@@ -26,13 +26,26 @@ function Get-BvrMsvcRoot {
     return $root
 }
 
+# The newest Windows SDK that is really installed: its Include\<v>\um\windows.h and its
+# Lib\<v>\um both exist. Sorting the folder names alone is not enough - a WDK adds a
+# "wdf" folder that sorts above every "10.0.x" (found on the GitHub Windows runner).
+function Get-BvrWinSdk {
+    $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+    $v = Get-ChildItem "$kits\Include" -Directory -ErrorAction SilentlyContinue |
+         Where-Object { $_.Name -match '^\d+(\.\d+){3}$' -and
+                        (Test-Path "$($_.FullName)\um\windows.h") -and
+                        (Test-Path "$kits\Lib\$($_.Name)\um") } |
+         Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+    if (-not $v) { throw "Windows 10/11 SDK not found under $kits (no version with um\windows.h)" }
+    return [pscustomobject]@{ Include = $v.FullName; Lib = "$kits\Lib\$($v.Name)" }
+}
+
 # Sets INCLUDE/LIB for a 32-bit host build and returns what to restore, plus cl.exe.
 function Enter-BvrMsvcEnv {
     $root = Get-BvrMsvcRoot
-    $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
-    $sdk = (Get-ChildItem "$kits\Include" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
-    $lib = (Get-ChildItem "$kits\Lib" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
-    if (-not $sdk -or -not $lib) { throw "Windows 10/11 SDK not found under $kits" }
+    $win = Get-BvrWinSdk
+    $sdk = $win.Include
+    $lib = $win.Lib
     $saved = @{ INCLUDE = $env:INCLUDE; LIB = $env:LIB }
     $env:INCLUDE = "$root\include;$sdk\ucrt;$sdk\shared;$sdk\um"
     $env:LIB = "$root\lib\x86;$lib\ucrt\x86;$lib\um\x86"

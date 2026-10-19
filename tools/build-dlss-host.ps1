@@ -12,9 +12,9 @@ $out = Join-Path $repo "build\dlss_host"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 . (Join-Path $PSScriptRoot "lib\msvc.ps1")
 $root = Get-BvrMsvcRoot
-$kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
-$sdk = (Get-ChildItem "$kits\Include" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
-$libv = (Get-ChildItem "$kits\Lib" -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+$win = Get-BvrWinSdk
+$sdk = $win.Include
+$libv = $win.Lib
 $savedInclude = $env:INCLUDE; $savedLib = $env:LIB
 $env:INCLUDE = "$root\include;$sdk\ucrt;$sdk\shared;$sdk\um"
 $env:LIB = "$root\lib\x64;$libv\ucrt\x64;$libv\um\x64"
