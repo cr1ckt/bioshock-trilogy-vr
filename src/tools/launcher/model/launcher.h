@@ -5,11 +5,12 @@
 #include <vector>
 #include "sys/gpu.h"
 #include "sys/process.h"
+#include "sys/release_repo.h"
 
 namespace bvr::launcher {
 inline constexpr wchar_t kGameExe[] = L"BioshockHD.exe";
 inline constexpr wchar_t kSteamUrl[] = L"steam://rungameid/409710";
-inline constexpr wchar_t kReleasesUrl[] = L"https://github.com/VR-Stereo-Hub/bioshock-trilogy-vr/releases";
+inline constexpr wchar_t kReleasesUrl[] = L"https://github.com/" BVR_RELEASES_REPO "/releases";
 inline constexpr wchar_t kRecord[] = L"bioshockvr-install.json";
 inline constexpr wchar_t kDisabledMod[] = L"bioshockvr.dll.disabled";
 

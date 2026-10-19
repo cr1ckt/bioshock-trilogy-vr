@@ -71,7 +71,7 @@ std::string release_json(const std::string& digest,const std::string& url){
 void update_tests(){
     check(updates::newer("1.0.0","0.8.3"),"numeric release comparison");check(!updates::newer("0.8.3","0.8.3"),"same release not newer");
     for(const auto& s:{"1.2","1.2.3.4","1.2.x","-1.2.3","1.2.3evil"}){uint32_t parts[3];check(!updates::version(s,parts),"malformed version refused");}
-    const std::string url="https://github.com/VR-Stereo-Hub/bioshock-trilogy-vr/releases/download/v0.9.0/BioShockVR-Launcher-v0.9.0.exe";std::vector<updates::Release> list;std::string error;
+    const std::string url="https://github.com/" BVR_RELEASES_REPO "/releases/download/v0.9.0/BioShockVR-Launcher-v0.9.0.exe";std::vector<updates::Release> list;std::string error;
     check(updates::parse_releases(release_json("sha256:"+std::string(64,'a'),url),&list,&error)&&list.size()==1&&list[0].downloadable(),"matching GitHub asset accepted");
     for(const auto& bad:{std::string("https://example.com/evil.exe"),url+"?redirect=evil"})check(updates::parse_releases(release_json("sha256:"+std::string(64,'a'),bad),&list,&error)&&!list.empty()&&!list[0].downloadable(),"foreign or modified URL refused");
     check(updates::parse_releases(release_json("missing",url),&list,&error)&&!list.empty()&&!list[0].downloadable(),"hashless asset refused");check(!updates::parse_releases("{not json}",&list,&error),"bad JSON refused");check(!updates::parse_releases("[] trailing",&list,&error),"trailing JSON refused");

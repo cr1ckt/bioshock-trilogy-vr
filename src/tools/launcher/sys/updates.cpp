@@ -14,7 +14,7 @@
 namespace bvr::launcher::updates {
 namespace {
 constexpr uint64_t maxAsset=256ull*1024*1024;
-const std::string prefix="https://github.com/VR-Stereo-Hub/bioshock-trilogy-vr/releases/download/";
+const std::string prefix="https://github.com/" BVR_RELEASES_REPO "/releases/download/";
 bool hash_ok(const std::string& h) { return h.size()==64 && h.find_first_not_of("0123456789abcdef")==std::string::npos; }
 struct Internet { HINTERNET h=nullptr; ~Internet(){ if(h) WinHttpCloseHandle(h); } };
 bool get(const std::wstring& url,size_t limit,std::vector<uint8_t>* out,std::string* error,const std::atomic<bool>* cancel) {
@@ -105,7 +105,7 @@ std::wstring data_dir() {
 Check check(const std::atomic<bool>* cancel) {
     Check result; std::vector<uint8_t> bytes;
     const auto cache=fs::join(data_dir(),L"releases.json");
-    if(get(L"https://api.github.com/repos/VR-Stereo-Hub/bioshock-trilogy-vr/releases?per_page=100",8*1024*1024,&bytes,&result.message,cancel) &&
+    if(get(L"https://api.github.com/repos/" BVR_RELEASES_REPO "/releases?per_page=100",8*1024*1024,&bytes,&result.message,cancel) &&
        parse_releases(std::string(bytes.begin(),bytes.end()),&result.releases,&result.message)) {
         result.online=true; result.message="Checked GitHub just now.";
         fs::write_file_atomic(cache,bytes.data(),bytes.size(),nullptr);

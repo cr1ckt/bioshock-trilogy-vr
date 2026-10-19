@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include "sys/release_repo.h"
 namespace bvr::launcher::updates {
 struct Release {
     std::string version, notes, published, assetUrl, sha256;
