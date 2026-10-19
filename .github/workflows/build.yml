@@ -27,7 +27,9 @@ jobs:
     runs-on: windows-2022
     defaults:
       run:
-        shell: pwsh
+        # Each step's output is also kept in ci-step.log, so a failure can be read back
+        # from the run's annotations (the "Report failure" step) without the raw logs.
+        shell: pwsh -NoProfile -Command "$log = Join-Path $env:RUNNER_TEMP 'ci-step.log'; try { & '{0}' *>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE) { exit $LASTEXITCODE } } catch { ($_ | Out-String) | Out-File -Append $log; throw }"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,6 +94,19 @@ jobs:
           Set-Content -Path out\RELEASE_TITLE.txt -Value $title -Encoding utf8 -NoNewline
           Set-Content -Path out\RELEASE_BODY.md -Value $body -Encoding utf8
           Get-ChildItem out | ForEach-Object { "{0,12}  {1}  {2}" -f $_.Length, (Get-FileHash $_.FullName).Hash, $_.Name }
+
+      - name: Report failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'ci-step.log'
+          if (-not (Test-Path $log)) { "::error title=CI::no step log"; exit 0 }
+          $tail = (Get-Content $log -Tail 120) -join "`n"
+          $enc = { param($t) $t -replace '%','%25' -replace "`r",'%0D' -replace "`n",'%0A' }
+          for ($i = 0; $i -lt $tail.Length; $i += 3500) {
+            $part = $tail.Substring($i, [Math]::Min(3500, $tail.Length - $i))
+            "::error title=CI log tail $([int]($i / 3500) + 1)::$(& $enc $part)"
+          }
 
       - uses: actions/upload-artifact@v4
         with:
