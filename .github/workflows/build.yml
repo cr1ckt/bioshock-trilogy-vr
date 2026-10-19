@@ -1,0 +1,127 @@
+# Build, test and package the mod on every push and PR; publish a GitHub pre-release
+# when a v* tag is pushed (the tag must match the VERSION in CMakeLists.txt).
+#
+# Runs on a GitHub-hosted Windows runner: VS 2022 with the x86 toolset builds the 32-bit
+# mod, the x64 toolset builds the DLSS helper, and NVIDIA's DLSS SDK is fetched at the
+# pinned, hash-checked version by tools/fetch-ngx.ps1. Only the pure host suites and the
+# launcher tests run here - the GPU suites, the simulator and the headset need a real
+# machine (docs/VERIFICATION.md).
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Read version
+        id: version
+        run: |
+          $cml = Get-Content CMakeLists.txt -Raw
+          if ($cml -notmatch 'project\(BioshockVR\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') { throw "no VERSION in CMakeLists.txt" }
+          $v = $Matches[1]
+          if ($env:GITHUB_REF -like 'refs/tags/*' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "tag $env:GITHUB_REF_NAME does not match CMakeLists.txt VERSION $v"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Lint
+        run: .\tools\lint.ps1 -Quiet
+
+      - name: Configure
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $cmake = & $vswhere -latest -products * -find "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" | Select-Object -First 1
+          if (-not $cmake) { throw "VS-bundled CMake not found" }
+          # The launcher checks this repository's releases for updates.
+          & $cmake --preset win32 "-DBVR_RELEASES_REPO=${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+
+      - name: Build (Win32 RelWithDebInfo)
+        run: .\tools\build.ps1 -Release
+
+      - name: Build the DLSS helper (x64)
+        run: |
+          .\tools\fetch-ngx.ps1
+          .\tools\build-dlss-host.ps1
+
+      - name: Host tests
+        run: .\tools\host-test.ps1
+
+      - name: Launcher tests
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "launcher-host-$([guid]::NewGuid().ToString('N'))"
+          & .\build\src\tools\launcher\RelWithDebInfo\bvr_launcher_tests.exe $out
+          if ($LASTEXITCODE -ne 0) { throw "bvr_launcher_tests failed" }
+          .\tools\test-launcher.ps1 -OutDir (Join-Path $env:RUNNER_TEMP "launcher-e2e-$([guid]::NewGuid().ToString('N'))")
+
+      - name: Package
+        run: .\tools\package.ps1 -SkipBuild -RequireDlss
+
+      - name: Collect release files
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "dist\bioshock-vr-v$v.zip" out\
+          Copy-Item "build\src\RelWithDebInfo\BioShockVR-Launcher-v$v.exe" out\
+          # This version's section of docs/RELEASE_NOTES.md becomes the release text.
+          $notes = Get-Content docs\RELEASE_NOTES.md -Raw
+          $m = [regex]::Match($notes, "(?ms)^## v$([regex]::Escape($v))\b.*?(?=^## v|\z)")
+          if (-not $m.Success) { throw "no '## v$v' section in docs/RELEASE_NOTES.md" }
+          $title = ([regex]::Match($m.Value, "^## ([^\r\n]*)")).Groups[1].Value
+          $body = ($m.Value -replace "^## [^\r\n]*\r?\n", "").Trim()
+          Set-Content -Path out\RELEASE_TITLE.txt -Value $title -Encoding utf8 -NoNewline
+          Set-Content -Path out\RELEASE_BODY.md -Value $body -Encoding utf8
+          Get-ChildItem out | ForEach-Object { "{0,12}  {1}  {2}" -f $_.Length, (Get-FileHash $_.FullName).Hash, $_.Name }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bioshock-vr-v${{ steps.version.outputs.version }}
+          path: out/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          title="$(sed '1s/^\xEF\xBB\xBF//' out/RELEASE_TITLE.txt)"
+          # Published as a pre-release: the launcher's updater skips pre-releases, so
+          # promote it with "Set as the latest release" once it is headset-verified.
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$title" \
+            --notes-file out/RELEASE_BODY.md \
+            --prerelease \
+            "out/bioshock-vr-v$v.zip" \
+            "out/BioShockVR-Launcher-v$v.exe"
