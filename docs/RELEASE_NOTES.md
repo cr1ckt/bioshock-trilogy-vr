@@ -3,6 +3,68 @@
 Newest first. The version is read from `CMakeLists.txt` by `tools/package.ps1`, so the zip
 name, the DLL banner and the tag cannot disagree.
 
+## v0.9.0 - preview: Dishonored-style hands, DLSS and AFW, the F10 menu and the launcher (BioShock 1)
+
+**A pre-release roll-up of everything merged to `staging` since v0.8.3,** built and
+published from the `cr1ckt` fork while `staging` waits to be promoted to `main`. Almost all
+of it is BioShock 1. **BioShock 2 and BioShock Infinite play the same as v0.8.3.**
+
+Some of this has not been run in a headset yet (listed below). Treat it as a preview, and
+keep the v0.8.3 zip if you want to roll back.
+
+**Hands, arms and weapons (BioShock 1)**
+
+- New hand and arm drive modelled on the Dishonored VR mod: arm IK on both arms, the off
+  hand tracked to your other controller, shoulder width, arm length and hand-size sliders,
+  and the tester's headset tune as the default.
+- Plasmid viewmodel support; the gun and hand no longer drift apart from the controller;
+  per-weapon grip and placement; crosshair improvements.
+- Shots and the laser leave along the barrel you see. Weapon size defaults to 0.88.
+- Reloads play at the gun: the free hand comes to the weapon and goes back. Recoil plays on
+  the guns again. The reticle is a dot again. The wrench is swung by hand, with no swing
+  animation.
+
+**Rendering (BioShock 1, all opt-in from F10 > Display)**
+
+- DLSS, DLAA and TAA (DLSS and DLAA need an NVIDIA RTX card; TAA runs on any GPU), with
+  hand motion vectors so the hands stay sharp while they move.
+- Two new stereo methods beside the default "both eyes every frame": Alternate eye (AER)
+  and Alternate frame warp (AFW), which render one eye per frame and are lighter on the GPU.
+  AFW was accepted in the headset; pixels around the hands and weapon silhouettes are still
+  imperfect.
+- The bathysphere gets the right world FOV, and walls right at your face drop to the
+  anchored flat view.
+
+**Comfort and presentation (BioShock 1)**
+
+- Head bob control, anchored screens and controller configuration, with BRVR-matched
+  defaults. Scripted scenes recenter the view and hide the arms where the game expects.
+- The head height offset now moves the hands, laser and shots with the camera. **Its
+  default is now 9 units up (was 0).**
+
+**New: the Rapture F10 settings menu and the BioShock Remastered VR launcher**
+
+- F10 is rebuilt as a themed settings menu with resolution scaling and a level selector.
+- `BioShockVR-Launcher-v0.9.0.exe` installs, updates, configures and removes the BioShock 1
+  mod. It is a preview of the launcher and only covers BioShock 1.
+
+**Install**
+
+- Launcher (BioShock 1): run `BioShockVR-Launcher-v0.9.0.exe` and follow it.
+- Manual (all three games): copy the four DLLs as before (see the README). For DLSS, DLAA
+  or TAA in BioShock 1, also copy the `bvr_dlss` folder next to `BioshockHD.exe` in
+  `Build\Final\`.
+
+**Before you play**
+
+- If you tuned your BioShock 1 INIs for v0.8.3, expect to re-tune: hands, arms, weapon size
+  and head height all have new defaults. The launcher's "Restore bundled calibration" resets
+  them to this release's presets.
+- **Not run in the game yet:** recoil and reloads at the gun (built and host-tested), and
+  the reticle dot. Please report what you see.
+- The DLSS helper ships NVIDIA's `nvngx_dlss.dll` under NVIDIA's license
+  (`bvr_dlss\NVIDIA-DLSS-LICENSE.txt`).
+
 ## v0.8.3 - hotfix: the left-eye flicker in BioShock 2
 
 **Fixes the hand and weapon flicker in the left eye in BioShock 2.** If your hands or gun
