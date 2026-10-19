@@ -1432,3 +1432,1561 @@ runtime.
   half-switched pad, and a partially-populated POD would silently unbind controls
   to bit 0. The BioShock 1 table reproduces the previous literals exactly - that,
   not an assertion, is the inertness argument, and it was measured (see below).
+
+### 2026-08-21 - the cinema screen is anchored where it opened, not where you recentred
+
+Ported from the BRVR mod as the first item of the consolidation
+(`docs/bioshock1/PORT-PLAN.md`).
+
+The quad that carries menus, the map, the manual, machine flows, the hack board,
+loading screens and cutscenes had two placements and each had a failure the
+other did not. `g_space` with an identity pose put it at the recenter origin's
+forward, so a player who had turned since recentring got a menu behind them.
+`g_viewSpace` pinned it to the head, so it swam with every glance. Session 22
+picked between them per screen type, which meant choosing which failure to have.
+
+Anchor mode is the third option and is now the default: take the head pose once,
+when the screen opens, flatten the forward vector to horizontal so the panel is
+never tilted, and leave the quad there in world space until the screen closes.
+The player can look around a stationary screen, which is what makes it readable.
+It re-places on the next screen, on a recenter, and after 0.45 m of head travel
+(headset off the desk, player stood up), and on nothing else - ordinary head
+motion must never move it.
+
+**Two details are load-bearing and both are somebody else's scar tissue.**
+
+The yaw is `atan2(-fx, -fz)`, not `atan2(fx, -fz)`. The quad's visible face is
+its local +Z and `R_y(yaw)*(0,0,1) = (sin yaw, 0, cos yaw)`, so the second form
+builds the MIRROR of the head yaw: the panel sits askew by twice the yaw, in
+opposite directions looking left versus right, and is dead straight at yaw 0 -
+which is exactly why it shipped in BRVR and survived testing. Any test of this
+code that does not turn the head cannot see the bug.
+
+The pose comes from the unconditional `xrLocateSpace` at frame open, and the
+anchor is not latched on a frame where that pose is invalid. BRVR anchored from
+a variable only the gameplay path wrote, so every screen shown before the first
+gameplay frame - the startup movies, the main menu - landed at the local origin
+instead of in front of the player.
+
+**Verified in the simulator, no headset** (`tools/xrsim-launch.ps1 -Game bs1`,
+main menu, one quad layer throughout):
+
+| Check | Result |
+|---|---|
+| Placed at all | `screen anchored at yaw 0.0 deg, head (0.00 1.60 0.00) m` |
+| Survives a pure 50 deg head turn | quad pose `(0.000 1.60 -1.750)` **identical** before and after, so it is world-locked and not following the head |
+| Re-anchors on travel | `screen re-anchoring - head moved 1.20 m from the anchor` |
+| Re-anchors on the RIGHT heading | at head yaw 50 it logged `yaw 50.0` and placed at `(-0.141 1.60 -1.125)`, which is head + 1.75 m along the head's own forward to **0.0000 m**. The mirrored placement would have been 2.681 m away |
+| Black around it | every capture reported `1 layer(s): quad`, no projection layer |
+
+Not verified: the `vrscreen` console command. `command.txt` is polled from the
+CalcView hook, which does not pump at the main menu, so the line was written and
+never read. The parser is untested at runtime; the F10 overlay controls call the
+same functions and are the primary surface.
+
+### 2026-08-22 (session 63) - BRVR parity on size and height, and where parity is only a number
+
+The user reported the weapon and hands reading tiny and asked for BRVR's scale,
+which felt right. Comparing BRVR's shipped `dist/BioshockVR.ini` against these
+defaults, most of the pipeline already agreed and the agreement was not luck:
+
+| Knob | BRVR | Here before | Delta |
+|---|---|---|---|
+| World scale | `EyeSeparation=3.2`, documented "game units == cm" -> 100 UU/m | `worldScale=100` | same |
+| Foreground lens | `2*atan(tan(fov/2)/(W/H)*1.3333)` | session-28 `k=(4/3)*(H/W)` | algebraically identical |
+| IPD | 64 mm | 63 mm | negligible |
+| Hand scale | `HandsScale=0.8` | `0.793` | ~1% |
+| Weapon scale | `GunScale=0.8` | `0.760` | ~5% |
+| **Camera height** | **`CameraHeightOffset=9` cm** | **0** | **the only large one** |
+
+**The decision worth recording is what we did NOT claim.** Adopting 0.80/0.80 is
+parity, not a fix: a 1% and a 5% change cannot be what a "reads tiny" report is
+about, and saying otherwise would have made the next headset session measure the
+wrong thing. The height was shipped at BRVR's 9 cm as the actual candidate, and
+`HandsScale`/`GunScale`/`CameraHeightOffset` were added to `BioshockVR.ini` so
+the real number can be found by dialling in one session rather than by a rebuild
+per guess.
+
+**Ini precedence is deliberately the opposite of the intent, and is logged.**
+`Bioshock1RAdapter::init` runs before `arm_vr_preset()` -> `load_vr_preset_values()`,
+so a saved `vrpreset.ini` overrides the ini keys. That preserves in-headset F10
+calibrations, which is right, but in a headset it is indistinguishable from the
+ini being ignored - hence the startup echo saying so on the same line. The clean
+model (ini is the source of truth, F10 is a front-end) stays blocked on the F10
+writer, which rewrites `vrpreset.ini` wholesale and drops unknown keys.
+
+**Mechanism parity was deliberately NOT taken for the hands.** BRVR scales the
+AHands actor's `DrawScale` (+0x2AC). The hands here are POSITIONED by writing
+bone translations, so an actor-level scale would silently scale our own writes
+with them; the cluster compression stays. The weapon is the opposite case - it
+is positioned by the engine through the attach bone - so a skeleton-less
+holdable (the wrench) now scales through the weapon actor's `DrawScale`, which
+is the one place this mod did visibly less than BRVR. Headset-confirmed the
+same day, which settles session 16's open question: the RIG actor's DrawScale is
+inert through the fg path, the WEAPON actor's is not. It also corrected the
+lane - the wrench is authored at 0.800, so a multiplier compounded to 0.64 and
+the knob is now absolute, as BRVR's is. See `docs/bioshock1/ENGINE_NOTES.md`.
+
+### 2026-08-22 (session 63) - the F10 panel in a headset
+
+The panel was unreachable in VR: ImGui's default corner, 420x420 inside a
+~2750x2850 backbuffer, unscaled font, mouse-only. Making it controller-driven
+turned up four things that are worth recording because each one LOOKED like a
+tuning problem and was not - and each cost a headset session to find, because a
+clean build proves nothing about a runtime contract.
+
+**R3 + L3 TAP opens the panel; HOLD (~0.6 s) recenters.** The chord already
+existed as recenter-only; it is now split by duration. Recenter took the hold
+because it is rare and deliberate. **This changes recenter for BS2 and Infinite
+too** - they drain the same chord - so it has a `docs/PORT-CANDIDATES.md` row.
+
+**Point with the right controller, click with RT.** `overlay.cpp` injects
+`io.MousePos` between `ImGui_ImplWin32_NewFrame()` and `ImGui::NewFrame()` -
+the only window where an injected cursor is not overwritten by the real one.
+The maths is deliberately position-free: rotate the aim direction into the
+HEAD's frame, divide out the forward component, scale by the eye tangents from
+`fov_audit`. **If the cursor sits off the ray, expect a constant scale factor,
+not a redesign** - the backbuffer holds the game's render at the game's FOV
+while the compositor presents through the claimed FOV, and those only agree
+because the session-15 lens match makes them.
+
+RT is swallowed **for the game only** while the panel is up, in
+`compose_synthetic` - deliberately NOT where the XR pad is published, because
+the overlay reads that same published pad to get the trigger. Everything else
+stays live, so you can still walk with the panel open.
+
+**THE HALF-SCREEN CUTOFF: the panel was never too tall, it was being
+guillotined.** ImGui's Win32 backend sets `io.DisplaySize` from the **window
+client rect** (`imgui_impl_win32.cpp:410`, `GetClientRect`), and the DX11
+backend sets the D3D **viewport** to exactly that
+(`imgui_impl_dx11.cpp:113-114`). We draw into the BACKBUFFER, which in VR is
+near-square (~2750x2780) - but Windows CLAMPS a window to the monitor, so on a
+1440p display the client rect is roughly half that height. Everything below it
+fell outside the viewport and was never rasterised, at a fixed ~50% of the eye
+image regardless of what the window asked for.
+
+Note the comparison that matters is **backbuffer vs CLIENT RECT**, not
+backbuffer vs render resolution - those two are near-identical and neither
+explains it. Two observations corroborate rather than contradict it: the cut is
+at the same ~50% **on the flat monitor too** (expected - the backbuffer is
+scaled into the window for display, so a viewport covering its top half still
+covers the top half of what you see), and **UEVR shows the identical symptom**,
+which is what you would predict from any mod that draws ImGui into a hooked
+Present while the game renders a backbuffer larger than its own window. (Noted
+as a symptom only - UEVR is all-rights-reserved and no code was consulted.) Fixed by pointing `io.DisplaySize` at the backbuffer after the
+Win32 backend runs (and rescaling the real mouse into that space so the desktop
+cursor still lands where it looks like it lands). This also makes the centring
+maths and the controller pointer correct, both of which already assumed
+backbuffer pixels. **The probe logs the proof once**:
+`overlay: window client rect ... vs backbuffer ...` - if those heights match,
+the cutoff was something else and this diagnosis is wrong.
+
+**IMGUI INPUT MUST GO THROUGH THE EVENT QUEUE - three bugs, one cause.**
+Reported: the cursor rendered in the RIGHT EYE ONLY, the trigger stopped
+clicking, and the stick-drag moved the cursor without changing any slider.
+
+Since ImGui 1.87 (vendored here: **1.92.8**) `io.MousePos`, `io.MouseDown[]` and
+`io.MouseWheel` are DERIVED state, rebuilt from queued events inside
+`NewFrame()` - `imgui.cpp:10535` is literally
+`io.MouseDown[button] = e->MouseButton.Down`, and `imgui.cpp:808` lists
+"Backend writing to io.MouseDown[] -> backend should call
+io.AddMouseButtonEvent()" as obsolete. The first cut wrote the FIELDS. Position
+survived by luck (nothing else queues a position event while the physical mouse
+is still); the button writes were overwritten every single frame, because the
+queue always carries the real button state. Hence a cursor that moved but could
+not click or drag. Now `AddMousePosEvent` / `AddMouseButtonEvent` /
+`AddMouseWheelEvent` throughout - including the real-mouse rescale, which was a
+field write for the same reason.
+
+The right-eye-only half was a second bug in the same function: it BAILED OUT on
+a failed pose read, leaving the cursor position unset for that present. Each eye
+is its own Present under SequentialReentry, so failing on alternate passes sets
+the cursor on one eye and not the other. It now holds the last good position.
+
+**The slider reset-to-aim: ImGui sliders position ABSOLUTELY on click.**
+`imgui_widgets.cpp` computes `clicked_around_grab` and preserves the value ONLY
+when the click lands on the grab handle - click the track and the value jumps to
+the cursor. The synthetic click-drag therefore reset the slider to the aim point
+on every re-engage. ImGui stores `HoveredId` but no hovered RECT, so the grab's
+position is not discoverable from outside; pre-aiming at it is impossible.
+
+The widget already implements the right path for keyboard/gamepad
+(`ActiveIdSource == Keyboard || Gamepad`): it starts from the CURRENT value and
+applies a relative delta, **one arrow-key press = 1% of the slider range**, and
+never looks at the cursor. Reaching it needs `SetActiveID` plus an
+`ActiveIdSource` override from `imgui_internal.h`; the keys themselves go through
+the public event API. Activation happens in `UpdateSliderTweak()`, which must run
+AFTER `NewFrame` (HoveredWindow is updated there) and BEFORE the sliders are
+submitted. Step RATE is ours, not ImGui's repeat timer - the key is pulsed once
+per due step (2-30/s, squared response), so stick pressure still means something.
+
+**The runaway scroll was a QUEUE BACKLOG, not momentum.** `UpdateInputEvents`'
+wheel branch is `if (trickle_fast_inputs && (mouse_moved || mouse_button_changed))
+break;` - it stops draining. Trickling is on by default, and the ray cursor moves
+every present (hand jitter guarantees it), so every wheel event was DEFERRED
+rather than applied; they queued up and drained about one per frame, which kept
+the panel scrolling after the stick was released.
+
+Trickling exists for real hardware, where a burst inside one frame must be spread
+so a fast click is not merged into a move. Our input is synthetic and already
+frame-paced - exactly one consistent pointer state per present - so
+`io.ConfigInputTrickleEventQueue = false` is correct here, not a workaround.
+
+**Both stick speeds are now PER SECOND, not per frame.** The present rate swings
+between ~100 and ~240/s (each eye presents separately under SequentialReentry),
+so a per-frame step made drag and scroll speed a function of framerate. That is
+also why the slider drag read about four times too fast.
+
+**Polish from the first in-headset look**: the window scale was right but the
+TEXT was too big (h/1080 = 2.37x), so the lift is now half that and there is a
+**"UI text scale" slider** - it is a perceptual number and guessing it from
+outside a headset is how the first attempt got it wrong. The panel is 0.45 of the
+backbuffer tall and centred, so trimming pulls in equally top and bottom -
+sized for a viewport that is now genuinely the full eye image. **Right stick scrolls it**, and the
+right stick and trigger are both swallowed in-game while it is up, so a scroll
+cannot turn you and a click cannot fire; the left stick still walks. **The
+crosshair, aim laser and aim dot are hidden** while it is up - the beam used to
+land on the panel and fight the cursor for the same pixels.
+
+**Anchored (world-locked) placement was asked for and DROPPED as too big.** It
+would mean the panel leaving the backbuffer for its own quad layer - render
+ImGui to an offscreen RT, copy into a new swapchain, submit at the anchor pose,
+and re-do the pointer as a ray/plane intersection. The `screen_place_mode`
+anchor logic the cinema screen already uses is exactly the placement behaviour
+wanted ("follows you, but a head turn does not drag it"), so a future attempt
+should reuse it rather than invent one. The panel stays head-locked for now.
+
+**The window opened small and off-lens because `io.IniFilename = nullptr`** -
+ImGui never persisted anything, and there is no record of where it was left.
+Interim default: centred, 42% x 52% of the backbuffer, with `FontGlobalScale`
+tracking backbuffer height (a 1080p-authored font is sub-pixel at 2560 square).
+**A probe logs the real geometry** on change, debounced 1 s, as fractions of the
+backbuffer so the baked number is resolution-independent:
+
+```
+grep "overlay: window" %LOCALAPPDATA%\BioshockVR\bioshockvr.log | tail -3
+```
+
+Drag it where it belongs, read the fractions, bake them, drop the probe.
+
+
+**The one thing deliberately NOT done: world-anchored placement.** Asked for and
+dropped as too big. The panel is drawn into the backbuffer, which is what makes
+it head-locked by construction; anchoring means giving it its own quad layer -
+render ImGui to an offscreen RT, copy into a new swapchain, submit at the anchor
+pose, raise the compositor's layer budget, and redo the pointer as a ray/plane
+intersection. **`screen_place_mode`, which the cinema screen already uses, is
+exactly the placement behaviour wanted** ("follows you as you walk, but a head
+turn does not drag it") - a future attempt should reuse it rather than invent
+one.
+
+### 2026-08-22 (session 64) - scripted events are a separate question from cutscenes
+
+The session was queued as "port BRVR's scripted-event detector, then the rotation
+toggles". Researching parity first turned up a finding that reframed it, and it
+is worth keeping because the same mistake is available to anyone reading BRVR's
+graveyard.
+
+**BRVR's *cutscene* detector was not the thing to port; ours is already the
+stronger one.** BRVR's `docs/CONSOLIDATION.md` - written 2026-08-15 explicitly
+for the merge into this repo, comparing its `9e56d58` against our `5bc5999` -
+records that it spent three sessions and nine graveyard entries hunting a
+cutscene signal while having one the whole time: `DrawHook_CutsceneBarsActive()`,
+fed by the textureless 29-vertex letterbox-bar draw, **exported with zero callers
+anywhere in its tree.** That same draw is `bvr::hud::bar_draw_active()` here, it
+is consumed, and `wantCine` combines it with four more signals BRVR has none of:
+the backbuffer letterbox pixel watch, the view-actor vtable test
+(`body::is_gameplay_view`), CalcView staleness, and the rendered-vs-claimed FOV
+mismatch, all under hysteresis. Its own verdict: *"the cutscene work is not a
+port. It is wiring on this side, plus four hardening signals from his side."*
+
+**So `wantCine` was not touched.** What was genuinely missing here is a different
+question: a scripted SEQUENCE, where the world renders, the HUD may be up, and
+the game is moving the player through an authored moment. That is BRVR's M7
+window, CONSOLIDATION's Tier 2 item 6, and it ports cleanly because it is
+engine-side and offset-driven rather than render-side.
+
+**Held in the producer, not the consumer.** `scripted_window()` is the union of
+the animation and forced-move signals held open for a settable delay, and the
+hold lives with the signals rather than in whoever reads them. BRVR learned that
+from the Little Sister crawl: the two signals failed to overlap for a single
+frame at 231 CalcView/s, its camera hook released and re-armed the aim inside a
+live scene, and the field ran 18.6 deg off for the next 58 seconds. Two correct
+signals that failed to overlap, not a racy one. Consumers layer their own
+policies on top; none of them get to decide when a scene is over.
+
+**Zero core change.** The signals, the policy and the F10 section all live in
+`src/game/bioshock1r/scripted.cpp`, and `git diff s63-bs1-comfort -- src/core/`
+is empty. The panel section registers through the adapter's existing
+`drawDebugUi()` chain, which is where every other BS1 section already lives.
+
+### 2026-08-22 (session 64) - where the game's rotation actually reaches the player
+
+The queued next-step was two toggles: freeze injected rotation during gameplay,
+and drop injected vertical rotation during scripted events. Reading the CalcView
+body before building either changed what got built, and the measurement is worth
+recording because it retires half the work rather than doing it.
+
+**During ordinary VR gameplay the game's pitch and roll already never reach the
+player.** `camera.cpp` overwrites `rot->pitch` and `rot->roll` *absolutely* from
+the head, and writes yaw as `gameYaw + headResidual`. Screen shake, weapon kick
+and the auto-pan toward enemies all arrive as those deltas - and two of the three
+axes are discarded by construction. This fell out of the head drive long ago and
+had never been written down, which is why BRVR's `FreezeGameplayRotation`
+(exactly that feature, and a real win *there*) read as a gap here.
+
+**What is left of it is a yaw latch**, which is the one axis that is genuinely
+risky: yaw feeds `driveYawOffsetRad` into `body::on_calcview`, which steers the
+pawn, and BRVR's graves 12 and 13 are both about that coupling. Small prize,
+sharp edge. **Deliberately not ported**; if it is ever wanted, it needs its own
+session and its own headset run, not a rider on this one.
+
+**The authored rotation does reach the player in exactly one case: when the head
+drive does not run at all**, and CalcView's rotator passes through untouched.
+That is a scripted or cinematic camera taking the view. It is the case the
+comfort complaint was actually about, and it is the only case
+`apply_rotation_policy` touches - so the control reads "when the game takes the
+camera, follow its rotation: both axes / horizontal only / neither".
+
+**The scene term is not decoration.** A menu also stops the head drive. Gating on
+the drive alone would latch a menu's framing and log on every inventory open, so
+the policy additionally requires `cinematic_hold() || scripted_window()`.
+
+**Pitch is held absolutely, not differenced.** An authored pitch slew is removed
+entirely and the horizon stays where the shot opened, rather than the shot
+drifting by whatever it accumulated before the policy engaged.
+
+**One control that already existed got a panel entry rather than a rewrite.**
+`cine_drive()` (off / authored / authored+look) has been implemented and
+preset-saved as `cineDrive` since session 29 and has only ever been reachable
+from the `vrcine drive` console command. Authored+look - the head adding a
+look-around delta on top of an authored shot - is squarely this section's
+subject, so it is surfaced in the same F10 group. This is the third time a
+session has proposed building something the panel already had.
+
+### 2026-08-22 (session 64 part 2) - one movie name was three defects
+
+Three separately-reported problems from one headset run turned out to be two
+causes, and finding that out cost less than fixing any one of them would have.
+
+**`PausePC.swf` is on the playing-movie stack for the whole of a bathysphere ride
+and every scripted scene**, not only at the pause menu. `screens::panel_screen_up()`
+matched it, that fed `publish_ui_pause(true)`, and `uiPaused` is an unconditional
+term in core's `wantCine` - so the cinematic quad engaged. The user saw two
+things and reported them as unrelated: the ride rendering on a head-locked square
+with black behind it, and the head being completely dead during scripted scenes.
+The second follows from the first because `cinematic_active()` also gates the
+head drive. **Same cause, and the quad drops in the same millisecond as
+`bathysphere off`, which is what made it findable.**
+
+Two plausible co-causes were ruled out rather than assumed, and both would have
+sent the fix somewhere useless: `g_cineStereo` already defaults **true** so the
+FOV-mismatch term contributes nothing even though the mismatch is real (80
+rendered against 100 claimed), and `screen-only` engaged five seconds *after* the
+quad, making it downstream rather than a trigger.
+
+**The fix is a gate, not a new mechanism**: a panel screen counts as a UI pause
+only when no scripted window and no bathysphere ride is running. It is narrow by
+construction - at a real pause menu neither signal is set - and it is only
+possible at all because part 1's signals exist. This is the first thing those
+signals bought.
+
+**RETRACTION of part 1's "FreezeGameplayRotation is redundant here".** That call
+rested on a correct measurement (the head drive overwrites `rot->pitch` and
+`rot->roll` absolutely) and an incomplete conclusion: yaw is not overwritten, it
+is composed as `gameYawUnits + residualUnits`, so everything the game puts into
+yaw reaches the view. The user reported exactly that - screenshake from world
+events and being panned onto groups of enemies - and it is now built.
+
+The lesson is worth more than the feature: **"two of the three axes are already
+discarded" is not "the feature is redundant".** The one surviving axis was the
+one the complaint was about. A per-axis audit owes a per-axis conclusion, and
+this one stopped a step early.
+
+**The freeze absorbs the delta rather than clamping the value**, so the view
+declines to be turned instead of snapping back to a held heading. It is
+camera-only by the user's explicit choice: aim and body still turn with the game,
+so the crosshair can sit off centre after a large shake. The alternative -
+steering the body to match - would write the aim field during events the game may
+be steering, which is BRVR's graves 12 and 13, and was rejected as a bigger risk
+than the symptom. The offset is bounded at 60 degrees and logs if it gets there,
+because an unbounded offset is an unbounded divergence between where you are
+looking and where the pawn is facing.
+
+**The both-edges rule arrived through a third door.** BRVR's rule is that a
+reference latched inside a scripted window must be dropped on both edges, or the
+second scene of a session differences against a value left from the end of the
+first. Here there is an additional gap BRVR did not have: the freeze filter only
+runs while the head drive runs, so a menu or a cutscene stops calling it
+entirely, and the yaw it would difference against on the way out is from before
+the scene. Absorbing that would swallow the whole turn the scene just made. The
+filter re-arms whenever more than 250 ms has passed since its last call - dt is
+the only witness available that it was not being called at all.
+
+### 2026-08-23 (session 64 part 2, corrected) - two bugs that shipped looking plausible
+
+The first cut of the comfort work built cleanly, logged convincingly and did
+almost nothing. Both causes are worth writing down because neither is visible in
+a diff and both are easy to write again.
+
+**GetTickCount64 cannot see a frame.** It has ~15.6 ms resolution and CalcView
+runs at ~118/s, so most frames are 8.5 ms apart and the counter does not move
+between them. The rotation freeze computed `dt` from it and treated `dt == 0` as
+"I was not called last frame, re-arm the reference" - which fired on roughly
+every other frame, re-armed constantly, and therefore never accumulated a single
+unit of the offset the whole feature exists to accumulate. It logged its own
+"freeze ON" line happily. **Anything differencing per-frame state needs QPC**;
+`GetTickCount64` is fine for the throttles it is used for elsewhere in this tree
+and wrong for anything at frame cadence.
+
+**A comfort filter must not live inside the head-drive block.** Both the freeze
+and the scripted-scene turn were applied inside `if (loc && rot && driveHead)`,
+which is skipped precisely when the game owns the camera - i.e. during the
+scripted scenes they exist to handle. The right stick did nothing during a scene
+because the code that would have turned the camera was never reached. The
+accumulators now advance in `scripted::observe()`, which runs on every CalcView
+unconditionally, and the result is applied in the unconditional `if (rot)` block.
+
+**The general shape:** a feature gated on a condition that is false exactly when
+the feature is needed. Worth checking for directly whenever a comfort or
+scripted-scene behaviour is added, because it reads as correct at every step.
+
+### 2026-08-23 - the bathysphere quad has a SECOND trigger, and it is `stale`
+
+Suppressing the `PausePC.swf` false pause was correct and is confirmed working -
+`uiPaused=0` throughout a ride now, with the gate logging when it fires. **It did
+not fix the reported black square**, because a second `wantCine` term takes over
+about 30 s into the descent:
+
+```
+23:42:41.876  scripted: bathysphere ON
+23:42:52.295  scripted: panel screen up during a bathysphere ride - NOT treating it as a UI pause
+23:43:11.281  xr: cinematic quad ON (strict=1 stale=1 fovMismatch=1 screenOnly=0 uiPaused=0)
+23:43:22.342  scripted: bathysphere off
+```
+
+`stale=1`: CalcView stops being called. The camera line drops from 112 calls/s to
+48 and then to 1, and the location jumps to a completely different world position
+in between - this is the **arrival and map transition**, not the ride proper.
+That is the session-22 finding ("scripted cameras bypass CalcView entirely")
+arriving again, and the quad fallback is what session 22 built *for* it.
+
+So this is not a gate problem and should not get another gate. Keeping stereo
+through a CalcView-silent scripted camera is a render-side question - the adapter
+cannot even refresh `publish_gameplay_view` during it, because that publish is
+itself driven from CalcView. It needs its own session and a render-thread path
+that still runs while the game thread has gone quiet. **Recorded, not bodged.**
+
+### 2026-08-23 (session 64) - the turn axis is not on the composed pad
+
+The gameplay rotation freeze shipped fixed and was still wrong in a way worth
+recording, because the reasoning that produced it was sound at every step.
+
+It excludes itself while the player is turning, which is what lets it hold the
+game's rotation back without touching the stick. It read that stick from
+`last_composed_sticks()` - the value the game is about to receive - which is the
+obvious place and the wrong one. **Anything that claims the turn axis zeroes it
+there**: snap turn sets `out.rx = 0` outright and keeps the step for itself, and
+the F10 overlay zeroes it so scrolling a menu does not spin the view.
+
+So "is the player turning?" answered NO permanently, the freeze absorbed the
+player's own turn along with the game's, and the view could not be turned at all.
+Reported as *"the view is fixed and turning the camera does nothing, like how the
+cutscenes were before this fix"* - the user recognising the symptom of a
+different bug, which is what made it findable.
+
+**Read intent from `last_xr_pad()`, not from the composed pad.** The composed pad
+answers "what will the game do"; a comfort filter is asking "what did the player
+ask for", and those differ by design wherever the mod claims an axis.
+
+### 2026-08-23 (session 64) - the rig during a scripted scene
+
+Two halves of one idea, both defaulted ON after a headset session.
+
+**The engine owns your hands.** A scripted scene now joins the session-29
+cinematic gate: the controller stops driving the bone cluster and `bones::release`
+hands the skeleton back, so the authored animation plays and the rig cannot be
+dragged around mid-scene.
+
+**The rig hides while a scene has nothing for your hands to do** - i.e. while
+`scripted_window()` is open and `scripted_anim()` is false, which is exactly the
+forced-move phase where the game is walking you into position - and comes back
+the instant an animation starts, because that animation is what you are meant to
+be watching.
+
+**Hidden by the actor's DrawScale, never by collapsing bones.** BRVR's reason
+transfers exactly: this file clears the skeleton's dirty byte so the engine does
+not re-evaluate over our writes, so a collapse would freeze the very bone array
+anything watching the rig would need to read. DrawScale leaves the array alone.
+It never writes exact zero either - the attach path inverse-decomposes chain
+scale, the same division that makes bone 43 untouchable.
+
+**This is cheaper here than in BRVR, and the reason is the signal.** BRVR had to
+infer "is an animation playing" from rig MOTION (`ArmHide_HandMotion`, with a
+threshold and a 4-second hold) because its own `CurrentlyExecutingScriptedHand-
+AnimationSequence` flag never locked. Ours locked on the first run, so the gate
+is the flag itself and there is no threshold to tune.
+
+The unhide is applied ABOVE the gate's early return, deliberately. Session 29's
+collapsed-hand bug was precisely a restore living inside code the gate had
+already skipped, and the same shape would have left the arms hidden for the rest
+of a scene.
+
+### 2026-08-23 - defaults promoted from the headset session
+
+`RotFollow::HorizontalOnly`, scripted-scene turn ON, engine-owns-hands ON,
+hide-rig ON, and BS1 opting into `CineDrive::Off` so the head keeps steering
+through a cutscene. The cine-drive default is set **from the adapter**, not by
+moving core's default, because BS2 and Infinite have never been tested with it
+and keep the authored behaviour they ship with today.
+
+The gameplay rotation freeze stays default OFF - it is the one of these that has
+not yet been judged working in a headset.
+
+### 2026-08-23 (session 64) - the blur was a per-eye yaw disagreement
+
+Reported as the biggest problem in the build: *"things in the distance at about
+10-15 feet away become blurry/fuzzy when walking and then become clear after
+stopping."* It was not a render change. It was where one line sat.
+
+The comfort yaw (`scripted::yaw_adjust_units()`) was applied at the END of the
+CalcView body, on the reasoning that it had to work in both the head-driven and
+game-owned paths and the unconditional block reaches both. **That put it after
+two things that had already read the rotator:** `apply_eye_offset` builds the eye
+separation axis from `*rot`, and the stereo second pass replays a stash
+(`g_srBaseRot`) taken inside the drive block.
+
+So the LEFT eye carried the adjustment and the RIGHT eye did not. A per-eye yaw
+disagreement is a double image, and a double image is most visible on distant
+geometry with the head translating - i.e. **while walking**, resolving the moment
+you stand still. Exactly the report.
+
+It is now applied once, immediately after `gameYawUnitsRaw` is captured and
+before anything downstream reads the rotator, so every consumer agrees.
+`gameYawUnitsRaw` is deliberately captured first, so `body::on_calcview` keeps
+steering by the engine's own value and the filter stays camera-only.
+
+**The general rule:** in this CalcView body, anything that changes `*rot` must
+land before `apply_eye_offset` and before the second-pass stash, or it ships as a
+stereo artefact rather than as a wrong number. That is much harder to attribute
+than a wrong number, which is why it is written down.
+
+### 2026-08-23 - the freeze inverted head look, and the body transfer is why
+
+*"Looking left and right is inverted, but up and down is correct when looking."*
+The asymmetry is the whole diagnosis: `body::on_calcview` only ever transfers
+YAW.
+
+The M7.5 body transfer steers the pawn to follow your head, which moves the
+ENGINE's yaw by that amount. One frame later the rotation freeze sees the engine
+yaw move while the stick is centred, cannot tell it from the game turning you,
+and absorbs it - cancelling exactly the amount the body had just followed. Turn
+your head left, the view slides right. Pitch is untouched because the body never
+transfers pitch.
+
+`body::on_calcview` already returns the exact integer it took - the same value
+`g_recenterYawUnits` absorbs, which is what makes that invariant a theorem rather
+than a tolerance. `scripted::note_body_yaw(moved)` now feeds the freeze the same
+integer, and it subtracts it from the delta before deciding what the game
+injected. Exact both ways, nothing left over.
+
+**The shape to remember:** a filter that classifies engine state as "the game did
+this" must be told about every change the MOD itself caused, or it will fight its
+own machinery.
+
+### 2026-08-23 - the arm hide was written against a falsified mechanism
+
+Removed, not left in place. It hid the rig with the hands actor's DrawScale,
+which is BRVR's mechanism and correct there - but this repo measured **rig-actor
+DrawScale as geometry-inert** in session 63 (ENGINE_NOTES: "rig-actor DrawScale
+does not size geometry; weapon-actor DrawScale does"), which is why the arms did
+not hide during the balcony sequence. The port contradicted this tree's own
+measurement, which is the exact failure the "never copy a number across without
+re-deriving it" rule exists to prevent, and the finding was already written down
+in this repo one session earlier.
+
+The mechanism that DOES work here is the bone-cluster collapse `hide_inactive`
+uses - but its reference capture and restore both live inside `drive()`, which
+the new "the engine owns your hands" gate deliberately stops calling during a
+scene. So the hide needs either a collapse path that survives without the drive,
+or a restore hoisted out of it the way session 29 hoisted the sleeve latch. That
+is real work and it is queued rather than bodged.
+
+### 2026-08-23 (session 64) - a VirtualQuery per read, 470 times a second
+
+The per-eye yaw theory for the walking blur was WRONG - the fix shipped and the
+blur survived it. Retracted; the placement change was a real correctness fix and
+stays, but it was not the cause and should not be cited as one.
+
+The better candidate, and it is squarely this module's fault: `read_u32` and
+`read_ptr_at` in `scripted.cpp` called `bvr::pattern_scan::is_memory_valid()`
+before every read. That is a **VirtualQuery** - a syscall that takes the process
+address-space lock - and `observe()` does four of those per CalcView at ~118
+CalcView/s. **~470 VirtualQuery calls a second on the game thread, every frame.**
+
+This tree already has a rule against exactly that shape ("never add a per-frame
+memory scan"), and the change walked into it sideways: each individual call reads
+as a cheap bounds check, and only the total is a problem. The `__try/__except`
+around the read was always the actual protection, and is the idiom the rest of
+the adapter uses - `body.cpp`'s `read_rot` has no VirtualQuery either. The
+pointer identity is checked once per change in `anchor_check`, which is where a
+one-shot check belongs.
+
+**A master switch now exists** (`scripted::set_enabled`, top of the F10 section).
+With it off nothing here reads engine memory and nothing reaches the camera. It
+is there because "did this module cause it?" was going to cost a bisect across
+builds and headset sessions otherwise, and one checkbox answers it in a single
+run. Any module that can plausibly be blamed for a perceptual symptom should have
+one.
+
+### 2026-08-23 - a default change cannot ship through a file that stores the old default
+
+`CineDrive::Off` failed to become the BS1 default twice, the same way in different
+clothes. First it was set in the adapter's `init()`, which runs BEFORE
+`load_vr_preset_values()` - the preset simply overwrote it. Then it was applied
+after the load but only when the preset had no `cineDrive` line, which does
+nothing when the preset HAS one, and every preset saved before 2026-08-23 carries
+`cineDrive=1` from the old default.
+
+**A stored value that happens to equal the old default is indistinguishable from
+a deliberate choice**, so no has-the-key logic can fix this. It needs a schema
+version, which is the ordinary answer: `presetVersion` is written on every save,
+and a preset older than the version that introduced a default has that key
+discarded. Anything chosen after this ships is saved at the current version and
+wins normally.
+
+Worth applying to any future default change that touches a preset-backed value -
+there are ~50 of them, and this is the first time one has moved.
+
+### 2026-08-23 (session 64) - DrawScale3D (+0x2B0) hides the rig; +0x2AC does not
+
+The arm suppression works, and the reason two attempts failed is one field.
+
+Session 63 measured the SCALAR DrawScale (+0x2AC) as geometry-inert on the rig
+actor, which is correct and is written down. s64 then read that as "actor scale
+cannot hide the rig" and removed the feature. **DrawScale3D at +0x2B0 - the
+per-axis vector immediately after it - is a different field and does work.**
+Measured in BRVR (`Hands/ArmHide.cpp`, `kDrawScale3DOff`) and re-derived here
+against the same actor.
+
+The layout is the ordinary Unreal shape, a scalar followed by a per-axis vector,
+and the two are emphatically not interchangeable on this build. The inert one is
+now documented directly above the working one in `patterns.h` so the next reader
+gets both halves at once - a falsified finding that is only half-stated is worse
+than none, because it retires a whole mechanism instead of one field.
+
+**One-shot per edge, not per frame.** This is an actor field, so unlike a bone
+write nothing re-evaluates over it, there is no dirty byte to keep clearing, and
+it does not fight the skeleton drive or its reference capture. That is what makes
+it compatible with the "engine owns your hands" gate, which stops `drive()` from
+running during a scene - the collapse path could not have been.
+
+Two guards travel with it, both from BRVR and both earned: refuse to SAVE an
+already-collapsed scale (restoring that would leave the hands invisible for
+good), and drop the saved value WITHOUT restoring when the actor pointer changes,
+because the old address may already belong to something else.
+
+### 2026-08-23 - the walk direction owes the same yaw the camera got
+
+Reported alongside the arms: "the walking direction is now going to the wrong
+place", appearing the moment the rotation freeze became a default.
+
+`publish_move_yaw_offset` rotates the movement stick by the head-vs-body error,
+`residual - moved`, so stick-forward tracks where you are looking. The freeze and
+the scripted-scene turn both move the CAMERA away from the pawn without moving
+the pawn - that is the whole point of camera-only - so the true camera-to-pawn
+angle became `residual - moved + yaw_adjust` and the published value was short by
+exactly the freeze offset. The view looked one way and the walk went another.
+
+Fixed by adding the same integer the camera was adjusted by, so the two cannot
+drift apart by construction.
+
+**The general shape, and it is the third time this session:** a camera-only
+adjustment is never only a camera adjustment. Everything derived from the
+camera-to-pawn relationship - the movement stick here, the aim ray, the
+viewmodel - owes the same term. Enumerate those consumers when adding one.
+
+### 2026-08-23 (session 64) - four wrong hypotheses on one symptom, and the method change
+
+A report of "things 10-15 feet away go fuzzy while walking, sharp once you stop"
+drew four consecutive explanations from me, each a plausible mechanism, each
+wrong, each costing a headset run:
+
+1. a per-eye yaw disagreement from the comfort adjustment landing after
+   `apply_eye_offset` and the second-pass stash;
+2. ~470 `VirtualQuery` calls a second on the game thread from `is_memory_valid`
+   in the per-frame read path;
+3. and two earlier ones in the same shape.
+
+**Both fixes were real and both are kept** - the adjustment genuinely did belong
+before the eye offset, and a syscall per read genuinely did violate this tree's
+"no per-frame memory scan" rule. Neither was the cause. That is the tell: they
+were defects found by *reading code and asking what could produce this feeling*,
+which is a search that always returns something and rarely returns the answer.
+
+**The disproof that mattered was a switch, not an argument.** A master enable on
+the whole scripted module, unticked in a headset, left the blur untouched - which
+cleared the entire module in one run after four rounds of theory had not. Any
+module that can plausibly be blamed for a perceptual symptom should have one.
+
+**The method change: bisect revisions, do not reason about mechanisms.**
+`tools/build-bisect.ps1` builds any set of revisions into `build/bisect/<label>/`
+via git worktrees, so the working tree is never checked out and swapping revision
+is copying one DLL. Three builds - `main` (v0.8.2), the s63 tip, and HEAD -
+localise a regression to a SESSION in three runs, and the F10 toggles
+(`vrcam headbob off`, `vrstereo off`) split it further inside the guilty one for
+free.
+
+The general rule, written for whoever hits the next perceptual bug: **a symptom
+described in feelings is not debuggable by reading code.** Get it bracketed to a
+revision range first, by measurement, and only then read.
+
+### 2026-08-23 - a diagnostic switch must announce what it takes with it
+
+The master switch was added to A/B the blur and it worked. It also silently
+disabled the arm hide and the hands gate, which share the module - so the next
+report ("arms still don't hide") came from a run with the module off, on a build
+that did not contain the arm fix at all. Two questions confounded by one switch.
+
+It now says so in the panel, in colour, and logs once when a scene starts while
+it is off. **A switch that changes more than its label implies costs exactly the
+session it was built to save.**
+
+### 2026-08-23 (session 64) - the pre-compensation was in the wrong ORDER, not the wrong shape
+
+s63 ported BRVR's movement-stick deadzone pre-compensation and put the call in
+`openxr_input.cpp`, at the point the XR stick is read. The head-relative rotation
+that the compensation exists to protect happens later, in `xinput_bridge.cpp`'s
+`compose()`. So the chain ran:
+
+    deadzone -> PRECOMP -> int16 -> ROTATE -> [game's per-axis band]
+
+and the compensation was computed for a direction the game never received. BRVR
+does it the other way round and only when it actually rotated
+(`Input/InputHook.cpp`). Modelled against the game's own 0.225 per-axis band, the
+old order does not merely bias the walk - **for small head offsets it erases the
+rotation entirely** (5 deg and 10 deg both arrive as 0.0), peaks at 18.5 deg of
+error at partial deflection near 20 deg, and flips sign past 45. The new order is
+exact at every angle and magnitude tested.
+
+**The fix is the move.** `precomp_stick_deadzone` and its two atomics now live in
+`xinput_bridge.cpp` beside the rotation, applied immediately after it and only
+inside the `deg != 0.0f` branch; the ini keys and per-game defaults stay in
+`openxr_input.cpp` and reach the state through `bvr::input::set_stick_precomp` /
+`set_game_stick_deadzone`. The s63 ramp deviation is unchanged.
+
+**Why this core change is safe for the games it was not judged on.**
+`stick_precomp()` defaults false and only BioShock 1 opts in, from its own
+adapter via `set_pad_brvr_defaults(true)`. With it off the lane is unreachable and
+the composed pad is bit-identical, so BS2 and Infinite keep exactly the behaviour
+they have. Recorded in `docs/PORT-CANDIDATES.md`.
+
+**The lesson, and it is BRVR graveyard entry 14's verbatim:** *when a correction
+is provably exact and the symptom survives, go and measure what the other side
+received.* The published rotation angle was algebraically exact the whole time -
+`residual - moved + yaw_adjust` matches the rotator writes term for term - and
+two sessions were spent re-deriving it. Nothing was wrong with the number; it was
+being applied on the wrong side of a distortion.
+
+### 2026-08-23 (session 64) - a faithful reading of a real flag can still answer the wrong question
+
+The arm hide was gated on `scripted_window() && !scripted_anim()` and never fired.
+The log showed why: `hands+0x594` bit 2 was already set on the first frame of the
+window, so the predicate was a correct reading of a correct offset - of *"is a
+scripted sequence running"*, which stays true through the parts of a scene where
+the hands sit perfectly still. The question actually being asked was *"do the
+hands have anything to do"*, and no flag on that actor answers it.
+
+Replaced by a measurement: `bones::hand_motion()` differences one engine-owned
+wrist per CalcView, `scripted.cpp` thresholds and holds it. The mechanism
+(`DrawScale3D`) was never at fault and did not change.
+
+**Where the module boundary landed, and why.** The measurement is in `bones.cpp`
+because it owns the skeleton; the threshold, the hold and the fail-safe direction
+are in `scripted.cpp` because they are policy, F10-facing and preset-backed. Same
+split this pair already used for the drive itself.
+
+**Fail toward the failure nobody has reported.** When both clusters are ours
+there is no honest wrist and the sampler returns "cannot answer". That routes to
+arms VISIBLE, because the failure on record is arms hidden for a whole scene and
+there is no matching record of arms shown for one frame.
+
+### 2026-08-23 (session 64) - never write the field the engine is steering by
+
+A scripted forced move steers the player by `Controller.Rotation`. The M7.5 body
+transfer writes that same field every frame so the pawn's yaw follows the head.
+The two had never met, because until s64 the head drive did not run during
+scripted scenes - part 2's `PausePC.swf` fix changed that deliberately, to let
+the player look around, and switched the transfer on inside scenes as a side
+effect nobody costed. Headset result: look around during a scene and you land
+"way off"; hold still and you land exactly right.
+
+The transfer now stands down for `scripted_window() || bathysphere()`. The held
+window is used rather than the raw `forced_move()` because BRVR threw a landing
+3.7 m by letting an equivalent predicate break mid-scene.
+
+**Two rules came out of it, and the second is the one with teeth:**
+
+- **A feature that removes a gate is also a feature that arms everything that
+  gate was incidentally holding off.** The PausePC fix was reviewed as "the head
+  drive now runs during scenes". What it actually did was set `vrDriving` true
+  inside scenes, and `vrDriving` is a precondition for machinery in three other
+  files. Enumerate the consumers of a flag before flipping the flag.
+- **The mod may steer the player, or the game may, and never both at once.**
+
+### 2026-08-23 (session 64) - two mods, two routes to head-relative walking
+
+Ported BRVR's `WalkDriftProbe` and it settled a question two sessions of theory
+had not. On all 25 samples of a normal walking run: `pub -0.0`, and
+`camYaw == pawnYaw`.
+
+**The head-relative stick-rotation lane is inert here.** The body transfer keeps
+the pawn's yaw under the camera, so the angle the composer would rotate the stick
+by is always zero. BRVR does the opposite: it never writes the aim field and
+redirects walking purely by rotating the stick, on the identity
+`walk = aimFieldYaw + stickAngle + R` - which leaves aim, the weapon trace and
+forced-move sequences untouched by construction.
+
+Neither route is wrong, and this is not a call to switch: the field write is what
+makes the *body* follow the head, which the stick rotation cannot do. But the
+cost is now known and paid once - the scripted-landing gate above exists only
+because we write the field.
+
+It also retires a red herring: **`moveYawSign` scales a value that is almost
+always zero**, so flipping it in a headset changes nothing. That is the expected
+result and says nothing about whether the sign is right.
+
+### 2026-08-23 (session 64) - a correlation you caused is not a measurement
+
+The arm hide is gated on measured rig motion. Round 9 shipped a diagnostic that
+logged the sampled bone's position beside the hidden flag, saw 212 bit-identical
+samples while hidden, and concluded that hiding the rig freezes the bone array -
+BRVR's M7-S5 latch through a new door. The gate was moved off motion onto
+`forced_move()` on that basis, and it was written up as measured fact.
+
+**It was not a measurement.** In that build `hidden` was computed FROM the motion
+reading, so "hidden" and "motion is zero" were the same event. The data could not
+have come out any other way, whatever the engine was doing.
+
+Round 10 decoupled them by accident - the hide ran off `forced_move()` while the
+sampler kept running - and the unconfounded answer was the opposite: 3 samples
+while hidden, 3 distinct positions. `DrawScale3D` is a safe hide.
+
+**The rule: before reading a correlation as causation, check whether your own
+code closes the loop.** A diagnostic that observes a variable the system is
+steering measures the steering, not the system. The tell was available in the
+same dataset and was missed - the frozen value also appeared with `hidden=0`.
+
+The useful finding was underneath it all along: 229 of 336 samples read raw
+exactly 0.0000, because CalcView fires far above the animation tick rate. The
+hold, not the threshold, is what this feature runs on.
+
+### 2026-08-23 (session 64) - the arm hide, and four rounds of fixing the wrong thing
+
+The arm hide took four headset cycles, and only the last one changed the thing
+that was actually wrong. The rest are worth recording because the failure was
+methodological, not technical.
+
+**What was wrong:** hiding the rig by scaling the actor to `DrawScale3D 0.0001`
+takes it out of whatever the engine animates, so the entire bone array freezes -
+and the gate that decides when the arms come back reads that array. A one-way
+door. **What was built instead:** re-flagging the dirty byte every frame, then a
+timed re-check that showed the rig briefly, then logic to discard readings taken
+across the frozen gap. Each addressed a consequence; none addressed the freeze.
+
+**The fix was to delete, not to add.** Hide by collapsing the BONES with the
+actor left at full scale: it stays in the render set, the engine keeps animating
+it, the array stays live. That removed the re-check timer, its two sliders, two
+preset keys, a latch state machine that `want_rig_hidden()` was carrying (and
+which the F10 render thread was calling into - a standing race), and the
+trusted-sample logic.
+
+**Three method failures, each of which cost a cycle:**
+
+- **A correlation you cause is not a measurement.** The first evidence for the
+  freeze was 212 bit-identical bone positions while hidden - from a build where
+  the hide was *computed from* the motion reading. The data could not have come
+  out any other way. Before reading a correlation as causation, check whether
+  your own code closes the loop.
+- **Then it was retracted on a grouping error.** "3 samples, 3 distinct values"
+  looked like the array staying live; those three came from three *different*
+  hidden windows, and a freeze predicts exactly that, since each window freezes
+  at a different pose. The question was always *within* one window.
+- **Read-before-write is not sufficient when you write faster than the engine
+  refreshes.** CalcView runs 118-240/s; the animation ticks well below that. The
+  sampler has to recognise its own write and report it as stale.
+
+**And one process note.** The tester said twice that the answer was already in
+the reference mod's docs, and it was - `INVARIANTS.md` offers "hide through
+`DrawScale3D`, **or measure something the write does not touch**". Three rounds
+went into the first clause. The second clause was the one that applied.
+
+### 2026-08-27 (session 68) - "stop adopting" is not "go back"
+
+s67 replaced the movement threshold with the engine's own `Hands` state machine,
+so recoil could be adopted and a reload refused by NAME instead of by size. The
+read works. The policy on top of it shipped a defect that the threshold never
+had, and the shape of the mistake is worth keeping.
+
+**The defect.** When the state leaves the adopt mask the drive stopped adopting -
+and stopping is not returning. `g_ref` kept whatever frame it last took, and
+`Hands.uc` leaves `WeaponFiring` at the TOP of the recoil, not after the gun has
+come back down. So the pistol froze at its recoil apex and stayed there until a
+weapon switch. The ammo-out freeze and the shotgun's first reload are the same
+bug through different doors: `Firing -> Reloading` is a mask exit like any other.
+
+**Why the threshold never had it.** BRVR gates on `adopt = (now - lastBigDelta) <
+holdMs`, so it keeps tracking for ~1.2 s past the animation's last big frame and
+re-freezes on the SETTLED pose. The settle window was the whole mechanism, and
+the state branch is what threw it away. That is the general lesson: a per-state
+gate answers "may this animation reach the rig", and silently drops the answer to
+"where does the rig go when it stops" - which the thing it replaced was quietly
+handling all along. **When replacing a heuristic, enumerate what it was doing
+incidentally, not just what it was for.**
+
+**Why we did not just reinstate the settle window.** It would re-freeze onto
+whatever the idle animation had drifted to, and `Holdable::GetIdlingHandsAnim()`
+draws a WEIGHTED RANDOM entry from `IdlingHandsAnim[]` every time `WeaponIdling`'s
+loop comes round (Holdable.uc:32). That randomness is precisely the "crosshair
+moves randomly between shots" report s67 fixed, so BRVR's answer is not portable
+here - its threshold gate never had a per-weapon crosshair riding on the pose.
+
+**What was built instead.** A CANONICAL rest pose: one snapshot per holdable,
+taken the first time the engine reports `WeaponIdling`, restored when an adopted
+state ends. Once per holdable rather than per return-to-idle, which is what makes
+it deterministic and what keeps the per-weapon crosshair true between shots.
+
+Three details that are policy, not incidental:
+
+- **Position and rotation only.** The scale rows stay with the `g_scaleWrote`
+  pinning bank; restoring them would undo session 61's pin-vs-adopt architecture.
+- **The edge is only trusted on a KNOWN state.** The engine parks `StateNode` at
+  null between transitions, and reading that blip as "the animation ended" would
+  abort a recoil halfway through it.
+- **The return is BLENDED (120 ms smoothstep), not snapped.** The pose being left
+  is a recoil apex; cutting straight to rest reads as a jerk, where easing is the
+  recovery the animation would have played. 0 ms = snap, and the F10 checkbox is
+  a live A/B back to the s67 behaviour, because this is a perceptual question and
+  the simulator cannot answer it.
+
+### 2026-08-27 (session 68) - a shared global behind a per-instance setting
+
+The viewmodel's view-frame PLACEMENT (`g_viewFwdCm/RightCm/UpCm` in `hands.cpp`)
+was a single global triple applied to both hands. The per-weapon profile system
+added in s67 then wrote it on every weapon change, from the RIGHT hand's profile.
+
+Plasmids are the LEFT hand and have no per-weapon profile, so nothing ever put
+the value back. The tester's report is the exact signature of that shape:
+
+> correct as I switch back and forth between the plasmids, but then they **both**
+> get locked to another position when I switch to a weapon and switch back
+
+Every clause is diagnostic. *Plasmid to plasmid is fine* - no weapon profile
+applies, so nothing overwrites it. *Locked after a weapon round trip* - the
+weapon's placement was written and there is no plasmid profile to restore it.
+And **both**, which is the clincher: two plasmids cannot share a fault unless the
+thing they share is one variable.
+
+**The rule: when a setting becomes per-instance, every global it reads or writes
+becomes a candidate.** s67 made placement per-WEAPON without making its storage
+per-HAND, so the weapon lane silently acquired write access to the plasmid lane.
+The sibling values had already been converted - `g_posFwdCm[2]`, `g_rotPitchDeg[2]`,
+and the aim trims - which is why this one was invisible: every call around it
+already passed a hand index, so the one that did not read as intentional.
+
+The fix makes it `[2]` like its siblings, routes the ini through the existing
+`store_hand_key()` (so a suffix-less key from an older file loads into BOTH hands
+- exactly what the shared global used to mean), and passes hand 1 at all five
+`aim.cpp` call sites, since `WeaponProfile` is a right-hand record by construction.
+
+**Also settled here:** plasmid position and plasmid crosshair are GLOBAL across
+all plasmids, not per plasmid (tester's call, 2026-08-27). That falls out of the
+same structure - only the right hand has per-weapon profiles - so the left hand's
+model offset, view placement and aim trim are each one value for every plasmid.
+The F10 sliders' L/R radio is the whole tuning surface for them; the numpad tuner
+stays the WEAPON hand's tuner, which is why it now writes index 1 rather than the
+old shared index 0.
+
+### 2026-08-27 (session 68) - the plasmid had no key, so it wore the weapon's profile
+
+**The engine parks `Hands.CurrentHoldable` at NULL while a PLASMID is equipped.**
+That one fact produced two defects that looked unrelated, and it is why the s68
+per-hand placement fix - correct in itself - did not cure the reported symptom.
+
+The proof is in the log, not in reasoning. Every plasmid switch prints bones'
+`wscale rigid: released (holdable gone)`, whose test is literally `!hold`, and
+prints **no `[aim] weapon profile ... applied` line at all**. `update_weapon_profile()`
+turned that null into an EMPTY key, and `apply_weapon_key()` dropped an empty key
+on the floor with `if (key.empty()) return;` - no log, nothing applied. So the
+outgoing WEAPON's entire profile stayed live: aim trim, placement, grip, and
+`animOn`.
+
+Both reports fall out of that:
+
+- *"the plasmids move to a different position after switching to a weapon and
+  switching back"* - they were wearing the weapon's profile, because nothing had
+  replaced it.
+- *"the animations aren't playing for the plasmids"* - `bones::set_anim_allowed()`
+  is one global, and the WRENCH sets it to 0. After a wrench, the gate stayed shut
+  and nothing reopened it. The run that reported this shows wrench<->plasmid
+  switching throughout.
+
+**The rule: a silent early return on a "nothing here" value is a bug waiting for a
+second meaning.** `key.empty()` meant "unresolvable" when it was written; the
+plasmid then made it also mean "a plasmid is equipped", and the branch could not
+tell them apart because it did nothing and said nothing either way. Both now have
+a name - `"Plasmid"` is a real profile key, and the genuinely-unknown case logs
+that the previous profile is still applied.
+
+**One key for every plasmid**, not one per plasmid (tester's call, 2026-08-27), so
+they share one position and one crosshair.
+
+**And a method note.** The first fix this session went in on a diagnosis that fit
+the symptom perfectly - a shared global behind a per-instance setting, which was
+also real and is also fixed - but was never checked against a log. The log had the
+answer the whole time, in a line about a scale lane that nobody would think to
+grep for. **Read the run before designing the fix, and grep for the absence of the
+line you expect, not just for the presence of the one you fear.**
+
+### 2026-08-27 (session 68) - the default profiles were scrambled twice over
+
+`seed_default_profiles()` wrote bare aggregate initialisers in the order given by
+the comment above it - trim, pos, animOn, view, grip, model - while `WeaponProfile`
+declares grip BEFORE view and `animOn` AFTER both. Every field past `posUp` was
+silently assigned to the wrong member. The Wrench ended up with `animOn = -16.70`:
+nonzero, so its animation gate read as ON, which is the one thing it must not be.
+
+Underneath it, a stale duplicate block re-assigned all eight weapons with FIVE
+values each. Aggregate init zero-fills the remainder, so grip, view, `animOn` and
+the model trims all went to zero and the second block won. **A fresh install had
+no recoil on any weapon and no placement on any of them.**
+
+Neither bug could be seen by anyone whose `weapons.ini` already overrode every
+field by name - which is every machine this has ever been tested on. The tester's
+own tuning file was hiding the shipping defaults.
+
+Now designated initialisers, which cannot drift out of order again. **When a
+struct's field order is load-bearing for a literal, name the fields** - the
+compiler is the only reader that will reliably notice.
+
+### 2026-08-27 (session 68b) - a timer standing in for a state the engine reports
+
+s68's rest-pose fix armed a fresh reference capture on a holdable change and then
+tracked for a FIXED 1200 ms (`g_swaySettleMs`) before freezing. That timer was the
+wrong instrument, and it produced three reports that looked like three bugs:
+
+| Report | Mechanism |
+|---|---|
+| "the wrench position was super off with a massive pivot on launch" | animOn=0, so once the timer expired the state branch refused forever - and the rest capture was gated on `g_animAllowed`, so it never ran either. The reference was whatever the timer froze, mid-equip |
+| "it did an equip animation but froze it before it finished" | the equip outlasted 1200 ms; adoption stopped part-way through |
+| "it applied it to both plasmids" | `CurrentHoldable` is NULL for EVERY plasmid, so plasmid-to-plasmid is `null != null` == false. The holdable-change test never fired, so one bad pose served all of them |
+
+**The engine already reports both edges we were guessing at**: `State::Equipping`
+starts the window, `State::Idling` ends it. Tracking until Idling means an
+animation longer than any timer still plays out in full, and there is no constant
+to tune. The Equipping EDGE also arms the capture, which is the only signal that
+can see one plasmid replace another - the holdable pointer is blind to it.
+
+**Two lessons, and the first is the one that keeps recurring here.**
+
+**A timer is a guess about a state.** If the system publishes that state, read it.
+s67 built the `Hands` state machine reader precisely so animation decisions could
+stop being inferred from magnitudes and durations - and then s68 put a duration
+back in the one place the state machine was most directly applicable. A timeout
+survives, but only as a backstop that LOGS when it bites; a silent expiry is what
+made this hard to see.
+
+**Gates must not be reused for questions they were not asked.** `animOn` answers
+"does this weapon FOLLOW its firing animation" - the wrench does not, because a
+swing animation fights manual melee. s68 also used it to gate "does this weapon
+get a correct resting pose", which is a different question with a different
+answer, and starving the wrench of a rest capture is what put the s67 defect back.
+When reaching for an existing flag, check that the question is the same one.
+
+### 2026-08-27 (session 68b) - the hand was inferred from the trigger, not read from the game
+
+`active_hand()` decided which hand was live from the last bumper or trigger the
+player touched. Both the crosshair and the viewmodel follow it. A plasmid SHOT
+does not - it is routed to `Hand::Left` by pointer identity, from the learned
+object map.
+
+So switching to a plasmid **without firing it** left auto-hand on the RIGHT, and
+two reports that sounded unrelated came out of that one gap:
+
+- *"it seems that it shoots slightly up and to the right of the crosshair"* - the
+  dot was drawn from `g_ray[1]` while the bolt left on `g_ray[0]`. Two rays, two
+  trims, one crosshair.
+- *"the other plasmid still had the wrong position and nothing fixed it"* - the
+  plasmid was being drawn with the RIGHT hand's offsets, which are the equipped
+  weapon's profile.
+
+And it explains why one plasmid was fine and the other was not, with no
+difference between them: the tester had been **firing** the good one.
+
+**The engine knows which hand it is.** `Hands.uc` parks the rig in an `Ability*`
+state while a plasmid is equipped, so `hands_state` now carries an `ability` flag
+per row and `active_hand()` reads it instead of guessing. An explicit hand mode
+still wins - this replaces only the inference.
+
+**The rule, again, and it is the third time this session: a value the game
+publishes should not be inferred from a side effect.** s67 replaced "guess the
+animation from movement magnitude" with the state machine. s68 replaced "guess
+the equip is over from a 1200 ms timer" with the same state machine. This
+replaces "guess the hand from the last trigger" with it too. Every one of these
+was a proxy that agreed with the truth most of the time, which is exactly what
+made each one survive so long.
+
+**Profiles now own a hand.** `profile_hand()` maps the `"Plasmid"` key to hand 0
+and everything else to hand 1. Before this the Plasmid profile wrote the RIGHT
+hand's trims and offsets - values a plasmid never reads - so tuning its crosshair
+moved the weapon's ray and the bolt kept leaving on the untouched left one. The
+seeded Plasmid row is correspondingly rebuilt from the tester's left-hand tuning
+(`vrpreset.ini`'s `aimTrimL*`/`aimPosL*`, `hands.ini`'s `*L`).
+
+**Migration note:** a `Plasmid.*` block written by the s68 build holds right-hand
+values under a key that now means the left hand. Those entries must be deleted,
+not carried - a stale one is not merely old, it is in the wrong frame.
+
+### 2026-08-27 (session 68c) - Idling is where the idle animation STARTS
+
+s68b replaced the equip-capture timer with the engine's own `Idling` edge, which
+was the right direction and still landed too early. `Hands.uc` starts the idle
+animation with `PlayAnimationOnChannelInstantEaseIn` - a BLEND - so on the first
+`Idling` frame the rig is still easing out of the equip pose. Capturing there
+captures a partial blend.
+
+**And the blend rate differs per path.** `AbilityIdling` eases at 4;
+`AbilityGenericIdling` eases at 8. A fixed capture instant therefore lands
+correctly for one plasmid and wrong for another with nothing configurable between
+them - which is precisely the report that made no sense for three rounds: *"the
+other plasmid is still wrong"*, with both sharing one global profile.
+
+The tester supplied the decisive clue by pointing back at their own earlier
+message: the positions were *perfect* on the build whose 1200 ms timer happened
+to outlast the blend, and wrong only the once it expired early. That is not an
+argument for the timer - it is the observation that **the correct capture moment
+is "after the pose stops moving", which the timer approximated and the state edge
+does not.**
+
+So the capture now waits for the pose to be STILL, measured on the same probe
+bones and the same thresholds the idle-sway kill already uses - two consecutive
+settled evaluations, bounded by the existing 4 s backstop. No new constant, and
+it adapts to whatever rate the engine picked.
+
+**The refinement of the rule this session keeps teaching.** "Read the state the
+engine publishes, don't infer it" got us here, and it was right - but a state
+edge answers *when the engine changed its mind*, not *when the consequences have
+finished arriving*. Those are different instants whenever a transition is
+animated. Read the state to know WHAT is happening; measure the geometry to know
+when it is DONE.
+
+**Regression fixed in the same pass.** 9c3fe50 pinned the numpad tuner to hand 1
+on the reasoning that it is the weapon hand's tuner. Once `active_hand()` began
+reporting 0 for a plasmid, that made the tuner silently inert while one was
+equipped - "none of the numpad modes change anything for the plasmids". It now
+follows `active_hand()`. The tester cannot type mid-session, so an in-headset
+tuner that does nothing for half of what you can hold is not a small loss.
+
+### 2026-08-27 (session 68d) - the engine evaluates the bone array 5% of the time
+
+**Measured:** 7 `engineEval=1` against 127 `engineEval=0` in one run. The engine
+re-evaluates the hands bone array on roughly **one frame in nineteen**, and
+irregularly.
+
+Everything in `drive()` that reasons about "the pose changed" runs only on those
+frames, because the whole recapture block is gated on `engineEvaluated`. So a
+condition expressed as *a count of evaluations* is really a condition on the
+engine's scheduling, which nothing in this mod controls or observes.
+
+s68c's settle detector required "two consecutive settled evaluations". With
+evaluations that sparse, where those two land - after the equip ease or in the
+middle of it - is a RACE. That is the whole of "it was really close earlier, but
+it would just break at a certain point": nothing about the holdable differed
+between a good capture and a bad one, only the timing did. It also explains why
+one plasmid looked right and another looked wrong while sharing one profile and
+one code path, and why FOUR successive fixes to identity, hand, profile and
+capture-edge changed the symptom not at all - none of them was in the loop.
+
+**The unit matters more than the threshold.** The fixed 1200 ms timer this
+lineage started with was blunt and it froze mid-equip when an animation outran
+it - but it was in WALL-CLOCK, and wall-clock is immune to the evaluation rate.
+Replacing it with an evaluation count fixed the bluntness and imported a race.
+The settle now gates on time (stillness must persist 350 ms, and never capture
+within 200 ms of the switch) with the evaluation count kept only as a floor, so
+"still" is always a comparison and never a single reading.
+
+**The diagnostic lesson, which cost four rounds.** A symptom that is bit-identical
+across changes to four different subsystems is evidence that NONE of them is
+involved. That should have redirected the search after the second attempt; instead
+each round produced a new plausible mechanism, and plausibility kept winning over
+the fact that the evidence had not moved. **When a fix changes nothing at all,
+the next step is to instrument, not to theorise again** - and the instrument that
+finally answered it, `engineEval` on the ROLLCHECK line, had been printing in
+every log the whole time.
+
+### 2026-08-27 (session 68e) - the settle test was a no-op, and its log was lying
+
+Two defects in the settle detector, both mine, both introduced while fixing the
+thing they then hid.
+
+**The threshold answered a different question.** s68d's stillness test reused
+`g_swayAngThreshDeg` - the ANIMATION ADOPTION threshold, 25 deg, raised in s67
+because BRVR measures real animations at 130-170 deg at the wrist. "Is this
+movement big enough to be a real animation?" and "has the pose stopped moving?"
+are not the same question and do not share an answer. With a 25 deg tolerance,
+any two consecutive evaluations of a smooth ease read as "still", so the test
+fired on the second evaluation whenever that landed - the race it was written to
+close was never gated at all. Measured: a capture fired at **2.34 deg of drift**,
+against a measured idle envelope of +-1.2 deg. The pose was still visibly moving.
+
+Stillness now has its own absolute constants, set just above that idle envelope:
+the pose is still when the only thing left in it is breathing.
+
+**And the instrument was lying.** The log line read `g_capStillSinceMs` and
+`g_capStillFrames` AFTER zeroing them, so every capture printed `held still
+19246078 ms across 0 evaluations` - the tick count and a zero. That number was
+sitting in the log through two rounds of diagnosis being read as evidence.
+
+**An instrument that lies is worse than no instrument**, because it is trusted.
+The tell was available and obvious - 19,246,078 ms is 5.3 hours and "0
+evaluations" cannot coexist with a rule requiring at least two - and it was read
+past because the line was mine and assumed correct. Read the numbers an
+instrument prints for PLAUSIBILITY before reading them for meaning.
+
+**On the hypothesis this round started with.** The measurement said `bones::drive()`
+runs for one hand and `active_hand()` is trigger-inferred, so a plasmid switched
+to but not fired could be undriven. The census refuted it: 29 samples of
+`hand=0 abil=1` against 8 of `hand=1 abil=1`, with the second plasmid driven
+continuously across its own switch. The hypothesis was wrong and the measurement
+cost one integer on a line that was already printing - which is the correct ratio,
+and the opposite of the four speculative fixes that preceded it.
+
+### 2026-08-27 (session 68f) - why "reverting it" did not restore it
+
+The tester asked the question that broke the deadlock: *why didn't reverting the
+commit put it back?* Because the revert (5ecbd49) undid the HAND changes only.
+The CAPTURE path had been rewritten four times underneath and none of it was
+reverted, so "back to the good build" was never true.
+
+**The good build was e8d938d, and its capture identity was `CurrentHoldable`
+alone.** `CurrentHoldable` is NULL for every plasmid, so that identity had a
+property nobody designed and nobody noticed:
+
+| transition | holdable | capture? |
+|---|---|---|
+| weapon -> plasmid | actor -> null | YES |
+| **plasmid A -> plasmid B** | **null -> null** | **NO** |
+| plasmid -> weapon | null -> actor | YES |
+
+Plasmid-to-plasmid never recaptured, so every plasmid shared ONE reference pose
+and they all sat in the same place. That is exactly the report: *"it was almost
+perfect earlier position wise switching between the two, but it was just breaking
+when switching to weapons."* Both halves of that sentence are this table.
+Switching between plasmids was clean BECAUSE nothing recaptured; the weapon
+transition broke because it is the only edge where a capture fires, and therefore
+the only place the capture's own quality can hurt.
+
+422f735 then added `CurrentAbility` to the identity so one plasmid replacing
+another would force a fresh capture. The reasoning was sound in isolation and it
+destroyed the working half - it converted a shared pose into a per-plasmid pose,
+which is a per-plasmid POSITION by construction, and the opposite of the "global,
+not per plasmid" the tester had asked for two rounds earlier.
+
+**Two rules out of this.**
+
+**A revert must be defined against a BUILD, not a commit.** "Revert the hand
+stuff" undid one axis while three others stayed rewritten, and the result was
+then read as evidence about the hand. Before reverting to restore a known-good
+behaviour, diff every axis that build differed on and say which ones are staying
+changed and why.
+
+**An accidental property can be the load-bearing one.** Nothing intended plasmids
+to share a reference pose; it fell out of watching a field that happens to be
+null for all of them. It was still the behaviour that worked, and "fixing" the
+accident regressed the feature. When a change makes a previously-good behaviour
+worse, suspect that the change removed an accident the behaviour depended on.
+
+### 2026-08-27 (session 68g) - adopting past Idling IS the equip idle cycle
+
+With the plasmid position fixed by the capture identity (68f), the weapons came
+back with "the 1 cycle idle animation on equip" - a defect 9c3fe50 had already
+killed, and which the tester had explicitly called out as fixed.
+
+The two are the same knob. 9c3fe50 captured on the FIRST `Idling` frame and
+stopped adopting there. s68c-e kept adopting PAST that edge while waiting for the
+pose to settle - and adopting during `Idling` is, definitionally, following the
+idle animation. One cycle of it, played into the rig, on every equip.
+
+**The settle machinery was built to fix the plasmid, and the plasmid was never a
+settle problem.** It was identity: `CurrentHoldable` is null for every plasmid, so
+all plasmids must SHARE one reference and must not recapture between themselves.
+Once that was right, the settle wait bought nothing and cost a regression, so it
+is deleted rather than tuned - 116 lines out of `bones.cpp`, and the three
+constants and two counters that went with it.
+
+**The rule: when a fix's premise is disproved, delete the fix.** Three commits of
+settle machinery survived the disproof of their own premise because each round
+they were merely *refined* - edge to count, count to wall-clock, threshold
+corrected - rather than re-examined. Every refinement made them more defensible in
+isolation and none of them re-asked whether the thing should exist. A fix whose
+reason has been withdrawn is not neutral: it is unexplained code that will be
+maintained, and here it was actively causing the next bug.
+
+**The tester's instrument was the branch history.** "I specifically called out
+which one fixed that" is a bisect, and it was faster than every measurement taken
+this session. Behaviour a tester has explicitly attributed to a commit should be
+treated as a REGRESSION TEST for every later commit, not re-derived from symptoms.
+
+### 2026-08-27 (session 68h) - waiting was never the mistake; ADOPTING while waiting was
+
+The tester's clue separated two things this session had treated as one knob:
+
+> Last run when the 1 cycle animation was happening, when the 2nd plasmid reached
+> its broken state after a weapon switch, switching to the other plasmid fixed the
+> position of both. This run had the 1 cycle animation fixed, but when the plasmid
+> broke by switching to weapons, switching between plasmids didn't fix either.
+
+Both halves are the same mechanism seen from opposite sides. Plasmid-to-plasmid
+DOES recapture - not through the holdable (null for all plasmids) but through the
+**Equipping edge**, which the arm also watches. So on the waiting build a plasmid
+switch ran a settle-quality capture, landed a good pose, and - because all
+plasmids share one reference - fixed both at once. On the edge-capture build the
+same switch takes a mid-blend pose, so it fixes nothing.
+
+**That makes the settled capture the correct pose, and waiting is not the defect.**
+The defect was ADOPTING while waiting: `adopt = true` makes `g_ref` track the
+engine every evaluation, and tracking during `Idling` is following the idle
+fidget - which is the "1 cycle animation on equip" exactly.
+
+They separate cleanly:
+
+- **Stop adopting at the `Idling` edge.** The rig freezes at the equip pose, so no
+  idle animation ever reaches it.
+- **Stay armed, and take ONE snapshot** once the engine's own pose has stopped
+  moving. Settle is measured between consecutive ENGINE evaluations, not against
+  `g_ref` - `g_ref` is frozen now, so comparing to it would never converge. That
+  comparison is also why the earlier version needed adoption at all.
+- **Ease onto the snapshot** with the rest-restore blend that already exists, so a
+  one-step correction arrives as a short settle rather than a pop.
+
+**The rule: when one change fixes A and breaks B, look for the two mechanisms
+before trading them off.** Four rounds treated "capture early" and "capture late"
+as a single dial with A at one end and B at the other, and spent themselves
+choosing a point on it. There was no dial - there were two independent decisions
+(when to stop following, and when to sample) that one flag happened to control.
+A tester's A/B across two builds is what exposed it, because it reported both
+symptoms and their signs, which no single-build measurement here could.
+
+### 2026-08-27 (session 68i) - the settle probe watched a bone that does not move
+
+The tester's report was precise enough to be a bisect on its own:
+
+> Any weapon switching to electrobolt works just fine and switching to the other
+> plasmid is fine, then any weapon switching to telekinesis sets its position
+> incorrectly and sets electrobolt to the same position
+
+The same plasmid being fine down one path and broken down another rules out its
+pose being inherently different. And the log gave the mechanism outright: **every
+capture in the run fired at 250-266 ms**, nine of them, regardless of what was
+being equipped. That is not a settle detector, it is the SECOND ENGINE EVALUATION
+- the engine evaluates the bone array about six times a second, so #2 always lands
+there.
+
+The settle test probed `kBoneWeaponAttach`. **A plasmid has no weapon attached**,
+so that bone barely moves during a plasmid's equip: the test asked "has the pose
+stopped moving?" of a bone that never started, answered yes on its first
+comparison, and snapshotted mid-blend.
+
+It survived on weapons because bone 43 genuinely moves with a gun on it, and on
+Electrobolt because its ease finishes inside 250 ms. Telekinesis eases for longer,
+so 250 ms is still mid-blend for it - and since every plasmid shares one reference,
+its bad capture set Electrobolt's position too. Every clause of the report is that
+one line of code.
+
+The probe is now the whole DRIVEN CLUSTER, which is the thing actually being
+captured: if any of it is still moving the capture is early, whatever is or is not
+in the hand.
+
+**The rule: a probe must be chosen for the thing being measured, not inherited
+from the code it was copied out of.** `kBoneWeaponAttach` came from the sway-kill
+threshold, where the question was "is a WEAPON animating" and the bone was right.
+Reused to ask "has THIS RIG settled", it was a constant. A measurement taken on
+the wrong instrument does not read as an error - it reads as a clean result, which
+is what made nine identical timings look like data instead of a flat line.
+
+**And the flat line was the tell.** Nine captures at 250-266 ms is not a
+distribution, and the spread of real equip animations is not 16 ms. Check whether
+a measurement VARIES before believing what it says.
+
+### 2026-08-27 (session 68j) - a plasmid rig never goes still, so stop asking
+
+Fixing the settle probe (68i) made things worse, not better, and the measurement
+it enabled is why:
+
+| driven cluster | time to "settle" | delta at capture |
+|---|---|---|
+| 27-44 (weapon) | 157 ms, 265 ms | 0.31-0.96 deg |
+| **6-21 (plasmid)** | **2156 ms** | **1.24 deg** |
+
+The plasmid cluster takes 2.2 s and lands at 1.24 deg against a 1.5 deg
+threshold - where the measured idle envelope is +-1.2 deg. **A plasmid rig never
+actually goes still**: the idle fidget keeps it moving, so the test crosses its
+threshold essentially at random. Probing CORRECTLY turned "sometimes early" into
+"any time at all", which is exactly the regression reported.
+
+So the answer is not a better threshold, it is a different question. The build the
+tester called almost perfect used a fixed 1200 ms timer whose only failure was
+firing before the equip had finished. Anchoring the same idea to the **Idling
+edge** removes that failure - the equip is over by definition once the engine says
+Idling - and leaves a deterministic instant identical for every holdable.
+
+Freeze at the edge (so no idle animation is followed into the rig), wait a fixed
+delay, take one snapshot, ease onto it. Default 700 ms, exposed on F10 and
+`vrbones equipdelay` because the right value is perceptual and the tester is the
+only one who can see it.
+
+**The rule: not every quantity a system exposes is measurable in it.** Four rounds
+were spent building a detector for "the pose has settled" in a rig that is
+animated continuously by design. The detector was refined three times and finally
+made correct - and correctness revealed there was nothing to detect. **Before
+building a measurement, check that the thing being measured actually occurs.**
+
+**And a regression is information.** Making the probe right made the symptom worse,
+which is only possible if the probe had been suppressing the real variance. That
+inversion located the answer faster than any of the fixes that preceded it.
+
+### 2026-10-08 (session 81) - the arm solver is Dishonored's, written as bones, not palette
+
+The s70i-s77 arm solve grew one fix per headset report (frames, twist accumulator,
+humerus split, clamps) until no single change could be judged on its own. Meanwhile the
+Dishonored VR mod shipped a full-arm IK that was accepted in a headset. Its algorithm was
+already two-thirds BioShock: it took the left-hand fork's reach, pole and twist design,
+plus this repo's lessons on frames and history. So the arm is now that solver
+(`bioshock1r/arm_ik.h`), pure and host-tested, behind `armIkV2` with the old one as the
+A/B.
+
+**Kept from BS1:** writing the evaluated skeleton rather than Dishonored's draw-time
+palette. Dishonored needed a mesh copy because it cannot write its engine's bones. BS1
+can, its arm bones carry no attachments, and the replay-per-pass cache already makes the
+eyes agree. The s74d shoulder frame is kept as well: it was signed off in the headset, and
+it is the frame the hands are placed in.
+
+**The evidence it rests on** is the offline triple: host suite, real-rig sweep skinned
+through the original weights, and an audit that runs Dishonored's own header on
+Dishonored's rig with the same poses. The audit shows the elbow direction within
+0.03 degrees and the shoulder and roll decisions identical. That is the claim "it is
+Dishonored's solver" made measurable. See `docs/bioshock1/ARM_IK.md`.
+
+### 2026-10-08: isolate BS1 player preferences from experimental defaults
+
+The reorganized BS1 F10 menu owns a stable settings catalogue and a separate
+`menu-settings.ini` override file. Ordinary edits persist on release; Debug
+values require an explicit save. Existing recovery presets and weapon profile
+loads reapply those overrides rather than silently erasing them. This avoids
+saving every active experiment along with a player's ordinary adjustment.
+
+The production ImGui view is also the offscreen preview target, so layout and
+interaction checks exercise the same widgets and embedded artwork. Resolution
+scaling follows Dishonored's eye-image fractions and proportional resize behavior.
+This changes BS1 through additive adapter hooks; other games keep the old UI.
+See `bioshock1/F10_MENU.md` for applicability, compatibility and unverified work.
+
+### 2026-10-10: DLSS/DLAA and the alternate frame warp - transport in core, policy in the adapter
+
+The Dishonored VR mod's process, ported to BS1 (`bioshock1/TEMPORAL.md`). The split follows
+the decoupling rule: what is genuinely game-agnostic AND new went to core, every default off -
+
+- `core/gfx/dlss_client` + `dlss_ipc.h` and `src/tools/dlss_host`: the 32-to-64 NGX
+  transport. NGX is x64-only and all three games are x86, so any of them would need exactly
+  this; it does nothing until an adapter starts it.
+- Four seams, each null by default so BS2 and Infinite run the old path byte for byte:
+  `frame_inspector::set_draw_tap` (the game's depth binding), `vr::set_eye_processor`
+  (replaces the backbuffer copy for stereo eye images), `vr::set_eye_output_size` (larger
+  eye swapchains for super resolution), and the AlternateEye pair `set_aer_eye_source` /
+  `set_held_rebuild` (an adapter-named eye per image, and a held-eye rebuild every present).
+  `blit::stretch_copy` backs the output size. Rows in `PORT-CANDIDATES.md`.
+
+Everything that knows BioShock - which depth surface is the world, the cameras, the hands
+pass, when history is valid, the F10 controls - is in `bioshock1r/temporal*.cpp` and
+`afw_gpu.cpp`. Two choices worth recording: the guides use the GAME'S camera from CalcView
+(not the XR pose model), so walking and stick turning are exact; and the Dishonored body band
+is off for BS1, because BS1's world depth does not contain the arms - they come from the
+foreground pass, which becomes DLSS's bias mask and the warp's hand depth instead.
+### 2026-10-10 (second round): stereo methods as one BS1 choice; the eye is a property of the FRAME
+
+The first headset run of the alternate frame warp flickered between the eyes: the eye was
+flipped per CalcView CALL, and BS1 makes about four calls per frame (`bioshock1/TEMPORAL.md`).
+The rule now: the eye belongs to the frame, decided once at the render view (the CalcView
+inside the gameplay scene build) and carried by every call of that frame - what BRVR's leader
+site and Dishonored's per-draw tag both do.
+
+AER (BRVR's method) and AFW (Dishonored's) became one F10 choice, "Stereo method", owned by
+`bioshock1r/alt_eye.cpp`; SequentialReentry stays the default. AER reuses core's existing
+SequentialReentry pair path instead of a new submit mode: a pair of alternate-eye frames,
+tagged L then R through `vr::sr_push_eye`, IS what that path already pairs into one XR frame
+with one locate's pose - so the BRVR behaviour needed no new compositor code. What makes the
+two frames one instant lives in the adapter: the right frame takes the left frame's head
+sample and per-call-site cameras, and the engine's frame delta is held on the right frame
+(BRVR's DeltaClamp; re-derived in `patterns.h`). The one core addition is opt-in and off by
+default: `vr::set_sr_drift_resync`, BRVR's eye-queue drift resync, which only BS1's AER
+switches on (a row in `PORT-CANDIDATES.md`).
+
+### 2026-10-09 (session 89) - the hand is pinned by its fist centre and aligned by its geometry
+
+The drawn hand is placed by the point where a handle passes through its fist - the controller
+grip pose's own origin (OpenXR /input/grip/pose) - and turned so the fist's handle axis lies on
+the grip's -Z and its palm normal on the grip's X. Both are measured from the rig
+(`tools\blender\hand_pivot.py`) and rebuilt each frame from the wrist and finger-base heads
+(`src/game/bioshock1r/hand_grip.h`). Before s89 the drive pinned the knuckle centroid and
+oriented the hand by eye-tuned trims; a pivot 3 cm off the real fist swings the drawn hand
+asymmetrically on every turn, and no trim can remove that, because a trim is a fixed offset in
+the hand's frame. This is Dishonored's grip calibration G, solved from the mesh instead of a key
+press; the per-hand trim remains as a residual nudge, zero by default. Per-weapon grips are a
+separate layer on top (the weapon's authored hand pose differs per weapon).
+### 2026-10-10 (third round): the frame inspector acts on the game's contexts only
+
+The frame inspector hooks the immediate context's VTABLE slots, and a vtable is shared by
+every `ID3D11DeviceContext` of that implementation in the process - including the OpenXR
+runtime's own device's contexts, which it drives from its own threads. Seven driver crashes
+under BS1's alternate frame warp (`nvwgf2um.dll+0x48153A`, a null object read on a driver
+worker) ended with a dump that put our Unmap detour on Virtual Desktop's compositor thread:
+the HUD and GFx classifiers, the AFW depth tap and the recorder had been running on the
+runtime's contexts with our device's resources and unsynchronized state. `install` now takes
+the game's immediate context, and every detour passes a context of another device straight
+to the original (the immediate context by pointer; any other context classified once by
+`GetDevice` and remembered). The game's own deferred contexts still count as the game's.
+Behaviour for BS2 and Infinite changes only in that the runtime's contexts no longer reach
+the classifiers - which they never should have. Details: `bioshock1/TEMPORAL.md`, "The sixth
+headset run".
+
+
+### 2026-10-11: BS1 opts into a separate native F10 composition layer
+
+`overlay::set_separate_layer(true)` is additive and off by default; only BS1 enables it.
+The ImGui canvas uses OpenXR's recommended eye dimensions independently of the game render
+and temporal output. `layer_texture()` supplies its premultiplied-alpha texture to an
+independent head-locked XR quad, submitted last at the HUD depth. Its extent follows the
+headset FOV. The controller origin and direction intersect that same finite-depth plane
+in head coordinates, then map into canvas pixels. A later `draw_mirror()` draws the same
+ImGui data at backbuffer scale after every eye consumer and the desktop HUD composition.
+Both native and mirror draws preserve all OM targets; game resize drops only backbuffer
+references and the native canvas is reusable. Session/swapchain teardown releases the XR
+overlay swapchain. Existing adapters keep their prior path. BS1 temporal processing no
+longer reads panel visibility: DLSS, TAA, source validity and AFW history continue normally.
+The layer does not join the background pace-feed snapshot, which already retains only
+the base game layer while the headset is unfocused.
+
+### 2026-10-14: BS1 reloads play at the gun, the free hand carried by the gun hand
+
+The flat game authors a reload in the camera's frame: both hands and the gun move together in
+front of the face. The old reload lever handed both hands to that clip, so the gun left the
+player's hand. Now the gun hand stays on its controller and the free hand takes the gun hand's
+own palette correction, which puts it where the clip has it relative to the gun. A sibling VR
+mod made the same decision and measured it first, so BS1 follows it. BS1 adds a join gate
+on the clip's palm-to-palm distance, so the free hand leaves its controller only while the clip
+actually brings it to the gun; the reload state alone would also pull it from wherever the clip
+parks it off screen. The clip's own motion of the gun hand is a separate weight, default 0, as
+in that mod. BRVR's size-gated adoption is the reference for that path. The state gate stays
+`hands_state` (`WeaponReloading` lasts the whole clip, ENGINE_NOTES 2026-10-14). Reading the
+playing clip's name or time from the engine would allow per-clip rules; it was not needed for
+the reload and is left for later.

@@ -27,6 +27,24 @@ inline constexpr uint32_t kHostTimeDateStamp = 0x6256F776;
 inline constexpr uint32_t kHostSizeOfImage = 0x01677000;
 inline constexpr uint64_t kHostFileBytes = 21214720;
 
+// ---- offline native-constant derivation (2026-10-11, local only) -------------
+// Read by tools/ida/nr1_stereo_constants.py, never used to hook/call engine code.
+// Derived from named shader-parameter string xrefs, material vtables and calls;
+// ENGINE_NOTES "Native eye-constant derivation" records each routine's role.
+inline constexpr char kNativeConstantResearchMd5[] = "b4db411ab3e5994b6cd39f8dd91fd990";
+inline constexpr uint32_t kNativeConstantAnchorRva = 0x375140; // ProcessEvent
+inline constexpr char kNativeConstantAnchorBytes[] = "558BEC8B81F8000000";
+inline constexpr uint32_t kNativeConstantResearchRvas[] = {
+    0x7727C0, 0x772880, 0x7BDFE0, 0x7BE8E0, 0x7BECB0,
+    0x7BE210, 0x7BE500, 0x76F950, 0x770680
+};
+inline constexpr uint32_t kNativeConstantAssemblyRvas[] = {0x772880, 0x76F950, 0x770680};
+// Per-pixel lights: exact "lights" string -> registration vtable slots 3/6 ->
+// shared payload builder -> local-vector/radius helpers. Offline analysis only.
+inline constexpr uint32_t kNativeConstantResearchLightRvas[] = {
+    0x7C57B0, 0x7C5850, 0x7C5B10, 0x7C5B50, 0x772DD0, 0x772F20
+};
+
 // False when the running exe is not the build the addresses came from. Features
 // that depend on a raw RVA must stand down; anything pattern-derived (the
 // CalcView seam, the FName chain) is build-independent and keeps working.
@@ -151,6 +169,23 @@ inline constexpr uint32_t kSceneBuildGameplayRetRva = 0x850EF0;
 inline constexpr uint8_t kSceneBuildPrologue[9] = {0x53, 0x8B, 0xDC, 0x83,
                                                    0xEC, 0x08, 0x83, 0xE4,
                                                    0xF0};
+
+// FRAME DELTA (ENGINE_NOTES "Frame delta: one world advance per AER eye pair",
+// 2026-10-10). The per-frame advance a virtual __thiscall receives as
+// (ecx this, stack arg1, stack float deltaSeconds): `ret 8`, reached only through its
+// vtable (zero static E8/E9 callers). The game thread calls it on TWO objects per
+// frame, before the scene build. Lead from BRVR's DeltaClamp (module+0x53D850 and its
+// 47-byte signature, bytes 6..9 = an SEH scope-table address, wildcarded);
+// re-derived on this exe with disasm-rva: the signature tail (bytes 10..46) occurs
+// exactly once in .text, at 0x53D85A, and the prologue + `ret 8` are as below.
+inline constexpr uint32_t kFrameDeltaRva = 0x53D850;
+inline constexpr uint8_t kFrameDeltaPrologue[5] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+// Bytes 10..46 (after the wildcarded scope-table push): checked at install as well.
+inline constexpr uint32_t kFrameDeltaTailOffset = 10;
+inline constexpr uint8_t kFrameDeltaTail[37] = {
+    0x64, 0xA1, 0x00, 0x00, 0x00, 0x00, 0x50, 0x64, 0x89, 0x25, 0x00, 0x00, 0x00,
+    0x00, 0x83, 0xEC, 0x44, 0x53, 0x56, 0x8B, 0xF1, 0xC7, 0x45, 0xE4, 0x00, 0x00,
+    0x00, 0x00, 0x57, 0x89, 0x75, 0xDC, 0x8B, 0x46, 0x44, 0x8B, 0x38};
 
 // Submitted-frame id pair (.data globals, block at [0x13AF7E8..] - see the
 // submit row in ENGINE_NOTES). Two slots (double-buffered frames): dword at
@@ -320,6 +355,17 @@ inline constexpr uint32_t kPadConnectedFlagRva = 0x11B7A10; // written by Update
 // pads still work). Ord-3 (SetState/vibration) is untouched until M7 haptics.
 inline constexpr uint32_t kXInputGetStateIatRva = 0xBCF8E0;
 inline constexpr uint32_t kXInputSetStateIatRva = 0xBCF8DC;
+// Render-device SetRes: slot and viewport fields derived in vp2/vp3 (2026-10-11).
+// Vtable, entry and first bytes observed on every confirmed resize in headset run 9,
+// build v0.8.3-239-g720c9f7. See ENGINE_NOTES 2026-10-11, "Pin the SetRes door".
+inline constexpr uint32_t kViewportDeviceOffset = 0xA4;
+inline constexpr uint32_t kViewportReentryOffset = 0x208;
+inline constexpr uint32_t kViewportFlagsOffset = 0x20C;
+inline constexpr uint32_t kViewportAltFullscreenOffset = 0xFC;
+inline constexpr uint32_t kDeviceSetResSlot = 61;
+inline constexpr uint32_t kRenderDeviceVtableRva = 0xE38E7C;
+inline constexpr uint32_t kRenderDeviceSetResRva = 0x75F940;
+inline constexpr uint8_t kRenderDeviceSetResPrologue[] = {0x55, 0x8B, 0xEC, 0x6A};
 // Exec chain entries (UBOOL __thiscall Exec(const wchar_t* cmd,
 // FOutputDevice& ar), ret 8; found via ParseCommand string clusters + RTTI):
 // UWindowsViewport::Exec handles SETRES/TOGGLEFULLSCREEN/SETMOUSE/...;
@@ -455,6 +501,19 @@ inline constexpr uint32_t kHandsVtableRva = 0xD8A28C;         // .?AVAHands@@ (M
 inline constexpr uint32_t kSkeletonInstanceVtableRva = 0xE19ACC; // .?AVSkeletonInstance@@
 inline constexpr uint32_t kActorMeshInstOffset = 0x128;  // AActor -> USkeletalMeshInstance*
 inline constexpr uint32_t kActorSkelInstOffset = 0x3FC;  // AActor -> SkeletonInstance*
+// The mesh instance's SOCKET TABLE (rs14, rs18): +0xE8 socket FNames (8 bytes each), +0xEC their
+// count, +0xF4 the bone each aliases, +0x100 a 48-byte FCoords offset in that bone's frame.
+inline constexpr uint32_t kMeshInstSocketNamesOffset = 0xE8;
+inline constexpr uint32_t kMeshInstSocketCountOffset = 0xEC;
+// AActor::GetBoneCoords, the C++ behind execGetBoneCoords (+0x545090), tools\ida\rs17/rs18:
+//   FCoords* __thiscall (FCoords* out, FName BoneName /* by value */, UBOOL bGetSocketCoords), ret 0x10
+// World space (origin, then X/Y/Z axes). A socket name resolves through the table above to its
+// bone (+0x3F4BD0); with bGetSocketCoords the socket's own offset is applied too (+0x3F9D80) -
+// the script corpus calls it that way for every socket. Its early returns (no mesh instance, a
+// failed LOD check) leave `out` unwritten.
+inline constexpr uint32_t kActorGetBoneCoordsRva = 0x544FA0;
+inline constexpr uint8_t kActorGetBoneCoordsPrologue[12] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8,
+                                                            0x83, 0xEC, 0x30, 0x56, 0x8B, 0xF1};
 inline constexpr uint32_t kSkelInstActorOffset = 0x04;   // backref to the actor
 inline constexpr uint32_t kSkelInstFreezeOffset = 0x20;  // int; SkeletonInstanceFreeze = 1
 inline constexpr uint32_t kSkelInstBonesOffset = 0x48;      // hkQsTransform* array A
@@ -462,6 +521,65 @@ inline constexpr uint32_t kSkelInstBoneCountOffset = 0x4C;  // int (AHands rig: 
 inline constexpr uint32_t kSkelInstBonesBOffset = 0x54;     // hkQsTransform* array B
 inline constexpr uint32_t kSkelInstBoneCountBOffset = 0x58;
 inline constexpr uint32_t kSkelInstDirtyOffset = 0x88;   // evaluate-if-dirty flag (byte)
+// ---- s87: THE SKIN PALETTE (CPU skinning; Dishonored's palette route) --------------------
+// BS1 skins skeletal meshes ON THE CPU. The hands are ONE draw of 26178 indices (NEWPlayerHands
+// LOD 0: 8726 triangles) from a 2 MB dynamic vertex ring at stride 56 (s87 frame dump + vbtap);
+// the draw binds a 576-byte VS b0 and no bone constants. The palette is a TArray of 4x4 floats
+// on the USkeletalMeshInstance, one per skeleton bone, ROW-VECTOR form: rows 0-2 are the images
+// of the bind-space axes, row 3 the translation (p' = x*R0 + y*R1 + z*R2 + R3).
+// Derivation (tools\ida\rs5..rs11, ENGINE_NOTES s87): FFinalSkinVertexStream (vtable 0xDF32A0)
+// slot 9 calls the GATHER below with (mesh instance, lod, out, a5); the gather copies
+// instance[+0x170][boneMap[slot]] into a per-LOD cache through the LOD's u16 bone map (LOD
+// +0x0C ptr / +0x10 count; LODs at mesh +0xC4, 288 bytes each; mesh at instance +0x44), then
+// calls the dispatch +0x5EC080, which runs VertexSkinTask (+0x5EBAB0: rigid 60-byte and skinned
+// 64-byte vertices, 4 weights / 255) inline or on a worker. The gather is the hook: thiscall,
+// 4 stack args, retn 10h, a plain frame prologue (bytes below, verified before hooking).
+inline constexpr uint32_t kSkinGatherRva = 0x3ED660;
+inline constexpr uint8_t kSkinGatherPrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x8B,
+                                                  0x45, 0x08, 0x53, 0x8B, 0xD9, 0x8B, 0x4D, 0x0C};
+inline constexpr uint32_t kMeshInstPaletteOffset = 0x170;      // FMatrix* (64 bytes each)
+inline constexpr uint32_t kMeshInstPaletteCountOffset = 0x174; // int (AHands rig: must be 47)
+// The skinned instance's OWNER actor. Live-derived s87: the gather never sees actor+0x128 (that
+// pointer is another object); the instance it skins for the hands holds the hands actor at +0x48
+// (a pointer scan of the instance against the drive's actor, on the 47-bone instance the gather
+// was skinning). The match is on this field.
+inline constexpr uint32_t kMeshInstOwnerOffset = 0x48;
+// s88, the rigid wrist (Dishonored VR-184) needs the skinned vertices the gather hands the
+// skinner. tools\ida\rs10/rs11: the gather reads mesh = instance[+0x44], LODs = mesh[+0xC4]
+// (count mesh[+0xC8], 288 bytes each); in a LOD the u16 bone map at +0x0C (count +0x10) and the
+// skinned vertices at +0x40 (count +0x44), which the gather pushes to the dispatch at call time.
+// A skinned vertex is 64 bytes: four bone slots (indices into the LOD bone map) at +56 and four
+// weights (/255) at +60 - the offsets the skinner +0x5EBAB0 reads them at.
+inline constexpr uint32_t kMeshInstMeshOffset = 0x44;
+inline constexpr uint32_t kMeshLodsOffset = 0xC4;
+inline constexpr uint32_t kMeshLodCountOffset = 0xC8;
+inline constexpr uint32_t kLodStride = 288;
+inline constexpr uint32_t kLodBoneMapOffset = 0x0C;
+inline constexpr uint32_t kLodBoneMapCountOffset = 0x10;
+inline constexpr uint32_t kLodSkinnedVertsOffset = 0x40;
+inline constexpr uint32_t kLodSkinnedCountOffset = 0x44;
+inline constexpr uint32_t kSkinnedVertexStride = 64;
+inline constexpr uint32_t kSkinnedVertexBonesOffset = 56;
+inline constexpr uint32_t kSkinnedVertexWeightsOffset = 60;
+// The held WEAPON is not CPU-skinned (s87 gather census: no holdable among the skinned owners);
+// it is a UStaticMesh drawn with one transform per draw. UStaticMesh vtable (0xDF20B4) slot 5,
+// +0x3DBCF0 (tools\ida\rs12/rs13), hands the renderer a per-draw record's LocalToWorld (+160)
+// and WorldToLocal (+224), row-vector 4x4: Dishonored's per-draw component transform (1.5).
+// thiscall (mesh, record, renderer, a4), retn 0Ch, prologue verified before hooking.
+inline constexpr uint32_t kStaticMeshDrawRva = 0x3DBCF0;
+inline constexpr uint8_t kStaticMeshDrawPrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x24, 0x83,
+                                                      0x7D, 0x10, 0x00, 0x53, 0x56, 0x57};
+inline constexpr uint32_t kDrawRecLocalToWorldOffset = 160;
+inline constexpr uint32_t kDrawRecWorldToLocalOffset = 224;
+// s82: the EVALUATOR - the engine routine that rebuilds the bone array from the
+// animation. Derived offline (tools\ida\hd1_skelinst_update.py, ENGINE_NOTES s82): vtable
+// slot +0x9C, reached from four call sites each guarded by the dirty byte above, and
+// skipped outright while freeze (+0x20) is set and the last-evaluate time (+0x80) is
+// positive. The slot's target is read from the vtable at runtime and must equal the RVA
+// below, or the hook refuses. BS1's twin of BS2's wfix target (BS2 s74).
+inline constexpr uint32_t kSkelInstEvaluateSlot = 0x9C;
+inline constexpr uint32_t kSkelInstEvaluateRva = 0x597CF0;
+inline constexpr uint32_t kSkelInstLastEvalTimeOffset = 0x80; // float
 // Session 20: bone NAMES. SkeletonInstance +0x08 -> SharedSkeletonData, whose
 // +0xAC map is FName -> bone index (lookup fn 0x5F6500, disassembled): a
 // standard UE hash map - +0x00 pairs base (16-byte pairs: +0 chain next,
@@ -482,6 +600,13 @@ inline constexpr uint32_t kActorAttachBoneNameOffset = 0xF0;
 // +0x2AC, written by AActor::SetDrawScale (0x375830) together with the dirty
 // protocol below - a raw field poke without the protocol is invisible.
 inline constexpr uint32_t kActorDrawScaleOffset = 0x2AC;
+
+// DrawScale3D (+0x2B0) USED TO BE DECLARED HERE. Removed in the PR-51 review
+// pass: the arm hide moved to the bones, leaving it with no reader in src/,
+// and its comment still asserted the "DrawScale3D is a safe hide" claim that
+// 293 read-only samples falsified. The offset, the +0x2AC/+0x2B0 distinction
+// and the never-write-exact-zero warning are all kept in ENGINE_NOTES,
+// "The DrawScale3D offset itself, kept after the constant was deleted".
 inline constexpr uint32_t kActorDirtyFlagsOffset = 0xD0;  // |= 0x10 on transform-ish change
 inline constexpr uint32_t kActorRenderRevOffset = 0x3F4;  // ++ (UpdateRenderRevision)
 inline constexpr uint32_t kActorDirtyByteOffset = 0x3E4;  // = 0
@@ -494,6 +619,11 @@ inline constexpr uint32_t kActorDirtyByteOffset = 0x3E4;  // = 0
 inline constexpr int kHandsRigBoneCount = 47;
 inline constexpr int kBoneRClusterFirst = 27;
 inline constexpr int kBoneRClusterLast = 44;
+// The same index as kBoneRClusterFirst, named separately on purpose: the s64
+// motion gate samples a WRIST, not whichever bone happens to sort first in the
+// cluster. If the cluster bounds are ever re-measured the two must be free to
+// move apart, and a mirror of kBoneLWrist makes the pair greppable.
+inline constexpr int kBoneRWrist = 27;
 inline constexpr int kBoneWeaponAttach = 43;
 inline constexpr int kBoneRSleeve[] = {24, 25, 26, 45, 46};
 // Left mirror, measured with Electro Bolt raised (left arm forward): wrist 6,
@@ -504,6 +634,20 @@ inline constexpr int kBoneLClusterFirst = 6;
 inline constexpr int kBoneLClusterLast = 21;
 inline constexpr int kBoneLWrist = 6;
 inline constexpr int kBoneLSleeve[] = {3, 4, 5, 22, 23};
+// s86c: THE PALM ANCHOR per hand - the point the hand drive pins to the controller and
+// turns about (Dishonored's rigid palm anchor, VR-183; hand_compose.h palm_of/delta). The
+// right hand's is R_grip (43, where every weapon is held), the left hand's the base of the
+// middle finger (kBone_L_Middle1, 13); both from the s82 P3 sweep, which proved the model on
+// the real clips with exactly these two. Pinning the WRIST instead (s83-s86b) put a 10 cm
+// lever on every wrist turn.
+inline constexpr int kBoneRPalm = kBoneWeaponAttach;
+inline constexpr int kBoneLPalm = 13;
+// s86f: the anchor is the PALM'S CENTRE - the mean of the hand bone and the four finger
+// bases (Index1, Middle1, Ring1, Pinky1), the bone-level twin of Dishonored's anchor patch
+// (the centroid of the kept hand mesh). R_grip (above) sits 4 rig units from the wrist,
+// at the heel of the hand, so turning about it still swung the palm ~6 cm.
+inline constexpr int kBoneRPalmBones[] = {27, 31, 34, 37, 40};
+inline constexpr int kBoneLPalmBones[] = {6, 10, 13, 16, 19};
 
 // ---- Foreground (viewmodel) scene (session 13, 2026-07-26) ------------------
 // The renderer draws the first-person rig as a separate FOREGROUND scene with
@@ -535,6 +679,28 @@ inline constexpr uint32_t kPawnForegroundFovOffset = 0x558; // research; not a r
 // address (the pawn's eye height). The session-13 "+0x558 non-lever" verdict
 // stands; this is its correction.
 inline constexpr uint32_t kPcForegroundFovOffset = 0x460;
+// THE WORLD FOV, and its mirror. Both floats on the PLAYERCONTROLLER, both
+// already derived in this tree for another purpose: the foreground scene-node
+// ctor below is passed `float PC+0x45C` (the world lens, default 75.0) beside
+// PC+0x460 (the foreground one), and the note on PC+0x65C records the
+// "75/75/60 fov floats" sitting at PC+0x648..0x650. Named here because s65
+// needs to WRITE them, not merely read them.
+//
+// A SCRIPTED CAMERA NARROWS THESE AND CalcView NEVER SAYS SO. Measured
+// 2026-08-23 on the bathysphere: CalcView keeps reporting fov=100.0 for the
+// whole ride while the renderer switches to 80 deg on the frame the forced
+// move begins (`rendered tanH 0.8391 = 80.0 deg vs option 100.0`). Rendering
+// narrower than we claim to OpenXR is what puts the picture in a small box
+// with black all round it - the image is correct and full-resolution, it just
+// occupies less of the headset than the layer says it does.
+//
+// BRVR reached the same two fields independently (`ClampWorldFov`,
+// `BioshockVR/Game/GameState.cpp`, its `WorldFovOffset`/`WorldFovOffset2`) and
+// measured the narrow side as 75.0 -> 60.0 there. THE NUMBERS DO NOT TRANSFER
+// - this build reads 100 -> 80 - but the OFFSETS agree with the derivation
+// already in this file, which is the corroboration that matters.
+inline constexpr uint32_t kPcWorldFovOffset = 0x45C;
+inline constexpr uint32_t kPcWorldFovMirrorOffset = 0x648;
 // cb0 fingerprint: floats 12..18 of every foreground draw hold the constant
 // screen-ray block (2*tanH, 0, -tanH, 0, 0, -2*tanV, tanV) of the fixed
 // projection; the capture spans floats 36..59 (viewport block, then the
@@ -583,30 +749,23 @@ inline constexpr float kFgInvTanV = 2.3094011f; // 1/0.4330127
 inline constexpr float kFgViewYawBiasDeg = 1.7f;
 inline constexpr float kFgViewPitchBiasDeg = 1.1f;
 
-// ---- The FOREGROUND SCENE NODE (session 21) --------------------------------
-// The fg pass is a SECOND SCENE NODE, pure data through shared render
-// machinery (dump stack-diff: fg and world draws share the whole skeletal
-// draw layer; they differ only in which recorded scene command iterates the
-// mesh and which section-transform provider bakes it). The scene build
-// (kSceneBuildRva 0x4CCE70) allocates a 0x400-byte fg node per frame from
-// the frame pool and constructs it at the RVA below with
-// (parentScene, &parentScene.view@+0x118, x, vec3 PC+0x65C, triple PC+0x668,
-// float PC+0x45C, float PC+0x460), then stores it at parentScene+0x1B0.
-// Derivation: static capstone disasm of the build's [PC+0x460] float read
-// (the only fg-fov consumer in the build region; found by disp-0x460 code
-// search) at build+0xD71, and of the ctor + its finisher (0x56DD90 - view
-// offset/rotation compose into node+0x150). The ctor's base-class call
-// receives THE PARENT VIEW POINTER - the fg node's view starts as a copy of
-// the world view; the fg divergence (actor orientation, eye pull) enters
-// downstream. The vec3 at PC+0x65C and triple at PC+0x668 read zero live at
-// rest (auxiliary offsets; 75/75/60 fov floats sit just before them at
-// PC+0x648..0x650).
+// ---- The PLAYER SCENE NODE (legacy Fg names, session 21) ------------------
+// Tenth-run correction, 2026-10-11: this is FCameraSceneNode -> FPlayerSceneNode,
+// the submitted player scene, not an independent hands-only camera. The build
+// (kSceneBuildRva) calls eventPlayerCalcView at RVA 0x4CCF5D, THEN this ctor at
+// RVA 0x4CDC31, THEN submits at RVA 0x4CDCD2. Earlier notes had the order reversed.
+// Derivation: headless IDA xrefs/disassembly on md5 b4db411ab3e5994b6cd39f8dd91fd990;
+// ENGINE_NOTES tenth-run call-order correction. The ctor stores absolute loc at
+// +0x310 and rot at +0x3E4, and its finisher 0x56DD90 builds view +0x150/inverse
+// +0x190. The build writes FPlayerSceneNode's vtable and viewport+0x1B0.
+// The live override must use the build's COMMITTED eye, since CalcView has already
+// advanced the next eye. Keep the existing symbol names to avoid a broad rename.
 inline constexpr uint32_t kFgSceneNodeCtorRva = 0x56DC30;
 inline constexpr uint8_t kFgSceneNodeCtorPrologue[5] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
 inline constexpr uint32_t kFgSceneNodeVtableRva = 0xE1846C; // written by the build after ctor
-inline constexpr uint32_t kSceneViewOffset = 0x118;   // parent scene's view block
-inline constexpr uint32_t kSceneFgNodeOffset = 0x1B0; // parentScene -> fg node (per frame)
-inline constexpr uint32_t kScenePcOffset = 0x48;      // parentScene -> PlayerController
+inline constexpr uint32_t kSceneViewOffset = 0x118;   // viewport-supplied view argument
+inline constexpr uint32_t kSceneFgNodeOffset = 0x1B0; // viewport -> player scene node (per frame)
+inline constexpr uint32_t kScenePcOffset = 0x48;      // viewport -> PlayerController
 inline constexpr uint32_t kFgSceneNodeViewOffset = 0x150; // view matrix the finisher composes
 inline constexpr uint32_t kFgSceneNodeFovAOffset = 0x3F0; // from PC+0x45C (default 75.0)
 inline constexpr uint32_t kFgSceneNodeFovBOffset = 0x3F4; // from PC+0x460 (the vrfgfov field)
@@ -624,6 +783,25 @@ inline constexpr uint32_t kFgSceneNodeBytes = 0x400;
 // owner-valid), which is why per-weapon profiles only swapped on FIRE in the
 // first headset run.
 inline constexpr uint32_t kHandsCurrentHoldableOffset = 0x45C;
+
+// Hands.CurrentAbility - the equipped PLASMID, the ability half of "is anything
+// in your hands". BRACKETED BY TWO OFFSETS THIS REPO DERIVED INDEPENDENTLY,
+// which is why it is not a number copied across:
+//
+//     +0x450  PawnOwner / Hands.Base   kHandsBaseOffset, derived here
+//     +0x454  CurrentAbility           <-- this one
+//     +0x458  OldAbility
+//     +0x45C  CurrentHoldable          kHandsCurrentHoldableOffset, derived here
+//
+// Four consecutive pointer-sized fields with our own two at each end and one
+// slot spare between - the only layout that fits. BRVR's ENGINE-MAP.md records
+// the same table, and its HandsProbe derives the ability slot as
+// `CurrentHoldable - 8` so one ini key drives both and they cannot drift.
+//
+// A NULL HERE IS MEANINGFUL, not a failure: nothing equipped. Read it with
+// hands::armed(), which fails towards "armed" so a cosmetic gate can never
+// strand the crosshair off.
+inline constexpr uint32_t kHandsCurrentAbilityOffset = 0x454;
 
 // ---- UObject identity (session 21) ------------------------------------------
 // Derived live via the seam: the equipped weapon actor's +0x28 dword read
@@ -674,6 +852,7 @@ struct Symbols {
     void* abilityFireStart = nullptr; // UAttackAbility::GetPerfectFireStart impl
     void* weaponInitDamage = nullptr;  // AWeapon::InitiateDamage impl (telemetry)
     void* abilityInitDamage = nullptr; // UAttackAbility::InitiateDamage impl (telemetry)
+    void* actorGetBoneCoords = nullptr; // AActor::GetBoneCoords (the weapon's muzzle socket)
 };
 
 // Runs all scans, logging each stage. False if anything failed to resolve.
@@ -698,6 +877,81 @@ void hfov_scan_rearm(const char* why);
 
 // True once the settings object is bound, for status lines.
 bool settings_bound();
+
+// ---- M7 scripted-event signals (session 64, 2026-08-22/23) ------------------
+//
+// Every offset the scripted-event module reads. They lived in scripted.cpp
+// until VOID's review of PR 51 pointed out that the repo rule puts engine
+// addresses HERE and nowhere else; the derivations moved with them unchanged.
+// The bit masks travel with their owning field on purpose - a bit index is
+// only meaningful against the DWORD it was derived in, and splitting the two
+// across files is how the wrong bit gets read off the right offset.
+
+// Hands.uc declares three consecutive bools at lines 80-82, and UE2 packs
+// consecutive bools into one DWORD:
+//     bit 0  bFinishedStateAnimations
+//     bit 1  AbilityHasBeenReleased
+//     bit 2  CurrentlyExecutingScriptedHandAnimationSequence   <-- ours
+// BRVR computed the DWORD's address by walking the field list from its proven
+// +0x494/+0x498 anchor. THE WALK IS THE WEAK LINK, not the bit, which is why
+// scripted.cpp's anchor_check re-validates the walk at four points along it.
+inline constexpr uint32_t kHandsScriptedBits = 0x594;
+inline constexpr uint32_t kScriptedBit = 1u << 2;
+
+// FALSIFIED IN BRVR, M7-S3, recorded here so it is not re-proposed: bit 0 is
+// NOT "an animation is playing". It is bFinishedStateAnimations, it tracks the
+// Hands state machine's own animations, and gating on it produced OPPOSITE
+// failures in two scenes (arms hidden through the whole Little Sister crawl;
+// arms stuck visible and frozen on the plasmid balcony). The state
+// PlayingScriptedHandAnimation has an EMPTY BODY and never touches the flag.
+// DO NOT gate anything on bit 0.
+
+// The anchor slots. Four FNames on the hands actor, computed from the same
+// field walk that produces +0x594 - so if all four resolve to real names, the
+// walk is validated at four points along its length and +0x594 is standing on
+// something.
+//   +0x498  HandsOffscreenAnimationName        (BRVR's proven anchor)
+//   +0x4B8  InjectingEveAnimationName          (the plasmid injection)
+//   +0x4D8  ExorcisingGathererAnimationName    (the rescue)
+//   +0x558  CurrentScriptedAnimationName       (what is playing NOW)
+inline constexpr uint32_t kAnchorSlots[4] = {0x498, 0x4B8, 0x4D8, 0x558};
+
+// MEASURED AND NOT KEPT, BRVR M7-S2: +0x558 read 'None' (index 0) for an entire
+// run INCLUDING throughout a scripted sequence. So animation-level naming does
+// not come from that field and the index-comparison idea it was going to enable
+// is unproven. It is an anchor slot here and nothing more.
+
+// Hands.Base. Derived live in this repo already - see kHandsCurrentHoldableOffset
+// above: "hands+0x450 held the pawn = Hands.Base; the weapon's own +0x450 holds
+// the hands actor: the attach chain weapon -> hands -> pawn is self-consistent".
+inline constexpr uint32_t kHandsBaseOffset = 0x450;
+
+// Pawn.uc line 46 bCannotFall. Pawn's own fields start at the AActor base
+// 0x450; lines 13..44 are EXACTLY 32 bools, one full DWORD at +0x460, so the
+// next three start a fresh one at +0x464:
+//     bit 0  ShouldNotTakeDamageOnNextLanding
+//     bit 1  bCannotFall                            <-- ours
+//     bit 2  bUseHavokRigidBodyCapsuleCollisions
+// THE ORACLE: ShockPlayer defaults bit 2 TRUE, and
+// ActionEnableBathysphereModeForPlayer clears it in the same call that sets
+// bit 1. Entering a ride must therefore flip BIT 1 UP AND BIT 2 DOWN IN THE
+// SAME WRITE - two bits moving in opposite directions at once is not something
+// a wrong offset produces by chance. Every edge logs both bits so the oracle
+// can be read straight out of the log.
+inline constexpr uint32_t kPawnFlagsBOffset = 0x464;
+inline constexpr uint32_t kCannotFallBit = 1u << 1;
+inline constexpr uint32_t kHavokCapsuleBit = 1u << 2;
+
+// ShockPlayerController.bIsForcingPlayerMove. BRVR could NOT compute this one:
+// six interface-typed fields of unknown size sit between the class base and the
+// flag. Found by differential probe (M7-S5) and correlated across three events
+// whose durations differ by 24x - 1.0 s ("went straight in"), 0.24 s (instant),
+// 5.75 s ("the slewing") - each matching an independent tester report.
+//
+// A LONE BOOL IS EXACTLY 0 OR 1. Anything else means a stale pointer or a wrong
+// offset, which is not hypothetical: BRVR caught its own bathysphere read doing
+// precisely that. The shape check in forced_move_tick refuses anything wider.
+inline constexpr uint32_t kCtlForcedMoveOffset = 0x9E0;
 
 // ---- live-object search -----------------------------------------------------
 // Find a live object by its class vtable. There is no static pointer to most

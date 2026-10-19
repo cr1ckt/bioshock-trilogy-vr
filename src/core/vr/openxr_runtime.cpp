@@ -5,9 +5,13 @@
 // quad layer containing a copy of the game backbuffer.
 
 #include "core/vr/openxr_runtime.h"
+#include "core/gfx/frame_pacing.h"
+#include "core/gfx/desktop_present.h"
 
 #include "core/gfx/blit.h"
 #include "core/gfx/hud_capture.h"
+#include "core/ui/overlay.h"
+#include "core/ui/overlay_geometry.h"
 #include "core/util/log.h"
 #include "core/util/xr_math.h"
 
@@ -55,6 +59,7 @@ XrFrameState g_frameState{XR_TYPE_FRAME_STATE};
 XrSwapchain g_swapchains[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
 std::vector<XrSwapchainImageD3D11KHR> g_images[2];
 uint32_t g_swapW = 0, g_swapH = 0;
+uint32_t g_bbW = 0, g_bbH = 0; // the backbuffer size they were built for (= swap size unless an output size is set)
 uint32_t g_backbufferFmt = 0; // DXGI format the live swapchains were built for
 // Set by on_resize (which runs inside the game's ResizeBuffersDetour, at an
 // arbitrary point in the frame) and consumed by the frame loop at a point where
@@ -83,6 +88,10 @@ std::atomic<bool> g_laserMuzzle{false};
 std::atomic<float> g_laserMuzzleD0[3] = {0.0f, 0.0f, -1.0f};
 std::atomic<float> g_laserModelPitchTrim{0.0f}, g_laserModelYawTrim{0.0f},
     g_laserModelRollTrim{0.0f};
+// A fixed ray (LaserConfig::fixedRay), slot 0 only.
+std::atomic<bool> g_laserFixed{false};
+std::atomic<float> g_laserFixedStart[3] = {0.0f, 0.0f, 0.0f};
+std::atomic<float> g_laserFixedDir[3] = {0.0f, 0.0f, -1.0f};
 std::atomic<uint32_t> g_laserLayersSubmitted{0};
 std::atomic<bool> g_loggedFirstLaser{false};
 
@@ -142,12 +151,62 @@ std::atomic<float> g_screenDistM{1.75f};  // quad distance in meters
 std::atomic<float> g_screenWidthM{2.4f};  // quad width in meters
 std::atomic<bool> g_cameraMode{false};    // M3: drive the game camera from the HMD
 
+// ---- SCREEN PLACEMENT (ported from the BRVR mod, docs/bioshock1/PORT-PLAN.md)
+// Where the cinema quad sits while the game is on it: the menus, the map, the
+// manual, the machine flows, the hack board, loading screens and cutscenes.
+//
+// The two pre-existing placements each had a failure the other did not:
+//   - g_space with an IDENTITY pose puts the screen at the RECENTER ORIGIN's
+//     forward, so a player who has turned since recentring gets a menu behind
+//     them and has to hunt for it.
+//   - g_viewSpace pins it to the head, so the screen swims with every glance
+//     and cannot be read the way a screen on a wall can.
+// Anchor mode takes the head pose ONCE, when the screen opens, and leaves the
+// quad there in world space until it closes. That is the BRVR behaviour, and
+// it is the one that reads as "a screen in the room".
+//
+// 0 = anchor, 1 = head-locked, 2 = recenter origin.
+//
+// THE DEFAULT HERE IS THE OLD BEHAVIOUR, ON PURPOSE. This is core, so it is
+// BioShock 1, BioShock 2 and Infinite at once, and anchor placement has only
+// been verified in a headset on BS1. A game opts in from its own adapter
+// (bioshock1r_adapter.cpp init) - so the new placement is BS1-specific until
+// somebody puts the headset on for the other two, at which point their
+// adapters opt in the same way and this default can finally move to 0.
+constexpr int kScreenPlaceLegacy = 2;
+// Published by the adapter: a full-screen pause interface is up. A fifth input
+// to the cinematic verdict, and the only one that is not render-side - see
+// publish_ui_pause() in the header for why the render side cannot see it.
+std::atomic<bool> g_uiPaused{false};
+// Aiming furniture should be hidden. Published by the adapter for the same
+// reason g_uiPaused is - every reason is a game-side fact the render side
+// cannot see - and consumed only to SUPPRESS. Core does not know why; the
+// adapter owns that. Defaults false, so a game that never publishes it behaves
+// exactly as before.
+std::atomic<bool> g_aimSuppressed{false};
+std::atomic<int> g_screenPlaceMode{kScreenPlaceLegacy};
+std::atomic<float> g_screenHeightM{0.0f}; // vertical nudge applied to the anchor
+
+// Anchor state. Present thread only - the quad branch below is the sole reader
+// and writer, so no synchronisation is needed or wanted here.
+bool g_screenAnchorSet = false;
+XrPosef g_screenAnchor = {};
+float g_screenAnchorHead[3] = {0.0f, 0.0f, 0.0f};
+// Drop a stale anchor once the head has travelled this far from where the
+// screen was placed: headset picked up off a desk, player stood up, roomscale
+// step. Below it, ordinary head motion must NOT move the screen.
+constexpr float kScreenReanchorM = 0.45f;
+std::atomic<uint32_t> g_screenAnchors{0}; // how many times a screen was placed
+
 // Session 19 HUD floating quad: the gameswf HUD captured by core/gfx/
 // hud_capture is copied into its own swapchain and composited head-locked
 // (g_viewSpace) during stereo gameplay. Sliders persist via vrpreset.ini.
 XrSwapchain g_hudSwapchain = XR_NULL_HANDLE;
 std::vector<XrSwapchainImageD3D11KHR> g_hudImages;
 uint32_t g_hudSwapW = 0, g_hudSwapH = 0;
+XrSwapchain g_overlaySwapchain=XR_NULL_HANDLE;
+std::vector<XrSwapchainImageD3D11KHR> g_overlayImages;
+uint32_t g_overlayW=0,g_overlayH=0;
 int64_t g_swapFormat = 0; // the format create_swapchains picked (lazy HUD create)
 std::atomic<float> g_hudDistM{1.30f};
 std::atomic<float> g_hudWidthM{1.25f};
@@ -276,6 +335,14 @@ int g_currentEye = 0;                    // eye slot the next captured frame bel
 XrPosef g_eyePose[2] = {};               // pose claimed for each eye's held image
 bool g_eyeValid[2] = {false, false};     // eye slot holds a released image + pose
 
+// Temporal seams (header: "Temporal seams"). Null / zero = the plain capture path.
+std::atomic<EyeProcessorFn> g_eyeProcessor{nullptr};
+std::atomic<uint32_t> g_outputW{0}, g_outputH{0};   // requested eye swapchain size, 0 = backbuffer
+std::atomic<AerEyeSourceFn> g_aerEyeSource{nullptr};
+std::atomic<HeldReadyFn> g_heldReady{nullptr};
+std::atomic<HeldRebuildFn> g_heldRebuild{nullptr};
+uint64_t g_heldRebuilds = 0, g_heldCopies = 0, g_aerUnknownEyes = 0; // render thread
+
 // s50 (Infinite): rendered-pose eye tags - see the header comment. Default
 // OFF; only an adapter arms it (additive, BS1/BS2 untouched). The ipd mirror
 // tracks the arming adapter's slider so the tag reconstructs the SAME offset
@@ -334,6 +401,10 @@ std::atomic<int8_t> g_srRing[kSrRingSize] = {};
 std::atomic<uint32_t> g_srPushed{0}, g_srPopped{0}, g_srDropped{0},
     g_srCleared{0};
 std::atomic<bool> g_loggedFirstSr{false};
+// BRVR's drift resync (set_sr_drift_resync): opt-in, off by default.
+std::atomic<bool> g_srDriftResync{false};
+std::atomic<uint32_t> g_srDriftResyncs{0};
+uint32_t g_srDeepRun = 0; // render thread: consecutive pops that found more than one tag
 // Session 28: a live-lens claim substitution must announce itself once. An
 // unexplained src=live is what let the yaw warp hide for a session.
 std::atomic<bool> g_loggedLiveClaim{false};
@@ -379,6 +450,19 @@ std::atomic<uint32_t> g_pmStereoSubmits{0}, g_pmStaleL{0}, g_pmStaleR{0};
 std::atomic<uint32_t> g_pmAgeMax[2] = {};    // worst capture age at submit, ms
 std::atomic<uint64_t> g_pmLastCapMs[2] = {}; // tick of last SR capture per eye
 constexpr uint32_t kPmStaleAgeMs = 50; // > any healthy cadence (SR ~14ms, AER ~28ms)
+
+// Issue #31 hunt, this session: event-edge witnesses over the same mechanisms
+// the minute counters aggregate. A tester says "I saw the flicker at 12:03";
+// a minute-window counter cannot answer that, a timestamped line can. Off by
+// default and armed only by the BS2 adapter, so BS1/BSI logs are untouched.
+// NOTE the s62 premise above ("any pair break leaves the LEFT eye stale") is
+// only true for breaks on the RIGHT present; a lone-left break (pass 2
+// skipped) captures a fresh LEFT and submits with the RIGHT eye old - so the
+// probe must watch BOTH eyes, and staleR is as interesting as staleL.
+std::atomic<bool> g_pairEdgeLog{false};
+std::atomic<int> g_srLastPop{0};      // what THIS present popped; hud interval attribution
+std::atomic<uint32_t> g_pmPopDeep{0}; // pops that found a full pair queued (phase-offset tell)
+bool g_unheldRight = false;           // present thread: unheld-right transition latch
 
 // Session 42 (Infinite I6 judder): pair-CADENCE statistics. The judder question
 // is not "how many pairs per second" but "how EVENLY are they spaced" - a mean
@@ -739,6 +823,11 @@ void phase_record(int ph, int64_t t0) {
         g_qpcFreq = f.QuadPart ? f.QuadPart : 1;
     }
     uint32_t us = static_cast<uint32_t>((phase_now() - t0) * 1000000 / g_qpcFreq);
+    const frame_pacing::Phase phases[kPhCount] = {
+        frame_pacing::VrBegin, frame_pacing::VrEnd, frame_pacing::XrWait,
+        frame_pacing::XrBeginFrame, frame_pacing::XrLocate, frame_pacing::XrAcquire,
+        frame_pacing::XrCapture, frame_pacing::XrEndFrame, frame_pacing::XrComposite};
+    frame_pacing::add(phases[ph], us);
     g_phaseLastUs[ph].store(us, std::memory_order_relaxed);
     if (us > g_phaseMaxUs[ph].load(std::memory_order_relaxed))
         g_phaseMaxUs[ph].store(us, std::memory_order_relaxed);
@@ -892,18 +981,49 @@ std::atomic<bool> g_loggedFirstMirror{false};
 int sr_pop_eye() {
     uint32_t tail = g_srTail.load(std::memory_order_relaxed);
     uint32_t head = g_srHead.load(std::memory_order_acquire);
-    if (tail == head) return 0;
+    if (tail == head) {
+        g_srLastPop.store(0, std::memory_order_relaxed);
+        return 0;
+    }
     if (head - tail > 2) {
         // More than a pair in flight: submit/present pairing skewed (mode
         // boundary). Drop everything and resync from mono.
         g_srTail.store(head, std::memory_order_relaxed);
         g_srCleared.fetch_add(1, std::memory_order_relaxed);
         BVR_LOG("xr: sr tag ring skewed (depth %u) - cleared", head - tail);
+        g_srLastPop.store(0, std::memory_order_relaxed);
         return 0;
+    }
+    // Issue #31 (H3): in the healthy 1t loop a tag is popped by the Present
+    // inside the same engine Draw that pushed it, so depth at pop is 1. A pop
+    // that finds a FULL PAIR queued means push/present phase slipped by one -
+    // the offset the depth>2 self-heal above can never see. Counted always,
+    // transition-logged when the edge witness is armed. Present thread only.
+    g_srDeepRun = head - tail > 1 ? g_srDeepRun + 1 : 0;
+    if (g_srDeepRun >= 8 && g_srDriftResync.load(std::memory_order_relaxed)) {
+        BVR_LOG("xr: sr tag ring drift resync - %u pops in a row found a stale tag queued; "
+                "dropped %u, taking the newest", g_srDeepRun, head - tail - 1);
+        tail = head - 1;
+        g_srTail.store(tail, std::memory_order_relaxed);
+        g_srDeepRun = 0;
+        g_srDriftResyncs.fetch_add(1, std::memory_order_relaxed);
+    }
+    static bool s_wasDeep = false;
+    if (head - tail == 2) {
+        g_pmPopDeep.fetch_add(1, std::memory_order_relaxed);
+        if (!s_wasDeep && g_pairEdgeLog.load(std::memory_order_relaxed))
+            BVR_LOG("[pairEdge] popDeep BEGAN (a full pair was queued at pop - "
+                    "eye tags now trail their presents by one)");
+        s_wasDeep = true;
+    } else if (s_wasDeep) {
+        if (g_pairEdgeLog.load(std::memory_order_relaxed))
+            BVR_LOG("[pairEdge] popDeep ended (pop depth back to 1)");
+        s_wasDeep = false;
     }
     int sign = g_srRing[tail & (kSrRingSize - 1)].load(std::memory_order_relaxed);
     g_srTail.store(tail + 1, std::memory_order_release);
     g_srPopped.fetch_add(1, std::memory_order_relaxed);
+    g_srLastPop.store(sign, std::memory_order_relaxed);
     return sign;
 }
 
@@ -1842,6 +1962,33 @@ void destroy_hud_swapchain() {
     g_hudSwapW = g_hudSwapH = 0;
 }
 
+void destroy_overlay_swapchain() {
+    if(g_overlaySwapchain!=XR_NULL_HANDLE) xrDestroySwapchain(g_overlaySwapchain);
+    g_overlaySwapchain=XR_NULL_HANDLE;g_overlayImages.clear();g_overlayW=g_overlayH=0;
+}
+void create_overlay_swapchain(uint32_t w,uint32_t h) {
+    destroy_overlay_swapchain();
+    if(!g_swapFormat || g_session==XR_NULL_HANDLE) return;
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags=XR_SWAPCHAIN_USAGE_SAMPLED_BIT|XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format=g_swapFormat;ci.sampleCount=1;ci.width=w;ci.height=h;
+    ci.faceCount=ci.arraySize=ci.mipCount=1;
+    if(XR_FAILED(xrCreateSwapchain(g_session,&ci,&g_overlaySwapchain))) {
+        g_overlaySwapchain=XR_NULL_HANDLE;BVR_LOG("xr: overlay quad swapchain creation failed");return;
+    }
+    uint32_t n=0;
+    if(XR_FAILED(xrEnumerateSwapchainImages(g_overlaySwapchain,0,&n,nullptr)) || !n) {
+        destroy_overlay_swapchain();return;
+    }
+    g_overlayImages.assign(n,{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+    if(XR_FAILED(xrEnumerateSwapchainImages(g_overlaySwapchain,n,&n,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(g_overlayImages.data())))) {
+        destroy_overlay_swapchain();return;
+    }
+    g_overlayW=w;g_overlayH=h;
+    BVR_LOG("xr: overlay quad live (%ux%u, native canvas at HUD depth)",w,h);
+}
+
 void destroy_swapchains() {
     // Session 54: the feed snapshot references these swapchains - drop it
     // BEFORE they die so a feed cycle can never submit a dead handle. (Feed
@@ -1860,7 +2007,9 @@ void destroy_swapchains() {
     }
     destroy_laser();
     destroy_hud_swapchain();
+    destroy_overlay_swapchain();
     g_swapW = g_swapH = 0;
+    g_bbW = g_bbH = 0;
     g_backbufferFmt = 0;
     // Whatever a queued rebuild was for, it has just happened.
     g_resizePending.store(false, std::memory_order_relaxed);
@@ -2097,12 +2246,34 @@ bool create_swapchains(IDXGISwapChain* swapchain) {
     sci.sampleCount = 1;
     sci.width = desc.BufferDesc.Width;
     sci.height = desc.BufferDesc.Height;
+    // Super resolution: the eye swapchains at the reconstruction's output size (the
+    // temporal seam); every capture into them is then stretched when it is not processed.
+    const uint32_t outW = g_outputW.load(std::memory_order_relaxed);
+    const uint32_t outH = g_outputH.load(std::memory_order_relaxed);
+    if (outW && outH) {
+        sci.width = outW;
+        sci.height = outH;
+        BVR_LOG("xr: eye swapchains at the requested output size %ux%u (backbuffer %ux%u)", outW, outH,
+                desc.BufferDesc.Width, desc.BufferDesc.Height);
+    }
     sci.faceCount = 1;
     sci.arraySize = 1;
     sci.mipCount = 1;
     uint32_t imageCount = 0;
     for (int i = 0; i < 2; ++i) {
         XrResult r = xrCreateSwapchain(g_session, &sci, &g_swapchains[i]);
+        if (XR_FAILED(r) && i == 0 && (outW || outH)) {
+            // The runtime refused the super-resolution size: drop the request and build at
+            // the backbuffer size, rather than fail every frame with no VR at all.
+            BVR_LOG("xr: xrCreateSwapchain at the requested output size %ux%u failed (%s) - "
+                    "the request is dropped, eye swapchains at the backbuffer size",
+                    sci.width, sci.height, res_str(r));
+            g_outputW.store(0, std::memory_order_relaxed);
+            g_outputH.store(0, std::memory_order_relaxed);
+            sci.width = desc.BufferDesc.Width;
+            sci.height = desc.BufferDesc.Height;
+            r = xrCreateSwapchain(g_session, &sci, &g_swapchains[i]);
+        }
         if (XR_FAILED(r)) {
             BVR_LOG("xr: xrCreateSwapchain failed: %s", res_str(r));
             g_swapchains[i] = XR_NULL_HANDLE;
@@ -2121,8 +2292,10 @@ bool create_swapchains(IDXGISwapChain* swapchain) {
         }
     }
 
-    g_swapW = desc.BufferDesc.Width;
-    g_swapH = desc.BufferDesc.Height;
+    g_swapW = sci.width;
+    g_swapH = sci.height;
+    g_bbW = desc.BufferDesc.Width;
+    g_bbH = desc.BufferDesc.Height;
     g_swapFormat = pick; // the HUD quad swapchain creates lazily with this
     g_backbufferFmt = desc.BufferDesc.Format; // for the same-size resize guard
     BVR_LOG("xr: swapchain pair %ux%u format %lld (%u images each)", g_swapW, g_swapH,
@@ -2749,6 +2922,9 @@ void on_present_begin(IDXGISwapChain* swapchain) {
         BVR_LOG("xr: pair hold outlived %u ms with no right-eye present - "
                 "aborting it (presents stopped mid-pair? alt-tab/level load)",
                 kPairHoldMaxMs);
+        if (g_pairEdgeLog.load(std::memory_order_relaxed))
+            BVR_LOG("[pairEdge] hold-expired (left was captured, its right "
+                    "sibling never presented)");
         g_srPairOpen = false;
         g_srPairAborts.fetch_add(1, std::memory_order_relaxed);
         g_pmAbortExpired.fetch_add(1, std::memory_order_relaxed);
@@ -3105,18 +3281,40 @@ struct LaserSnapshot {
     bool muzzle = false;
     float d0[3] = {0.0f, 0.0f, -1.0f};
     float modelPitch = 0.0f, modelYaw = 0.0f, modelRoll = 0.0f;
+    bool fixed = false;               // LaserConfig::fixedRay
+    float fixedStart[3] = {}, fixedDir[3] = {0.0f, 0.0f, -1.0f};
 };
 
 // Fill `quads` with the dots along one laser's ray and return how many were
 // built, capped at `budget` quads. Render thread, projection mode only.
 uint32_t build_laser_from(const LaserSnapshot& ls, XrCompositionLayerQuad* quads,
                           int budget) {
+    // Nothing aiming-related while the F10 panel is up: the beam lands ON the
+    // panel and fights the cursor for the same pixels. Suppression only - the
+    // user's `laserOn` setting is untouched and comes straight back.
+    if (bvr::overlay::visible()) return 0;
+    // ...nor while a scripted scene owns the view. You are not aiming during a
+    // cutscene, and a beam tracking a hand you are not steering reads as the
+    // mod fighting the scene. Same suppression contract: the setting is
+    // untouched and returns with the scene. (Adapter-published; see
+    // publish_aim_suppressed.)
+    if (g_aimSuppressed.load(std::memory_order_relaxed)) return 0;
     if (!ls.on || budget < 1) return 0;
     if (g_laserSwapchain == XR_NULL_HANDLE || !g_laserDot || !g_viewsValid) return 0;
 
     int hand = ls.hand;
-    float pos[3], quat[4];
-    if (!input_get_hand_pose(hand, true, pos, quat)) return 0; // AIM pose = the fire ray
+    float pos[3], quat[4], d[3];
+    // A fixed ray (LaserConfig::fixedRay): the adapter's own points, used as given.
+    bool fixedRay = false;
+    if (ls.fixed) {
+        const float n = sqrtf(ls.fixedDir[0] * ls.fixedDir[0] + ls.fixedDir[1] * ls.fixedDir[1] +
+                              ls.fixedDir[2] * ls.fixedDir[2]);
+        if (std::isfinite(n) && n > 1e-4f) {
+            for (int i = 0; i < 3; ++i) { pos[i] = ls.fixedStart[i]; d[i] = ls.fixedDir[i] / n; }
+            fixedRay = true;
+        }
+    }
+    if (!fixedRay && !input_get_hand_pose(hand, true, pos, quat)) return 0; // AIM pose = the fire ray
 
     // Session 20 unification: the laser composes its pitch/yaw trim as a
     // quaternion in the controller's LOCAL frame - the model's and the fire
@@ -3126,8 +3324,10 @@ uint32_t build_laser_from(const LaserSnapshot& ls, XrCompositionLayerQuad* quads
     // stops being a calibration tool and becomes a lie.
     constexpr float kDegToRad = 3.14159265f / 180.0f;
     const float fwd[3] = {0.0f, 0.0f, -1.0f};
-    float trim[4], q2[4], d[3];
-    if (ls.muzzle) {
+    float trim[4], q2[4];
+    if (fixedRay) {
+        // pos and d are final: no pose, no trim, no origin offset.
+    } else if (ls.muzzle) {
         // Muzzle ray: the beam follows the RENDERED barrel - the MODEL's trim
         // (roll included: it moves an off-axis vector) applied to the barrel
         // axis the game side derived from the driven rig this frame.
@@ -3154,7 +3354,7 @@ uint32_t build_laser_from(const LaserSnapshot& ls, XrCompositionLayerQuad* quads
         float ofM = ls.posFwdCm * 0.01f;
         float orM = ls.posRightCm * 0.01f;
         float ouM = ls.posUpCm * 0.01f;
-        if (ofM != 0.0f || orM != 0.0f || ouM != 0.0f) {
+        if (!fixedRay && (ofM != 0.0f || orM != 0.0f || ouM != 0.0f)) {
             float yaw = atan2f(d[0], -d[2]);
             float right[3] = {cosf(yaw), 0.0f, sinf(yaw)};
             float up2[3] = {right[1] * d[2] - right[2] * d[1],
@@ -3253,6 +3453,11 @@ LaserSnapshot snapshot_laser_slot(int slot) {
     ls.modelPitch = g_laserModelPitchTrim.load(std::memory_order_relaxed);
     ls.modelYaw = g_laserModelYawTrim.load(std::memory_order_relaxed);
     ls.modelRoll = g_laserModelRollTrim.load(std::memory_order_relaxed);
+    ls.fixed = g_laserFixed.load(std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) {
+        ls.fixedStart[i] = g_laserFixedStart[i].load(std::memory_order_relaxed);
+        ls.fixedDir[i] = g_laserFixedDir[i].load(std::memory_order_relaxed);
+    }
     return ls;
 }
 
@@ -3286,6 +3491,8 @@ bool publish_laser_image() {
 // game_point_to_xr. All that happens here is billboarding and sizing, so
 // there is no second algebra that can drift from the first.
 uint32_t build_aim_dot_slot(XrCompositionLayerQuad* quad, int slot) {
+    if (bvr::overlay::visible()) return 0; // see build_laser_from
+    if (g_aimSuppressed.load(std::memory_order_relaxed)) return 0; // and the adapter's reasons
     const bool two = (slot == 1);
     if (!(two ? g_dot2On : g_dotOn).load(std::memory_order_relaxed)) return 0;
     if (!(two ? g_dot2Valid : g_dotValid).load(std::memory_order_relaxed)) return 0;
@@ -3401,11 +3608,20 @@ float xr_quat_yaw_deg(float qx, float qy, float qz, float qw) {
 // with a disproven rationale is a hazard, not an option. The fix is not to
 // issue the draw - see hud_capture's DrawVerdict::Skip and `vrcine bars`.
 void capture_frame(ID3D11Texture2D* dst, ID3D11Texture2D* backbuffer) {
-    g_context->CopyResource(dst, backbuffer);
+    // A super-resolution output size (the temporal seam) makes the eye swapchains larger
+    // than the backbuffer; whatever the processor does not reconstruct is stretched whole
+    // (never a band - see above).
+    if (g_swapW == g_bbW && g_swapH == g_bbH)
+        g_context->CopyResource(dst, backbuffer);
+    else
+        bvr::blit::stretch_copy(g_context, dst, backbuffer);
 }
 
 void on_present_end(IDXGISwapChain* swapchain) {
     PhaseScope psEnd(kPhPresentEnd); // records on every return path
+    frame_pacing::xr_context(g_frameState.predictedDisplayTime,
+        g_frameState.predictedDisplayPeriod, static_cast<int>(g_state),
+        g_frameOpen && g_frameState.shouldRender != XR_FALSE);
     phase_heartbeat_maybe(GetTickCount64());
     if (!g_frameOpen) {
         // No XR frame this present (session gone, or the pace guard skipped
@@ -3459,11 +3675,12 @@ void on_present_end(IDXGISwapChain* swapchain) {
     XrCompositionLayerQuad dot2Quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad handQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad hudQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad overlayQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
     // The game frame is layer 0; the aim laser(s) add one quad per dot on top -
     // BOTH slots share the kMaxLaserDots budget - then up to two aim dots, the
-    // s51 hand ref quad and the HUD quad (worst case 13 of the 16 runtimes
+    // s51 hand ref, HUD and overlay quads (worst case 14 of the 16 runtimes
     // must accept).
-    const XrCompositionLayerBaseHeader* layers[1 + kMaxLaserDots + 4] = {};
+    const XrCompositionLayerBaseHeader* layers[1 + kMaxLaserDots + 5] = {};
     uint32_t layerCount = 0;
 
     // Claim the fov the game actually rendered with (adapter readback);
@@ -3500,7 +3717,9 @@ void on_present_end(IDXGISwapChain* swapchain) {
         bool fovMm = bvr::hud::fov_mismatch();
         bool screenOnly = bvr::hud::screen_only(); // hack/loading/FMV screens
         bool stereoCine = g_cineStereo.load(std::memory_order_relaxed);
-        bool wantCine = stale || !strict || screenOnly || (fovMm && !stereoCine);
+        bool uiPaused = g_uiPaused.load(std::memory_order_relaxed);
+        bool wantCine =
+            stale || !strict || screenOnly || uiPaused || (fovMm && !stereoCine);
         bool active = g_cineActive.load(std::memory_order_relaxed);
         if (wantCine != active) {
             if (++g_cineStreak >= kCineHysteresis) {
@@ -3512,9 +3731,9 @@ void on_present_end(IDXGISwapChain* swapchain) {
                 else
                     g_cineExits.fetch_add(1, std::memory_order_relaxed);
                 BVR_LOG("xr: cinematic quad %s (strict=%d stale=%d fovMismatch=%d "
-                        "screenOnly=%d)",
+                        "screenOnly=%d uiPaused=%d)",
                         active ? "ON" : "off", strict ? 1 : 0, stale ? 1 : 0,
-                        fovMm ? 1 : 0, screenOnly ? 1 : 0);
+                        fovMm ? 1 : 0, screenOnly ? 1 : 0, uiPaused ? 1 : 0);
             }
         } else {
             g_cineStreak = 0;
@@ -3570,7 +3789,12 @@ void on_present_end(IDXGISwapChain* swapchain) {
     bool srFrame = projectionMode && srSign != 0;
     // HUD capture gate (session 19): the gameswf redirect runs only while
     // stereo gameplay frames flow (menus stop the eye tags -> gate drops).
-    bvr::hud::set_gate(srFrame);
+    // Temporal seam: AlternateEye frames whose eye the adapter names (the
+    // alternate frame warp) are stereo gameplay too - a HUD drawn into them
+    // would be warped with the world behind it.
+    const bool aerSeamFrame = projectionMode && g_aerEnabled.load(std::memory_order_relaxed) &&
+                              g_aerEyeSource.load(std::memory_order_relaxed) != nullptr;
+    bvr::hud::set_gate(srFrame || aerSeamFrame);
 
     // Mirror, left half: snapshot the LEFT eye before anything else runs
     // (read-only - the XR eye capture below is unaffected). The right half
@@ -3584,6 +3808,11 @@ void on_present_end(IDXGISwapChain* swapchain) {
     if (pairSecond) {
         if (srSign == +1) {
             g_srPairs.fetch_add(1, std::memory_order_relaxed);
+            if (g_unheldRight) {
+                if (g_pairEdgeLog.load(std::memory_order_relaxed))
+                    BVR_LOG("[pairEdge] unheld-right ended (pairs hold again)");
+                g_unheldRight = false;
+            }
             // Pair-cadence sample (session 42): stamp the CLOSE of the pair -
             // the one moment per pair that exists exactly once on exactly one
             // thread. g_qpcFreq is initialized by the PhaseScope wrapping this
@@ -3632,7 +3861,28 @@ void on_present_end(IDXGISwapChain* swapchain) {
                 g_pmAbortLeft.fetch_add(1, std::memory_order_relaxed);
             else
                 g_pmAbortUntag.fetch_add(1, std::memory_order_relaxed);
+            if (g_pairEdgeLog.load(std::memory_order_relaxed))
+                BVR_LOG("[pairEdge] %s (pair broke on the %s present; this "
+                        "submit captures fresh %s and the OTHER eye rides its "
+                        "old image)",
+                        srSign < 0 ? "lone-left" : "untagged-close",
+                        srSign < 0 ? "next LEFT" : "untagged",
+                        srSign < 0 ? "LEFT" : "index 0");
         }
+    } else if (srSign == +1 && srFrame) {
+        // Issue #31 (H2): a RIGHT-tagged present with no hold open ran its own
+        // xrWaitFrame + xrLocateViews, so the two eyes of this pair are tagged
+        // from DIFFERENT locate generations - the left eye's pose is one
+        // display period behind, which reprojection turns into a left-only
+        // lateral double under head motion. Transition-logged: with pair
+        // pacing off every tick lands here, and that is a state, not an event.
+        if (!g_unheldRight && g_pairEdgeLog.load(std::memory_order_relaxed))
+            BVR_LOG("[pairEdge] unheld-right BEGAN (right present without a pair "
+                    "hold - pose generations split across the pair; shouldRender=%d "
+                    "pacing=%d)",
+                    g_frameState.shouldRender ? 1 : 0,
+                    g_srPairPacing.load(std::memory_order_relaxed) ? 1 : 0);
+        g_unheldRight = true;
     }
     bool pairHold = srFrame && srSign < 0 && !pairSecond &&
                     g_srPairPacing.load(std::memory_order_relaxed) &&
@@ -3650,6 +3900,28 @@ void on_present_end(IDXGISwapChain* swapchain) {
     int eyeFlip = g_aerSwapEyes.load(std::memory_order_relaxed) ? -1 : 1;
     int currentEyeSign = (g_currentEye == 0 ? -1 : 1) * eyeFlip;
     bool eyeCaptured = false;
+    // Temporal seam: an adapter-named eye for this AlternateEye image (the sign it was
+    // rendered with). Unknown = not an eye image (a menu, a load, a scripted camera): it
+    // flows through index 0 like any un-offset frame, and the layer is still submitted
+    // (an empty frame would show black). Guessing an eye here would put a frame rendered
+    // for one eye into the other's swapchain.
+    if (aerActive) {
+        AerEyeSourceFn source = g_aerEyeSource.load(std::memory_order_relaxed);
+        if (source) {
+            const int named = source();
+            if (named == 0) {
+                ++g_aerUnknownEyes;
+                imageSign = 0;
+            } else {
+                g_currentEye = named < 0 ? 0 : 1;
+                imageSign = currentEyeSign = named;
+            }
+        }
+    }
+    // The tangents the projection layer will claim (computed again below, identically),
+    // for the temporal seams that need them before the capture.
+    const float seamTanH = tanf(hfovDeg * 0.5f / 57.29578f);
+    const float seamTanV = g_swapW ? seamTanH * static_cast<float>(g_swapH) / static_cast<float>(g_swapW) : seamTanH;
 
     if (g_frameState.shouldRender && g_swapchains[0] != XR_NULL_HANDLE) {
         ID3D11Texture2D* backbuffer = nullptr;
@@ -3661,14 +3933,23 @@ void on_present_end(IDXGISwapChain* swapchain) {
             // [pair] probe: an untagged present in projection mode captures
             // into the LEFT swapchain (index 0) - candidate mechanism for a
             // wrong-content left eye.
-            if (projectionMode && !srFrame && !aerActive)
+            if (projectionMode && !srFrame && !aerActive) {
                 g_pmUntaggedProj.fetch_add(1, std::memory_order_relaxed);
+                if (g_pairEdgeLog.load(std::memory_order_relaxed))
+                    BVR_LOG("[pairEdge] untag-capture (untagged present wrote "
+                            "the LEFT swapchain, index 0)");
+            }
             uint32_t index = 0;
             int64_t tAcq = phase_now();
             XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             XrResult acqRes = xrAcquireSwapchainImage(g_swapchains[target], &ai, &index);
-            if (XR_FAILED(acqRes))
+            if (XR_FAILED(acqRes)) {
                 g_pmAcqFail.fetch_add(1, std::memory_order_relaxed);
+                if (g_pairEdgeLog.load(std::memory_order_relaxed))
+                    BVR_LOG("[pairEdge] acquire-fail eye=%d (%s) - this eye "
+                            "keeps its previous released image",
+                            target, res_str(acqRes));
+            }
             if (XR_SUCCEEDED(acqRes)) {
                 XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
                 wi.timeout = XR_INFINITE_DURATION;
@@ -3678,19 +3959,42 @@ void on_present_end(IDXGISwapChain* swapchain) {
                     imageReady = XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchains[target], &wi));
                 }
                 phase_record(kPhAcquire, tAcq);
-                if (!imageReady)
+                if (!imageReady) {
                     // The release below still runs (spec requires it), which
                     // makes an UNDEFINED-content image the eye's most recently
                     // released one - counted, because that is one of the
                     // stale-left candidate mechanisms.
                     g_pmWaitFail.fetch_add(1, std::memory_order_relaxed);
+                    if (g_pairEdgeLog.load(std::memory_order_relaxed))
+                        BVR_LOG("[pairEdge] wait-fail eye=%d (an UNDEFINED "
+                                "image becomes this eye's released one)",
+                                target);
+                }
                 if (imageReady) {
                     // Same size + same typeless family (guaranteed at creation),
                     // so a straight GPU copy carries the frame - overlay
                     // included. Under an engine letterbox the copy becomes an
                     // unsqueeze blit instead (session 22, capture_frame).
                     int64_t tCap = phase_now();
-                    capture_frame(g_images[target][index].texture, backbuffer);
+                    // Temporal seam: a stereo eye image goes through the adapter's
+                    // processor (DLSS/DLAA) when one is set; it falls back here.
+                    bool processed = false;
+                    const bool stereoEye = srFrame || (aerActive && target == g_currentEye &&
+                                                       imageSign == currentEyeSign);
+                    EyeProcessorFn proc = g_eyeProcessor.load(std::memory_order_relaxed);
+                    if (proc && projectionMode && stereoEye) {
+                        EyeFrame ef;
+                        ef.eye = target;
+                        ef.imageSign = srFrame ? srSign : imageSign;
+                        ef.sequential = srFrame;
+                        ef.src = backbuffer;
+                        ef.srcW = g_bbW; ef.srcH = g_bbH;
+                        ef.dst = g_images[target][index].texture;
+                        ef.dstW = g_swapW; ef.dstH = g_swapH;
+                        ef.tanH = seamTanH; ef.tanV = seamTanV;
+                        processed = proc(g_context, ef);
+                    }
+                    if (!processed) capture_frame(g_images[target][index].texture, backbuffer);
                     phase_record(kPhCapture, tCap);
                 }
                 XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -3737,6 +4041,47 @@ void on_present_end(IDXGISwapChain* swapchain) {
                         g_eyePose[g_currentEye] = g_viewsContent[g_currentEye].pose;
                     g_eyeValid[g_currentEye] = true;
                     eyeCaptured = true;
+
+                    // Temporal seam (AFW): rebuild the held eye at this instant
+                    // rather than leave it to rotation-only reprojection. ready()
+                    // promises the rebuild will write the image, so an acquired
+                    // image is never released unwritten.
+                    HeldReadyFn ready = g_heldReady.load(std::memory_order_relaxed);
+                    HeldRebuildFn rebuild = g_heldRebuild.load(std::memory_order_relaxed);
+                    const int held = g_currentEye ^ 1;
+                    if (ready && rebuild && ready(held)) {
+                        uint32_t hidx = 0;
+                        XrSwapchainImageAcquireInfo hai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                        if (XR_SUCCEEDED(xrAcquireSwapchainImage(g_swapchains[held], &hai, &hidx))) {
+                            XrSwapchainImageWaitInfo hwi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                            hwi.timeout = XR_INFINITE_DURATION;
+                            int how = 0;
+                            if (XR_SUCCEEDED(xrWaitSwapchainImage(g_swapchains[held], &hwi))) {
+                                HeldFrame hf;
+                                hf.held = held; hf.fresh = g_currentEye;
+                                hf.dst = g_images[held][hidx].texture;
+                                hf.w = g_swapW; hf.h = g_swapH;
+                                hf.tanH = seamTanH; hf.tanV = seamTanV;
+                                how = rebuild(g_context, hf);
+                            }
+                            XrSwapchainImageReleaseInfo hri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                            xrReleaseSwapchainImage(g_swapchains[held], &hri);
+                            if (how == 1) {
+                                // Rebuilt at the fresh image's instant: claim the
+                                // same locate generation the fresh eye claims.
+                                if (g_eyeTagRendered.load(std::memory_order_relaxed))
+                                    g_eyePose[held] = parallel_eye_tag(
+                                        g_viewsContent[0].pose, g_viewsContent[1].pose, held,
+                                        g_eyeTagIpdMm.load(std::memory_order_relaxed));
+                                else
+                                    g_eyePose[held] = g_viewsContent[held].pose;
+                                g_eyeValid[held] = true;
+                                ++g_heldRebuilds;
+                            } else {
+                                ++g_heldCopies;
+                            }
+                        }
+                    }
                 }
 
                 if (pairHold) {
@@ -3761,6 +4106,13 @@ void on_present_end(IDXGISwapChain* swapchain) {
                                  {static_cast<int32_t>(g_swapW), static_cast<int32_t>(g_swapH)}};
 
                 if (projectionMode) {
+                    // Back in the world: forget where the last screen hung, so
+                    // the NEXT one is placed where the player is looking then.
+                    // Released here rather than on the cine-verdict transition
+                    // because the verdict already carries hysteresis - a screen
+                    // must never be re-placed part-way through being read.
+                    g_screenAnchorSet = false;
+
                     // fov = the symmetric fov the game rendered with (hfov
                     // written by the adapter, vfov via aspect).
                     float halfH = hfovDeg * 0.5f / 57.29578f;
@@ -3882,22 +4234,112 @@ void on_present_end(IDXGISwapChain* swapchain) {
                         BVR_LOG("xr: alternate-eye stereo live (both eyes hold offset images)");
                 } else {
                     float width = g_screenWidthM.load(std::memory_order_relaxed);
-                    // Session 22 (user feedback, first headset run): SCREEN-ONLY
-                    // intervals (hack minigame, loading screens - world-less 2D
-                    // boards) ride the HEAD-LOCKED view space, exactly like the
-                    // pause-menu panel, so the board is centered on wherever the
-                    // player is looking instead of the recenter-origin facing.
-                    // Cinematic scenes (fov-mismatch/strict legs) and the plain
-                    // camera-off screen keep the world-locked space unchanged.
-                    bool headLock = g_cineActive.load(std::memory_order_relaxed) &&
-                                    bvr::hud::screen_only() &&
-                                    g_viewSpace != XR_NULL_HANDLE;
-                    quad.space = headLock ? g_viewSpace : g_space;
+                    float dist = g_screenDistM.load(std::memory_order_relaxed);
+                    int place = g_screenPlaceMode.load(std::memory_order_relaxed);
+
+                    // Session 22 (user feedback, first headset run) put
+                    // SCREEN-ONLY intervals (hack minigame, loading screens -
+                    // world-less 2D boards) on the HEAD-LOCKED view space so
+                    // the board landed where the player was looking rather
+                    // than on the recenter-origin facing. Anchor mode gets
+                    // that placement right for EVERY screen without the
+                    // swimming, so the screen-only special case is no longer
+                    // needed; it survives only as placement mode 1.
+                    bool headLock = place == 1 && g_viewSpace != XR_NULL_HANDLE;
+
+                    if (place == 0 && g_viewSpace != XR_NULL_HANDLE) {
+                        // ---- ANCHOR MODE ------------------------------------
+                        float hp[3], hq[4];
+                        bool poseOk = false;
+                        {
+                            std::lock_guard<std::mutex> lock(g_poseMutex);
+                            poseOk = g_poseValid;
+                            if (poseOk) {
+                                hp[0] = g_headPose.px;
+                                hp[1] = g_headPose.py;
+                                hp[2] = g_headPose.pz;
+                                hq[0] = g_headPose.qx;
+                                hq[1] = g_headPose.qy;
+                                hq[2] = g_headPose.qz;
+                                hq[3] = g_headPose.qw;
+                            }
+                        }
+
+                        // Re-anchor after a long head translation only. Every
+                        // smaller motion must leave the screen where it is,
+                        // which is the entire point of the mode.
+                        if (g_screenAnchorSet && poseOk) {
+                            const float dx = hp[0] - g_screenAnchorHead[0];
+                            const float dy = hp[1] - g_screenAnchorHead[1];
+                            const float dz = hp[2] - g_screenAnchorHead[2];
+                            const float d2 = dx * dx + dy * dy + dz * dz;
+                            if (d2 > kScreenReanchorM * kScreenReanchorM) {
+                                g_screenAnchorSet = false;
+                                BVR_LOG("xr: screen re-anchoring - head moved %.2f m "
+                                        "from the anchor",
+                                        sqrtf(d2));
+                            }
+                        }
+
+                        // NEVER anchor to a pose we do not have. BRVR shipped
+                        // this bug: it anchored from a variable only gameplay
+                        // wrote, so every screen shown before the first
+                        // gameplay frame - the startup movies, the main menu -
+                        // landed at the LOCAL origin instead of in front of
+                        // the player. Here the pose comes from the unconditional
+                        // xrLocateSpace at frame open, and if it is not valid
+                        // this frame we hold the previous anchor (or fall
+                        // through to the origin placement on the very first
+                        // frame) rather than latching a bad one.
+                        if (!g_screenAnchorSet && poseOk) {
+                            // Head forward = q * (0,0,-1), flattened to
+                            // horizontal so the screen is never tilted even if
+                            // the player opened it while looking up or down.
+                            float fx = -2.0f * (hq[0] * hq[2] + hq[1] * hq[3]);
+                            float fz = -(1.0f - 2.0f * (hq[0] * hq[0] + hq[1] * hq[1]));
+                            float len = sqrtf(fx * fx + fz * fz);
+                            if (len < 1e-4f) { fx = 0.0f; fz = -1.0f; len = 1.0f; }
+                            fx /= len;
+                            fz /= len;
+
+                            // The quad's visible face is its local +Z, and
+                            // R_y(yaw)*(0,0,1) = (sin yaw, 0, cos yaw), so
+                            // putting +Z on -forward wants yaw = atan2(-fx,-fz).
+                            // BRVR's first attempt used atan2(fx,-fz), which
+                            // builds the MIRROR of the head yaw: the quad sits
+                            // askew by 2*yaw, in the opposite direction looking
+                            // left versus right, and is dead straight at yaw 0 -
+                            // which is exactly why it survived testing.
+                            const float yaw = atan2f(-fx, -fz);
+                            g_screenAnchor.orientation = {0.0f, sinf(yaw * 0.5f), 0.0f,
+                                                          cosf(yaw * 0.5f)};
+                            g_screenAnchor.position = {
+                                hp[0] + fx * dist,
+                                hp[1] + g_screenHeightM.load(std::memory_order_relaxed),
+                                hp[2] + fz * dist};
+                            g_screenAnchorSet = true;
+                            g_screenAnchorHead[0] = hp[0];
+                            g_screenAnchorHead[1] = hp[1];
+                            g_screenAnchorHead[2] = hp[2];
+                            g_screenAnchors.fetch_add(1, std::memory_order_relaxed);
+                            BVR_LOG("xr: screen anchored at yaw %.1f deg, head "
+                                    "(%.2f %.2f %.2f) m, %.2f m out",
+                                    yaw * 57.29578f, hp[0], hp[1], hp[2], dist);
+                        }
+                    }
+
+                    if (place == 0 && g_screenAnchorSet) {
+                        quad.space = g_space;
+                        quad.pose = g_screenAnchor;
+                    } else {
+                        // Head-locked, recenter-origin, or anchor mode on a
+                        // frame with no valid head pose yet.
+                        quad.space = headLock ? g_viewSpace : g_space;
+                        quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+                        quad.pose.position = {0.0f, 0.0f, -dist};
+                    }
                     quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
                     quad.subImage = sub;
-                    quad.pose.orientation.w = 1.0f;
-                    quad.pose.position = {0.0f, 0.0f,
-                                          -g_screenDistM.load(std::memory_order_relaxed)};
                     quad.size = {width, width * static_cast<float>(g_swapH) /
                                             static_cast<float>(g_swapW)};
                     layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
@@ -4010,6 +4452,44 @@ void on_present_end(IDXGISwapChain* swapchain) {
         }
     }
 
+    // F10 is composed last and never enters the eye processor/AFW history.
+    // Also available over the menu/cinematic screen, at the HUD's depth.
+    if(layerCount && g_viewSpace!=XR_NULL_HANDLE) {
+        ID3D11Texture2D* tex=bvr::overlay::layer_texture();
+        if(tex) {
+            D3D11_TEXTURE2D_DESC td{};tex->GetDesc(&td);
+            float tanH=g_auditTanH.load(),tanV=g_auditTanV.load(),halfH=0,halfV=0;
+            if(headset_half_fov_deg(&halfH,&halfV)) {
+                tanH=tanf(halfH/57.29578f);tanV=tanf(halfV/57.29578f);
+            }
+            const auto geometry=bvr::overlay::quad_geometry(g_hudDistM.load(),tanH,tanV);
+            if(geometry.depth>0) {
+                if(g_overlaySwapchain==XR_NULL_HANDLE || g_overlayW!=td.Width || g_overlayH!=td.Height)
+                    create_overlay_swapchain(td.Width,td.Height);
+                if(g_overlaySwapchain!=XR_NULL_HANDLE) {
+                    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};uint32_t index=0;
+                    if(XR_SUCCEEDED(xrAcquireSwapchainImage(g_overlaySwapchain,&ai,&index))) {
+                        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wi.timeout=XR_INFINITE_DURATION;
+                        const bool ready=XR_SUCCEEDED(xrWaitSwapchainImage(g_overlaySwapchain,&wi)) && index<g_overlayImages.size();
+                        if(ready) g_context->CopyResource(g_overlayImages[index].texture,tex);
+                        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                        const bool released=XR_SUCCEEDED(xrReleaseSwapchainImage(g_overlaySwapchain,&ri));
+                        if(ready && released) {
+                            overlayQuad.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            overlayQuad.space=g_viewSpace;overlayQuad.eyeVisibility=XR_EYE_VISIBILITY_BOTH;
+                            overlayQuad.subImage.swapchain=g_overlaySwapchain;
+                            overlayQuad.subImage.imageRect={{0,0},{static_cast<int32_t>(td.Width),static_cast<int32_t>(td.Height)}};
+                            overlayQuad.pose.orientation.w=1;
+                            overlayQuad.pose.position.z=-geometry.depth;
+                            overlayQuad.size={geometry.width,geometry.height};
+                            layers[layerCount++]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&overlayQuad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
     fei.displayTime = g_frameState.predictedDisplayTime;
     fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -4022,11 +4502,18 @@ void on_present_end(IDXGISwapChain* swapchain) {
         r = xrEndFrame(g_session, &fei);
     }
     phase_record(kPhEndFrame, tEnd);
+    frame_pacing::submission(static_cast<int>(r), layerCount);
     if (XR_FAILED(r)) {
         BVR_LOG("xr: xrEndFrame failed: %s", res_str(r));
         teardown_session("endframe failed");
         return;
     }
+    // This TLS evidence authorizes only an optional desktop-mirror drop in the
+    // SAME root Present. Runtime timing, graphics fences and eye ordering stay
+    // intact. Failed/empty/quad-only submissions never qualify.
+    desktop_present::mark_xr_submission(g_state == XR_SESSION_STATE_FOCUSED &&
+        g_frameState.shouldRender != XR_FALSE && layerCount &&
+        layers[0] == reinterpret_cast<const XrCompositionLayerBaseHeader*>(&proj));
     if (layerCount && ++g_framesSubmitted == 1)
         BVR_LOG("xr: first frame submitted to the headset (%ux%u quad)", g_swapW, g_swapH);
 
@@ -4079,9 +4566,9 @@ void on_resize(unsigned width, unsigned height, unsigned format) {
     // the geometry they were built for is unchanged. Width/height/format of 0
     // mean "unchanged" in DXGI's own convention; anything unknown falls through
     // to the old destroy-and-recreate path.
-    const bool sameSize = g_swapchains[0] != XR_NULL_HANDLE && g_swapW && g_swapH &&
-                          (width == 0 || width == g_swapW) &&
-                          (height == 0 || height == g_swapH) &&
+    const bool sameSize = g_swapchains[0] != XR_NULL_HANDLE && g_bbW && g_bbH &&
+                          (width == 0 || width == g_bbW) &&
+                          (height == 0 || height == g_bbH) &&
                           (format == 0 /*DXGI_FORMAT_UNKNOWN*/ || format == g_backbufferFmt);
     if (sameSize) {
         BVR_LOG("xr: same-size ResizeBuffers (%ux%u fmt %u) - XR swapchains kept",
@@ -4296,6 +4783,11 @@ void draw_debug_ui() {
             bool swap = g_aerSwapEyes.load(std::memory_order_relaxed);
             if (ImGui::Checkbox("Swap eyes (inverted-depth test)", &swap))
                 g_aerSwapEyes.store(swap, std::memory_order_relaxed);
+            if (g_heldRebuild.load(std::memory_order_relaxed))
+                ImGui::Text("Held eye: %llu rebuilt, %llu re-shown as is; %llu presents of unknown eye",
+                            static_cast<unsigned long long>(g_heldRebuilds),
+                            static_cast<unsigned long long>(g_heldCopies),
+                            static_cast<unsigned long long>(g_aerUnknownEyes));
         }
         bool manualFov = g_claimFovManual.load(std::memory_order_relaxed);
         if (ImGui::Checkbox("Manual claimed FOV (distortion calibration)", &manualFov)) {
@@ -4350,20 +4842,39 @@ void draw_debug_ui() {
                     g_mirrorHolds.load(std::memory_order_relaxed), mirrorBlits);
     uint32_t cineEnters = g_cineEnters.load(std::memory_order_relaxed);
     if (cineEnters || g_cineActive.load(std::memory_order_relaxed))
-        ImGui::Text("cinematic: %s | enters %u exits %u presents %u",
+        ImGui::Text("cinematic: %s | enters %u exits %u presents %u | uiPaused %d",
                     g_cineActive.load(std::memory_order_relaxed) ? "ACTIVE (quad)" : "off",
                     cineEnters, g_cineExits.load(std::memory_order_relaxed),
-                    g_cinePresents.load(std::memory_order_relaxed));
+                    g_cinePresents.load(std::memory_order_relaxed),
+                    g_uiPaused.load(std::memory_order_relaxed) ? 1 : 0);
 
     input_draw_debug_ui(); // M5 action-layer status line
 
-    if (!camMode) {
+    // The cinema screen. These used to be drawn only while camera mode was OFF,
+    // which hid them during the exact sessions that need them: with camera mode
+    // ON the quad is what menus, machine flows, the map and cutscenes are shown
+    // on, and the player has no other way to reach its size or placement.
+    if (ImGui::CollapsingHeader("Cinema screen (menus, map, cutscenes)")) {
+        int place = g_screenPlaceMode.load(std::memory_order_relaxed);
+        if (ImGui::Combo("Screen placement", &place,
+                         "Anchored where it opened\0Follows your head\0At the recenter "
+                         "origin\0"))
+            set_screen_place_mode(place);
         float dist = g_screenDistM.load(std::memory_order_relaxed);
-        if (ImGui::SliderFloat("Screen distance (m)", &dist, 0.5f, 5.0f))
+        if (ImGui::SliderFloat("Screen distance (m)", &dist, 0.5f, 5.0f)) {
             g_screenDistM.store(dist, std::memory_order_relaxed);
+            release_screen_anchor(); // otherwise the slider does nothing until it closes
+        }
         float width = g_screenWidthM.load(std::memory_order_relaxed);
         if (ImGui::SliderFloat("Screen width (m)", &width, 0.5f, 6.0f))
             g_screenWidthM.store(width, std::memory_order_relaxed);
+        float sh = g_screenHeightM.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat("Screen height offset (m)", &sh, -1.5f, 1.5f))
+            set_screen_height_m(sh);
+        if (ImGui::Button("Re-place screen here")) release_screen_anchor();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s | placed %u", g_screenAnchorSet ? "placed" : "unplaced",
+                            g_screenAnchors.load(std::memory_order_relaxed));
     }
 
     // Session 19 HUD quad: capture toggle + head-locked placement.
@@ -4466,6 +4977,35 @@ void set_alternate_eye(bool on) {
             "compositor reprojects the stale eye - judders, but never re-enters "
             "the game's draw)",
             on ? "ON" : "off");
+}
+
+void set_eye_processor(EyeProcessorFn fn) {
+    g_eyeProcessor.store(fn, std::memory_order_relaxed);
+}
+
+void set_eye_output_size(uint32_t w, uint32_t h) {
+    if (!w || !h) w = h = 0;
+    const uint32_t ow = g_outputW.exchange(w, std::memory_order_relaxed);
+    const uint32_t oh = g_outputH.exchange(h, std::memory_order_relaxed);
+    if (ow == w && oh == h) return;
+    // Rebuilt at the frame loop's safe point (the same queue a real resize uses).
+    if (g_swapchains[0] != XR_NULL_HANDLE) g_resizePending.store(true, std::memory_order_release);
+    BVR_LOG("xr: eye output size %ux%u requested (%s)", w, h,
+            w ? "super resolution: swapchains rebuilt at that size" : "back to the backbuffer size");
+}
+
+void eye_output_size(uint32_t* w, uint32_t* h) {
+    if (w) *w = g_swapW;
+    if (h) *h = g_swapH;
+}
+
+void set_aer_eye_source(AerEyeSourceFn fn) {
+    g_aerEyeSource.store(fn, std::memory_order_relaxed);
+}
+
+void set_held_rebuild(HeldReadyFn ready, HeldRebuildFn rebuild) {
+    g_heldRebuild.store(rebuild, std::memory_order_relaxed);
+    g_heldReady.store(ready, std::memory_order_relaxed);
 }
 
 void set_eye_tag_rendered(bool on) {
@@ -4813,6 +5353,14 @@ void publish_gameplay_view(bool strictGameplay) {
                          std::memory_order_relaxed);
 }
 
+void publish_ui_pause(bool paused) {
+    g_uiPaused.store(paused, std::memory_order_relaxed);
+}
+
+void publish_aim_suppressed(bool active) {
+    g_aimSuppressed.store(active, std::memory_order_relaxed);
+}
+
 CineDrive cine_drive() {
     return static_cast<CineDrive>(g_cineDrive.load(std::memory_order_relaxed));
 }
@@ -4829,6 +5377,106 @@ void set_cine_drive(CineDrive mode) {
     int v = static_cast<int>(mode);
     if (g_cineDrive.exchange(v, std::memory_order_relaxed) != v)
         BVR_LOG("xr: cinematic drive = %s", cine_drive_name(mode));
+}
+
+// ---- screen placement -------------------------------------------------------
+const char* screen_place_name(int mode) {
+    switch (mode) {
+        case 1: return "head";
+        case 2: return "origin";
+        default: return "anchor";
+    }
+}
+
+void release_screen_anchor() { g_screenAnchorSet = false; }
+
+int screen_place_mode() { return g_screenPlaceMode.load(std::memory_order_relaxed); }
+
+void set_screen_place_mode(int mode) {
+    if (mode < 0 || mode > 2) return;
+    if (g_screenPlaceMode.exchange(mode, std::memory_order_relaxed) != mode) {
+        release_screen_anchor(); // the next frame places it under the new rule
+        BVR_LOG("xr: screen placement = %s", screen_place_name(mode));
+    }
+}
+
+float screen_width_m() { return g_screenWidthM.load(std::memory_order_relaxed); }
+
+void set_screen_width_m(float m) {
+    if (m < 0.3f) m = 0.3f;
+    if (m > 20.0f) m = 20.0f;
+    g_screenWidthM.store(m, std::memory_order_relaxed);
+    BVR_LOG("xr: screen width = %.2f m", m);
+}
+
+float screen_height_m() { return g_screenHeightM.load(std::memory_order_relaxed); }
+float screen_distance_m() { return g_screenDistM.load(std::memory_order_relaxed); }
+void set_screen_distance_m(float meters) {
+    if(meters < 0.5f || meters > 5.0f) return;
+    g_screenDistM.store(meters,std::memory_order_relaxed);
+    release_screen_anchor();
+}
+bool cinematic_stereo() { return g_cineStereo.load(std::memory_order_relaxed); }
+void set_cinematic_stereo(bool on) { g_cineStereo.store(on,std::memory_order_relaxed); }
+
+void set_screen_height_m(float m) {
+    if (m < -3.0f) m = -3.0f;
+    if (m > 3.0f) m = 3.0f;
+    g_screenHeightM.store(m, std::memory_order_relaxed);
+    release_screen_anchor();
+}
+
+void handle_screen_command(const char* args) {
+    if (strncmp(args, "anchor mode", 11) == 0) {
+        const char* v = args + 11;
+        while (*v == ' ') ++v;
+        if (strncmp(v, "head", 4) == 0) {
+            set_screen_place_mode(1);
+        } else if (strncmp(v, "origin", 6) == 0) {
+            set_screen_place_mode(2);
+        } else if (strncmp(v, "anchor", 6) == 0) {
+            set_screen_place_mode(0);
+        } else {
+            BVR_LOG("xr: usage: vrscreen anchor mode anchor|head|origin  (current %s)",
+                    screen_place_name(screen_place_mode()));
+        }
+    } else if (strncmp(args, "anchor now", 10) == 0) {
+        release_screen_anchor();
+        BVR_LOG("xr: screen anchor released - it re-places on the next screen frame");
+    } else if (strncmp(args, "dist ", 5) == 0) {
+        float v = static_cast<float>(atof(args + 5));
+        if (v >= 0.3f && v <= 20.0f) {
+            g_screenDistM.store(v, std::memory_order_relaxed);
+            release_screen_anchor();
+            BVR_LOG("xr: screen distance = %.2f m", v);
+        } else {
+            BVR_LOG("xr: usage: vrscreen dist <0.3..20>  (current %.2f)",
+                    g_screenDistM.load(std::memory_order_relaxed));
+        }
+    } else if (strncmp(args, "width ", 6) == 0) {
+        float v = static_cast<float>(atof(args + 6));
+        if (v >= 0.3f && v <= 20.0f) {
+            g_screenWidthM.store(v, std::memory_order_relaxed);
+            BVR_LOG("xr: screen width = %.2f m", v);
+        } else {
+            BVR_LOG("xr: usage: vrscreen width <0.3..20>  (current %.2f)",
+                    g_screenWidthM.load(std::memory_order_relaxed));
+        }
+    } else if (strncmp(args, "height ", 7) == 0) {
+        float v = static_cast<float>(atof(args + 7));
+        set_screen_height_m(v);
+        BVR_LOG("xr: screen height offset = %.2f m", screen_height_m());
+    } else {
+        BVR_LOG("xr: screen placement=%s dist=%.2f m width=%.2f m height=%+.2f m "
+                "(anchored %u times, currently %s)",
+                screen_place_name(screen_place_mode()),
+                g_screenDistM.load(std::memory_order_relaxed),
+                g_screenWidthM.load(std::memory_order_relaxed), screen_height_m(),
+                g_screenAnchors.load(std::memory_order_relaxed),
+                g_screenAnchorSet ? "placed" : "unplaced");
+        BVR_LOG("xr: usage: vrscreen anchor mode anchor|head|origin | anchor now | "
+                "dist <m> | width <m> | height <m>");
+    }
 }
 
 void handle_cine_command(const char* args) {
@@ -5012,6 +5660,11 @@ void set_laser(const LaserConfig& cfg) {
     g_laserModelPitchTrim.store(cfg.modelPitchTrimDeg, std::memory_order_relaxed);
     g_laserModelYawTrim.store(cfg.modelYawTrimDeg, std::memory_order_relaxed);
     g_laserModelRollTrim.store(cfg.modelRollTrimDeg, std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) {
+        g_laserFixedStart[i].store(cfg.fixedStartXr[i], std::memory_order_relaxed);
+        g_laserFixedDir[i].store(cfg.fixedDirXr[i], std::memory_order_relaxed);
+    }
+    g_laserFixed.store(cfg.fixedRay, std::memory_order_relaxed);
 }
 
 void set_aim_dot(const AimDotConfig& cfg) {
@@ -5097,6 +5750,12 @@ void sr_push_eye(int eyeSign) {
     g_srPushed.fetch_add(1, std::memory_order_relaxed);
 }
 
+void set_sr_drift_resync(bool on) {
+    if (g_srDriftResync.exchange(on, std::memory_order_relaxed) != on)
+        BVR_LOG("xr: sr tag ring drift resync %s (resyncs so far %u)", on ? "ON" : "off",
+                g_srDriftResyncs.load(std::memory_order_relaxed));
+}
+
 void pair_probe(PairProbe* out) {
     if (!out) return;
     out->pairs = g_srPairs.load(std::memory_order_relaxed);
@@ -5122,8 +5781,18 @@ void pair_probe(PairProbe* out) {
     out->ringPopped = g_srPopped.load(std::memory_order_relaxed);
     out->ringDropped = g_srDropped.load(std::memory_order_relaxed);
     out->ringCleared = g_srCleared.load(std::memory_order_relaxed);
+    out->popDeep = g_pmPopDeep.load(std::memory_order_relaxed);
     out->mirrorOn = g_mirror.load(std::memory_order_relaxed);
 }
+
+void set_pair_edge_log(bool on) {
+    g_pairEdgeLog.store(on, std::memory_order_relaxed);
+    BVR_LOG("[pairEdge] witness %s", on ? "ARMED (event-edge lines will name "
+                                          "each pairing break as it happens)"
+                                        : "off");
+}
+bool pair_edge_log() { return g_pairEdgeLog.load(std::memory_order_relaxed); }
+int sr_last_pop_sign() { return g_srLastPop.load(std::memory_order_relaxed); }
 
 } // namespace bvr::vr
 
@@ -5150,6 +5819,14 @@ int64_t display_period_ns() { return 0; }
 bool vr_camera_mode() { return false; }
 void set_camera_mode(bool) {}
 void set_alternate_eye(bool) {}
+void set_eye_processor(EyeProcessorFn) {}
+void set_eye_output_size(uint32_t, uint32_t) {}
+void eye_output_size(uint32_t* w, uint32_t* h) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+}
+void set_aer_eye_source(AerEyeSourceFn) {}
+void set_held_rebuild(HeldReadyFn, HeldRebuildFn) {}
 void set_eye_tag_rendered(bool) {}
 bool eye_tag_rendered() { return false; }
 void set_eye_tag_ipd_mm(float) {}
@@ -5192,7 +5869,20 @@ void fov_audit(float* tanH, float* tanV, int* src, unsigned* swapW, unsigned* sw
 }
 void set_pose_audit(bool) {}
 void publish_gameplay_view(bool) {}
+void publish_ui_pause(bool) {}
+void publish_aim_suppressed(bool) {}
 void handle_cine_command(const char*) {}
+void handle_screen_command(const char*) {}
+void release_screen_anchor() {}
+int screen_place_mode() { return 0; }
+void set_screen_place_mode(int) {}
+const char* screen_place_name(int) { return "anchor"; }
+float screen_height_m() { return 0.0f; }
+float screen_distance_m() { return 2.0f; }
+void set_screen_distance_m(float) {}
+bool cinematic_stereo() { return false; }
+void set_cinematic_stereo(bool) {}
+void set_screen_height_m(float) {}
 bool cinematic_active() { return false; }
 CineDrive cine_drive() { return CineDrive::Authored; }
 void set_cine_drive(CineDrive) {}
@@ -5200,6 +5890,10 @@ const char* cine_drive_name(CineDrive) { return "authored"; }
 float rendered_hfov_deg() { return 0.0f; }
 int current_eye_sign() { return 0; }
 void sr_push_eye(int) {}
+void set_sr_drift_resync(bool) {}
+void set_pair_edge_log(bool) {}
+bool pair_edge_log() { return false; }
+int sr_last_pop_sign() { return 0; }
 void set_laser(const LaserConfig&) {}
 void set_aim_dot(const AimDotConfig&) {}
 void set_hud_quad(float, float, float) {}

@@ -91,6 +91,11 @@ bool enabled();
 // override arms the redirect with no XR session - REQUIRED for flat testing
 // (projectionReady can never be true without a headset).
 void set_gate(bool stereoActive);
+// [hudgate] issue #31 witness (opt-in, default off; BS2 arms it): logs gate
+// transitions and one-eye HUD-burn intervals (unarmed swf draws over a world
+// pass; leader-miss blips outside screen-only spans).
+void set_gate_log(bool on);
+bool gate_log();
 void set_force(bool on);
 bool force();
 
@@ -328,6 +333,17 @@ bool backbuffer_dims(unsigned* w, unsigned* h);
 //   postfx_count  lifetime count of post-tonemap draws left IN-FRAME because
 //                 they sample a backbuffer-sized texture (alcohol blur etc.).
 bool screen_only();
+
+// s65: keep calling a render target "the world" while it still draws anything,
+// once it has been confidently identified as the world pass. Without it a near
+// wall draws too little geometry, screen_only() trips, and wantCine drops
+// gameplay to the M2 quad - the pause menu's anchored square, mid-walk.
+//
+// DEFAULT OFF: BS2 and Infinite keep the pre-s65 count-only rule untouched.
+// BioShock 1 opts in from its adapter.
+void set_scene_leader_latch(bool on);
+bool scene_leader_latch();
+unsigned scene_leader_rescues();
 unsigned postfx_count();
 
 // Session 22 round 2: engine-cinematic letterbox (plasmid FMV sequences

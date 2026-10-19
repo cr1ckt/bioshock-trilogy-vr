@@ -1,4 +1,6 @@
-﻿// Hook behavior (call the original, then adjust the writable out-params;
+﻿#include "menu_bindings.h"
+#include "menu_backend.h"
+// Hook behavior (call the original, then adjust the writable out-params;
 // publish state through atomics) follows
 // itsloopyo/bioshock-remastered-headtracking (MIT), src/engine_hook.rs.
 
@@ -7,27 +9,36 @@
 #include "core/debug/value_scan.h"
 #include "core/gfx/frame_inspector.h"
 #include "core/gfx/hud_capture.h"
+#include "core/hooks/d3d11_debug.h"
+#include "game/bioshock1r/resize.h"
 #include "core/ui/overlay.h"
 #include "core/input/swing.h"
 #include "core/input/xinput_bridge.h"
 #include "core/util/log.h"
 #include "game/bioshock1r/aim.h"
+#include "game/bioshock1r/alt_eye.h"
 #include "game/bioshock1r/body.h"
 #include "game/bioshock1r/bones.h"
 #include "game/bioshock1r/console_exec.h"
 #include "game/bioshock1r/game_ini.h"
+#include "game/bioshock1r/probe_bob.h"
+#include "game/bioshock1r/screens.h"
 #include "core/vr/openxr_runtime.h"
 #include "game/bioshock1r/hands.h"
 #include "game/bioshock1r/input_drive.h"
 #include "game/bioshock1r/patterns.h"
+#include "game/bioshock1r/scripted.h"
 #include "game/bioshock1r/recorder.h"
 #include "game/bioshock1r/scenedraw.h"
+#include "game/bioshock1r/temporal.h"
+#include "game/bioshock1r/native_proof.h"
 #include "game/shared/ue_math.h"
 
 #include <windows.h>
 #include <MinHook.h>
 
 #include <imgui.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cmath>
@@ -67,9 +78,77 @@ std::atomic<float> g_worldScale{100.0f};       // Unreal units per meter
 // User head-anchor offset (session 16 part 3): the pawn's authored eye
 // height reads wrong once worldScale moves (60 UU = 0.6 m at 100 UU/m - the
 // "head very wrong" report); vertical + view-forward sliders correct the
-// anchor. Defaults 0 by the user's call (session 16 part 4) - they tune by
-// eye and persist their value via the VR preset ini.
-std::atomic<float> g_headOffUpUu{0.0f};
+// anchor. Shipped 0 from session 16 part 4 until 2026-08-22.
+//
+// Now 9 UU, which is BRVR's CameraHeightOffset=9 - its own comment: "the pawn's
+// eye height was authored for a monitor and reads short in VR". BRVR calls the
+// number cm and this file calls it UU, and both are right, because 1 UU == 1 cm
+// at worldScale 100 (BRVR's EyeSeparation is documented "game units == cm", so
+// its 3.2 cm half-IPD IS 3.2 UU, which is 100 UU/m - the same world scale this
+// file already ships). Of every number the two mods disagreed on, this was the
+// only large one, which is why it is the first suspect for the user's report
+// that the hands and weapon read tiny. `CameraHeightOffset` in BioshockVR.ini
+// and the F10 "Head offset up" slider both move it; a saved vrpreset wins.
+std::atomic<float> g_headOffUpUu{9.0f};
+
+// ---- head bob ---------------------------------------------------------------
+// On by default: a camera that bobs while the player's real head does not is a
+// strong nausea trigger, and BRVR ships its equivalent on for that reason.
+std::atomic<bool> g_killHeadBob{true};
+std::atomic<bool> g_loggedHeadBob{false};
+
+// APawn fields, both from docs/bioshock1/ENGINE_NOTES.md:
+//   +0x1D8  FVector Location
+//   +0x550  float   eye height  (GetViewPoint = Location + eyeHeight on Z)
+constexpr size_t kPawnLocationOffset = 0x1D8;
+constexpr size_t kPawnEyeHeightOffset = 0x550;
+
+// Is +0x550 the STATIC BaseEyeHeight or the ANIMATED EyeHeight? BRVR asked this
+// question in a comment and never answered it, because the code path that would
+// have logged it never ran. If it is the animated one the bob is INSIDE it and
+// this substitution achieves nothing - so measure it instead of assuming, for
+// the first ten seconds, once a second, then never again.
+std::atomic<bool> g_eyeHeightAudit{true};
+
+bool pawn_eye_point(void* pawn, float out[3]) {
+    if (!pawn || !out) return false;
+    float loc[3];
+    float eye;
+    __try {
+        const uint8_t* p = static_cast<const uint8_t*>(pawn);
+        memcpy(loc, p + kPawnLocationOffset, sizeof(loc));
+        memcpy(&eye, p + kPawnEyeHeightOffset, sizeof(eye));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    for (int i = 0; i < 3; ++i)
+        if (!(loc[i] == loc[i]) || loc[i] < -1e8f || loc[i] > 1e8f) return false;
+    if (!(eye == eye) || eye < 0.0f || eye > 250.0f) return false;
+
+    if (g_eyeHeightAudit.load(std::memory_order_relaxed)) {
+        static float lo = 1e9f, hi = -1e9f;
+        static uint64_t last = 0, first = 0;
+        const uint64_t now = GetTickCount64();
+        if (!first) first = now;
+        if (eye < lo) lo = eye;
+        if (eye > hi) hi = eye;
+        if (now - last >= 1000) {
+            last = now;
+            BVR_LOG("[b1r] headbob: eyeHeight +0x550 min %.2f max %.2f (spread %.2f) "
+                    "- a spread near zero means the bob is NOT in this field, which "
+                    "is what makes the substitution work",
+                    lo, hi, hi - lo);
+            lo = 1e9f;
+            hi = -1e9f;
+        }
+        if (now - first >= 10000) g_eyeHeightAudit.store(false, std::memory_order_relaxed);
+    }
+
+    out[0] = loc[0];
+    out[1] = loc[1];
+    out[2] = loc[2] + eye;
+    return true;
+}
 std::atomic<float> g_headOffFwdUu{0.0f};
 // VR preset 1 (session 16 part 3): one button/command arming the user's full
 // VR configuration - every switch they flipped by hand, in a safe order,
@@ -99,7 +178,15 @@ std::atomic<uint64_t> g_resWritePending{0};
 // property offset or bitmask is ever needed, and SET also writes the class
 // default, so pawns spawned later (load crossings) inherit it. Re-asserted
 // on a slow cadence in case anything script-side calls EnableReticle.
-std::atomic<bool> g_crosshairVisible{false}; // `vrxhair on` re-shows it
+std::atomic<uint64_t> g_lastMenuPressMs{0};
+bool g_playerOpenedPanel = false;
+std::atomic<bool> g_crosshairVisible{false};
+// Hide every crosshair while nothing is equipped. Ported from BRVR, whose
+// XRSession crosshair gate reads HandsProbe_Armed(): "a dot floating in front
+// of you before the game has given you anything to aim - the whole opening of
+// the game - reads as a bug, and it follows you into every scene where the game
+// takes your weapon away." Default on.
+std::atomic<bool> g_hideAimUnarmed{true}; // `vrxhair on` re-shows it
 int g_crosshairApplied = -1;                 // last state pushed (-1 = never)
 uint64_t g_crosshairAssertMs = 0;            // game thread only
 // Session 22 round 5 (user ask, pre-release): the pad SOFT LOCK-ON (aim
@@ -120,7 +207,10 @@ uint64_t g_lockOnAssertMs = 0;
 // "head turned right" is a SIM derivation (walk under a yawed head must track
 // the head), not an assumption - flip here if the walk tracks the mirror
 // heading instead.
-constexpr float kMoveYawSign = 1.0f;
+// s64: NOW A LIVE TOGGLE, body::move_yaw_sign(). It stays documented here
+// because this is where it is applied, but a constant was the wrong shape for a
+// value this banner already admitted was underived.
+
 std::atomic<bool>  g_recenterRequested{true};  // auto-recenter on first drive
 std::atomic<bool>  g_vrDriving{false};         // telemetry for the UI
 std::atomic<bool>  g_forceHeadsetFov{false};   // session 4: now writes the REAL control (the
@@ -132,12 +222,21 @@ std::atomic<bool>  g_forceHeadsetFov{false};   // session 4: now writes the REAL
 // Session 4: direct game-FOV write through the settings object (the video
 // option's storage). Distinct from the dead PC+0xE0 override above.
 std::atomic<bool>  g_gameFovWrite{false};
-std::atomic<float> g_gameFovDeg{130.0f};
+// 100, matching the BRVR mod's shipping value and the game's own HorizontalFOV
+// default here. 130 was a leftover from the session-4 experiment that found the
+// real control, and it was misleading rather than harmful: the WRITE is default
+// OFF, so nothing was ever set to 130 - but the F10 slider showed 130 while the
+// in-game video menu showed 100, which reads as two FOVs fighting. Lowering FOV
+// below 100 also buys frames, because the game stops rendering side content
+// that never reaches the display (BRVR's dist/BioshockVR.ini, section 1).
+std::atomic<float> g_gameFovDeg{100.0f};
 std::atomic<int32_t> g_lastOptionFov{0};       // telemetry: what the option holds now
 
 // M4 rung 1: AlternateEye. Half-IPD camera shift per eye, eye picked by
-// vr::current_eye_sign() (0 while AER is off).
-std::atomic<float> g_ipdMm{63.0f};
+// vr::current_eye_sign() (0 while AER is off). 64 mm is BRVR's EyeSeparation=3.2
+// (it stores HALF the IPD, in cm) - a 0.5 mm per eye difference from the 63 that
+// shipped before, adopted for exact parity rather than because it is visible.
+std::atomic<float> g_ipdMm{64.0f};
 // Head-offset telemetry: the recenter-relative offset applied to loc this
 // frame, in UU - makes the world-scale slider's effect a number on screen.
 std::atomic<float> g_headOffX{0.0f}, g_headOffY{0.0f}, g_headOffZ{0.0f};
@@ -378,11 +477,14 @@ void apply_command(const char* cmd, const char* args) {
         patterns::handle_buildgate_command(args);
     } else if (strcmp(cmd, "vrres") == 0) {
         // The eye render IS the game's backbuffer, so the game's resolution is
-        // the VR resolution. `SETRES` faults (ENGINE_NOTES session 27), so the
-        // game's own ini is the only working lever and a change lands on the
-        // next launch. Deliberately explicit rather than automatic.
+        // the VR resolution. `SETRES` faults (ENGINE_NOTES session 27); the
+        // game's own ini changes the next launch, and `vrres live WxH` resizes
+        // the game window, which the engine answers with its own SetRes
+        // (resize.h). Deliberately explicit rather than automatic.
         unsigned rw = 0, rh = 0;
-        if (sscanf_s(args, "%ux%u", &rw, &rh) == 2 && rw && rh) {
+        if (strncmp(args, "live", 4) == 0) {
+            resize::handle_command(args + 4 + (args[4] == ' '));
+        } else if (sscanf_s(args, "%ux%u", &rw, &rh) == 2 && rw && rh) {
             game_ini::write_viewport(rw, rh);
         } else if (sscanf_s(args, "%u %u", &rw, &rh) == 2 && rw && rh) {
             game_ini::write_viewport(rw, rh);
@@ -630,6 +732,11 @@ void apply_command(const char* cmd, const char* args) {
         int count = 1;
         sscanf_s(full ? args + 4 : args, " %d", &count);
         bvr::frame_inspector::arm(full ? 2 : 1, count);
+    } else if (strcmp(cmd, "vbtap") == 0) {
+        // s87: vbtap [n] - log the next n vertex-buffer uploads with their uploader stacks
+        int n = 20;
+        sscanf_s(args, "%d", &n);
+        bvr::frame_inspector::vb_tap_log(n);
     } else if (strcmp(cmd, "vrinput") == 0) {
         input::handle_command(args); // M5 synthetic gamepad; logs its own echoes
     } else if (strcmp(cmd, "vraim") == 0) {
@@ -659,6 +766,13 @@ void apply_command(const char* cmd, const char* args) {
     } else if (strcmp(cmd, "vrpreset") == 0) {
         if (strncmp(args, "save", 4) == 0) save_vr_preset();
         else apply_vr_preset();
+    } else if (strcmp(cmd, "d3ddebug") == 0) {
+        // The D3D11 debug layer for the NEXT launch: `d3ddebug on|break|off`.
+        bvr::d3d11_debug::arm(strncmp(args, "break", 5) == 0 ? 2 : strncmp(args, "on", 2) == 0 ? 1 : 0);
+    } else if (strcmp(cmd, "dlss") == 0) {
+        temporal::handle_command(cmd, args); // DLSS/DLAA and TAA
+    } else if (strcmp(cmd, "aer") == 0 || strcmp(cmd, "afw") == 0) {
+        alt_eye::handle_command(cmd, args); // alternate-eye stereo methods (AFW's tuning words pass on to temporal)
     } else if (strcmp(cmd, "vrpace") == 0) {
         bvr::vr::handle_pace_command(args); // M8 disconnect-stall guard
     } else if (strcmp(cmd, "vrmirror") == 0) {
@@ -756,6 +870,8 @@ void vr_preset_path(wchar_t* out, size_t count) {
     swprintf_s(out, count, L"%s\\vrpreset.ini", bvr::log::data_dir());
 }
 
+constexpr int kPresetVersion = 2; // see the preset-schema banner below
+
 void save_vr_preset() {
     wchar_t path[MAX_PATH];
     vr_preset_path(path, MAX_PATH);
@@ -786,9 +902,20 @@ void save_vr_preset() {
     fprintf(f, "bodyRate=%.2f\n", body::rate_per_sec());
     fprintf(f, "bodyDeadzoneDeg=%.1f\n", body::deadzone_deg());
     fprintf(f, "moveDirInstant=%d\n", body::move_dir_instant() ? 1 : 0);
+    fprintf(f, "moveYawSign=%d\n", body::move_yaw_sign());
     fprintf(f, "autoVr=%d\n", g_autoVr.load(std::memory_order_relaxed) ? 1 : 0);
+    fprintf(f, "killHeadBob=%d\n", g_killHeadBob.load(std::memory_order_relaxed) ? 1 : 0);
     fprintf(f, "turnScale=%.2f\n", bvr::input::turn_scale());
     fprintf(f, "snapTurn=%d\n", bvr::input::snap_turn() ? 1 : 0);
+    // s63: the d-pad modifier trio. They are ALSO BioshockVR.ini keys
+    // (ControllerDpadModifier / ControllerDpadFlip / JumpOnR3), and this file
+    // loads later, so saving them here is what makes the F10 controls stick -
+    // at the cost of this file then shadowing those ini keys, which is the same
+    // trade every other value in here already makes. -1 is the legacy heuristic
+    // and is a real state, not "unset".
+    fprintf(f, "dpadModifier=%d\n", bvr::input::dpad_modifier());
+    fprintf(f, "dpadSelectLeft=%d\n", bvr::input::dpad_select_left() ? 1 : 0);
+    fprintf(f, "jumpOnR3=%d\n", bvr::input::jump_on_r3() ? 1 : 0);
     fprintf(f, "snapAngleDeg=%.0f\n", bvr::input::snap_angle_deg());
     fprintf(f, "swingOn=%d\n", bvr::input::swing::enabled() ? 1 : 0);
     fprintf(f, "swingThreshold=%.2f\n", bvr::input::swing::threshold_ms());
@@ -798,9 +925,22 @@ void save_vr_preset() {
     fprintf(f, "swingDelayMs=%u\n", bvr::input::swing::delay_ms());
     fprintf(f, "swingHeadRel=%d\n", bvr::input::swing::head_relative() ? 1 : 0);
     fprintf(f, "laserOn=%d\n", aim::laser_enabled() ? 1 : 0);
+    fprintf(f, "presetVersion=%d\n", kPresetVersion);
     fprintf(f, "cineBarsHidden=%d\n", bvr::hud::bars_hidden() ? 1 : 0);
     fprintf(f, "cineDrive=%d\n", static_cast<int>(bvr::vr::cine_drive()));
     fprintf(f, "cineSubsInFrame=%d\n", bvr::hud::cine_subs_in_frame() ? 1 : 0);
+    fprintf(f, "scriptedRotFollow=%d\n", static_cast<int>(scripted::rot_follow()));
+    fprintf(f, "scriptedHoldMs=%d\n", scripted::hold_ms());
+    fprintf(f, "scriptedFreezeRot=%d\n", scripted::freeze_game_rot() ? 1 : 0);
+    fprintf(f, "scriptedFreezeBleed=%.1f\n", scripted::freeze_bleed_deg_per_sec());
+    fprintf(f, "scriptedTurnOn=%d\n", scripted::scripted_turn() ? 1 : 0);
+    fprintf(f, "scriptedTurnRate=%.1f\n", scripted::scripted_turn_deg_per_sec());
+    fprintf(f, "scriptedRecentre=%d\n", scripted::scripted_recentre_mode());
+    fprintf(f, "scriptedFreezeHands=%d\n", scripted::freeze_hands_in_scenes() ? 1 : 0);
+    fprintf(f, "scriptedHideRig=%d\n", scripted::hide_rig_in_scenes() ? 1 : 0);
+    fprintf(f, "scriptedWorldFov=%d\n", scripted::world_fov_guard() ? 1 : 0);
+    fprintf(f, "scriptedArmMotion=%.4f\n", scripted::arm_motion_threshold());
+    fprintf(f, "scriptedArmHoldMs=%d\n", scripted::arm_hold_ms());
     fprintf(f, "effectsInFrame=%d\n", bvr::hud::effects_in_frame() ? 1 : 0);
     fprintf(f, "effectMaxVerts=%u\n", bvr::hud::effect_max_verts());
     fprintf(f, "postFxRtOnly=%d\n", bvr::hud::postfx_rt_only() ? 1 : 0);
@@ -818,6 +958,8 @@ void save_vr_preset() {
         fprintf(f, "hudQuadWidthM=%.2f\n", hw);
         fprintf(f, "hudQuadUpM=%.2f\n", hu);
     }
+    fprintf(f, "screenPlaceMode=%d\n", bvr::vr::screen_place_mode());
+    fprintf(f, "screenHeightM=%.2f\n", bvr::vr::screen_height_m());
     fclose(f);
     BVR_LOG("[b1r] VR preset values saved to vrpreset.ini");
     // The per-hand model offsets live in hands.ini; saving them here too makes
@@ -827,7 +969,36 @@ void save_vr_preset() {
     aim::save_weapon_profiles();
 }
 
+// ---- preset schema version, and why cineDrive needed one -------------------
+//
+// BS1 wants CineDrive::Off by default (headset-settled 2026-08-23: the head keeps
+// steering through a cutscene). Two attempts at that failed for the same reason
+// in different clothes.
+//
+// First it was set in the adapter's init(), which runs BEFORE the preset loads -
+// so a saved vrpreset.ini simply overwrote it. Then it was applied after the
+// load but only when the preset had no cineDrive line - which does nothing when
+// the preset DOES have one, and every preset saved before 2026-08-23 carries
+// `cineDrive=1` from the old default. Reported twice: "head control still isnt
+// defaulting to the camera controlled by head option".
+//
+// A DEFAULT CHANGE CANNOT BE DELIVERED THROUGH A FILE THAT ALREADY STORES THE
+// OLD DEFAULT, and no amount of has-the-key logic fixes that: a stored value
+// that happens to equal the old default is indistinguishable from a deliberate
+// choice. It needs a schema version, which is the ordinary answer.
+//
+// `presetVersion` is written on every save from now on. A preset with no version
+// (or an older one) predates this default, so its cineDrive is discarded and the
+// BS1 default applies. Anything the user chooses AFTER this ships is saved with
+// the current version and wins normally.
+int g_presetVersion = 0;
+bool g_presetHadCineDrive = false;
+bool preset_had_cine_drive() { return g_presetHadCineDrive; }
+int preset_version() { return g_presetVersion; }
+
 void load_vr_preset_values() {
+    g_presetHadCineDrive = false;
+    g_presetVersion = 0;
     wchar_t path[MAX_PATH];
     vr_preset_path(path, MAX_PATH);
     FILE* f = nullptr;
@@ -868,9 +1039,18 @@ void load_vr_preset_values() {
         else if (strcmp(key, "bodyRate") == 0) bodyRate = v;
         else if (strcmp(key, "bodyDeadzoneDeg") == 0) bodyDz = v;
         else if (strcmp(key, "moveDirInstant") == 0) body::set_move_dir_instant(v != 0.0f);
+        else if (strcmp(key, "moveYawSign") == 0)
+            body::set_move_yaw_sign(v < 0.0f ? -1 : 1);
         else if (strcmp(key, "autoVr") == 0) g_autoVr.store(v != 0.0f, std::memory_order_relaxed);
+        else if (strcmp(key, "killHeadBob") == 0)
+            g_killHeadBob.store(v != 0.0f, std::memory_order_relaxed);
         else if (strcmp(key, "turnScale") == 0) bvr::input::set_turn_scale(v);
         else if (strcmp(key, "snapTurn") == 0) bvr::input::set_snap_turn(v != 0.0f);
+        else if (strcmp(key, "dpadModifier") == 0)
+            bvr::input::set_dpad_modifier(static_cast<int>(v));
+        else if (strcmp(key, "dpadSelectLeft") == 0)
+            bvr::input::set_dpad_select_left(v != 0.0f);
+        else if (strcmp(key, "jumpOnR3") == 0) bvr::input::set_jump_on_r3(v != 0.0f);
         else if (strcmp(key, "snapAngleDeg") == 0) bvr::input::set_snap_angle_deg(v);
         else if (strcmp(key, "swingOn") == 0) bvr::input::swing::set_enabled(v != 0.0f);
         else if (strcmp(key, "swingThreshold") == 0) bvr::input::swing::set_threshold_ms(v);
@@ -895,10 +1075,40 @@ void load_vr_preset_values() {
             bvr::hud::set_postfx_rt_only(v != 0.0f);
         else if (strcmp(key, "cineSubsInFrame") == 0)
             bvr::hud::set_cine_subs_in_frame(v != 0.0f);
+        else if (strcmp(key, "presetVersion") == 0)
+            g_presetVersion = static_cast<int>(v);
         else if (strcmp(key, "cineDrive") == 0) {
+            g_presetHadCineDrive = true;
             int m = static_cast<int>(v);
             if (m >= 0 && m <= 2) bvr::vr::set_cine_drive(static_cast<bvr::vr::CineDrive>(m));
         }
+        else if (strcmp(key, "scriptedRotFollow") == 0) {
+            int sm = static_cast<int>(v);
+            if (sm >= 0 && sm <= 2)
+                scripted::set_rot_follow(static_cast<scripted::RotFollow>(sm));
+        }
+        else if (strcmp(key, "scriptedHoldMs") == 0)
+            scripted::set_hold_ms(static_cast<int>(v));
+        else if (strcmp(key, "scriptedFreezeRot") == 0)
+            scripted::set_freeze_game_rot(v != 0.0f);
+        else if (strcmp(key, "scriptedFreezeBleed") == 0)
+            scripted::set_freeze_bleed_deg_per_sec(v);
+        else if (strcmp(key, "scriptedTurnOn") == 0)
+            scripted::set_scripted_turn(v != 0.0f);
+        else if (strcmp(key, "scriptedTurnRate") == 0)
+            scripted::set_scripted_turn_deg_per_sec(v);
+        else if (strcmp(key, "scriptedRecentre") == 0)
+            scripted::set_scripted_recentre_mode(static_cast<int>(v));
+        else if (strcmp(key, "scriptedFreezeHands") == 0)
+            scripted::set_freeze_hands_in_scenes(v != 0.0f);
+        else if (strcmp(key, "scriptedHideRig") == 0)
+            scripted::set_hide_rig_in_scenes(v != 0.0f);
+        else if (strcmp(key, "scriptedWorldFov") == 0)
+            scripted::set_world_fov_guard(v != 0.0f);
+        else if (strcmp(key, "scriptedArmMotion") == 0)
+            scripted::set_arm_motion_threshold(v);
+        else if (strcmp(key, "scriptedArmHoldMs") == 0)
+            scripted::set_arm_hold_ms(static_cast<int>(v));
         else if (strcmp(key, "aimDotOn") == 0)
             aim::handle_command(v != 0.0f ? "dot on" : "dot off");
         else if (strcmp(key, "aimDotDistM") == 0) {
@@ -916,6 +1126,9 @@ void load_vr_preset_values() {
         else if (strcmp(key, "hudQuadDistM") == 0) hudD = v;
         else if (strcmp(key, "hudQuadWidthM") == 0) hudW = v;
         else if (strcmp(key, "hudQuadUpM") == 0) hudU = v;
+        else if (strcmp(key, "screenPlaceMode") == 0)
+            bvr::vr::set_screen_place_mode(static_cast<int>(v));
+        else if (strcmp(key, "screenHeightM") == 0) bvr::vr::set_screen_height_m(v);
         else --n;
     }
     fclose(f);
@@ -928,6 +1141,40 @@ void load_vr_preset_values() {
     if (n) BVR_LOG("[b1r] VR preset: %d value(s) loaded from vrpreset.ini", n);
 }
 
+// ---- preset migrations, and why every load path must call this -------------
+//
+// EVERY path that calls load_vr_preset_values() must call this straight after
+// it. There are two, and until VOID's review of PR 51 only one of them did:
+//
+//   1. apply_vr_preset()           - the "VR PRESET 1" button / auto-VR
+//   2. install_calcview_hook()     - the boot-time VALUES-ONLY load
+//
+// Path 2 was the gap. It exists so a user's saved sliders are live from the
+// first frame without pressing anything, and load_vr_preset_values() DOES
+// apply cineDrive (see its `cineDrive` key). With autoVr=1 - the default -
+// path 1 runs on the first CalcView and corrected it a moment later, which is
+// why this was never seen. With **autoVr=0** nothing corrected it, and a
+// pre-s64 preset carrying cineDrive=1 silently reinstated the old behaviour:
+// exactly the failure the presetVersion gate was added to prevent.
+//
+// It also cannot move to the adapter's init(), which runs BEFORE either load -
+// a migration has to see what the file actually said.
+//
+// Idempotent by construction: it only ever forces a default the preset did not
+// knowingly choose, so calling it on both paths is safe.
+void apply_preset_migrations() {
+    // BS1 ships CineDrive::Off (headset-settled 2026-08-23: the head keeps
+    // steering through a cutscene). A preset that DID choose still wins; this
+    // only fills the gap for one that predates the default existing.
+    if (!preset_had_cine_drive() || preset_version() < kPresetVersion) {
+        bvr::vr::set_cine_drive(bvr::vr::CineDrive::Off);
+        BVR_LOG("[b1r] cine drive: preset %s - applying the BS1 default (off: your head "
+                "keeps steering through a cutscene). Save the preset to keep your own "
+                "choice from now on.",
+                preset_had_cine_drive() ? "predates this default (presetVersion < 2)"
+                                        : "had no cineDrive");
+    }
+}
 void apply_vr_preset() {
     BVR_LOG("[b1r] VR PRESET 1: arming the full VR configuration");
     bvr::vr::set_enabled(true);        // paces the game to the headset
@@ -957,9 +1204,11 @@ void apply_vr_preset() {
     hands::handle_command("pose aim"); // align to the AIM ray
     body::handle_command("on");        // M7.5: stick-forward = look direction
     load_vr_preset_values();           // tuned sliders (ini) over defaults
+    apply_preset_migrations();         // see the banner on its definition
     aim::note_preset_baseline();       // seed source for new weapon profiles
     aim::reapply_weapon_profile();     // the active weapon profile beats the baseline
     scenedraw::handle_command("vrstereo on"); // last: 1t + stereo, sticky
+    menu::reapply_preferences(); // recovery preset must not erase player choices
     BVR_LOG("[b1r] VR PRESET 1 armed (unwind: vrstereo off + overlay checkboxes)");
 }
 
@@ -973,11 +1222,38 @@ void apply_vr_preset() {
 // a slow safety net for a script-side caller we have not identified.
 constexpr uint64_t kExecReassertMs = 300000; // 5 minutes
 
+// Should every crosshair be hidden this frame, and why? ONE predicate for all
+// three of them - the core aim dot and laser (published to core below) and the
+// game's own reticle (assert_crosshair) - so they can never disagree.
+//
+// Two reasons, and they are independent switches because they are independent
+// judgements: a scene owning the view is scripted.cpp's call, and empty hands is
+// hands.cpp's. BRVR keeps them separate too, and its comment says why - it first
+// expected empty hands to cover cutscenes, "a full playthrough of the opening
+// says it does not, so the sequence is named directly".
+bool aim_suppressed() {
+    if (scripted::scene_owns_aim()) return true;
+    return g_hideAimUnarmed.load(std::memory_order_relaxed) && !hands::armed();
+}
+
 // Crosshair upkeep (see the globals): push the wanted state through the
 // engine's SET handler on change, on a world event, and on the slow safety
 // net. Game thread.
 void assert_crosshair(uint64_t now) {
-    int want = g_crosshairVisible.load(std::memory_order_relaxed) ? 1 : 0;
+    // Hidden while the F10 panel is up - it sits in the middle of the view,
+    // right where the panel is, and reads as a smudge on the menu. This is a
+    // suppression, not a setting change: the `due` test below is edge-driven,
+    // so it hides on open and comes back on close.
+    // ...and hidden while a scripted scene owns the view, for the same reason
+    // the aim dot and laser are (bvr::vr::publish_scene_active): you are not
+    // aiming during a cutscene, and a reticle pinned to the middle of a camera
+    // you are not steering reads as a smudge on the scene. Suppression, not a
+    // setting change - the edge-driven `due` test below brings it back when the
+    // scene ends, exactly as it does when the panel closes.
+    int want = (g_crosshairVisible.load(std::memory_order_relaxed) &&
+                !bvr::overlay::visible() && !aim_suppressed())
+                   ? 1
+                   : 0;
     bool due = want != g_crosshairApplied ||
                (want == 0 && now - g_crosshairAssertMs >= kExecReassertMs);
     if (!due) return;
@@ -1073,6 +1349,9 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
             g_eyeCamLoc[1] = *loc; // fg view-sync stash, RIGHT eye
             g_eyeCamRot[1] = *rot;
             g_eyeCamStampMs[1] = GetTickCount64();
+            temporal::note_camera(g_srBaseEyed ? +1 : 0, *loc, *rot); // DLSS / AFW guides
+            const float proofWorldEye[3] = {loc->x,loc->y,loc->z};
+            native_proof::note_eye(g_srBaseEyed ? +1 : 0, 2*eye_half_separation_uu(), proofWorldEye);
         } else if (rot) {
             rot->yaw += static_cast<int32_t>(reentryYawDeg * kRotUnitsPerDegree);
         }
@@ -1084,6 +1363,8 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
     }
     g_original(self, edx, viewActor, loc, rot);
     scenedraw::note_calcview();
+    int aerSignApplied = 0; // the AlternateEye offset this build renders with (temporal guides)
+    FVector aerEyeTranslation{}; // render-only offset; never move the head/shoulders with it
 
     g_playerController.store(self, std::memory_order_relaxed);
     uint32_t count = g_callCount.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1129,13 +1410,19 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
     // F10 button posts (seated pose + view yaw).
     if (bvr::input::take_recenter_chord()) {
         g_recenterRequested.store(true, std::memory_order_relaxed);
+        // A recenter with a screen open must bring the screen too, or the
+        // player recenters and the thing they were reading stays behind them.
+        bvr::vr::release_screen_anchor();
         BVR_LOG("[b1r] recenter requested (stick chord)");
     }
     if (g_vrPresetSavePending.exchange(false, std::memory_order_relaxed)) save_vr_preset();
+    menu::tick(); // render-thread edits become settings changes on the game thread
     if (uint64_t req = g_resWritePending.exchange(0, std::memory_order_relaxed)) {
         game_ini::write_viewport(static_cast<uint32_t>(req >> 32),
                                  static_cast<uint32_t>(req & 0xFFFFFFFFu));
     }
+    temporal::tick_resolution(); // latest mode/output intent, after any prior resize completes
+    resize::tick(); // the engine's SetRes runs on this game thread
     // M5: pump the engine's own pad pipeline against the synthetic gamepad
     // (self-throttles to once per present; no-op while vrinput is off).
     input_drive::on_frame(now);
@@ -1166,10 +1453,42 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
     // M6: the aim ray must be built in the SAME frame as the camera, so keep
     // the pre-head-offset camera loc and the yaw the drive added.
     FVector baseLoc = loc ? *loc : FVector{};
+    float headAnchor[3] = {0.0f, 0.0f, 0.0f}; // s90: the head-offset sliders' vector (FrameContext::anchor*)
     float driveYawOffsetRad = 0.0f;
+    // s74c: the head's own yaw, recenter-relative, published untouched so the
+    // arm probes can tell a PHYSICAL head turn from a stick turn. Stays 0 on
+    // frames the head does not drive, which is exactly when there is no head
+    // turn to attribute anything to.
+    float headYawRelRad = 0.0f;
     // The same quantity in rotator units - what M7.5 transfers to the body.
     int32_t residualUnits = 0;
     int32_t gameYawUnitsRaw = rot ? rot->yaw : 0; // the engine's own body yaw
+
+    // ---- the comfort yaw, applied HERE and nowhere else --------------------
+    //
+    // IT USED TO BE APPLIED AT THE END OF THE BODY, and that is what made
+    // distant geometry smear while walking. Everything downstream reads the
+    // rotator: apply_eye_offset builds the eye separation axis from it, and the
+    // stereo second pass replays a stash (g_srBaseRot) taken inside the drive
+    // block. An adjustment added after both meant the LEFT eye carried it and
+    // the RIGHT eye did not - a per-eye yaw disagreement, which is a double
+    // image that resolves the moment you stand still. Reported as "things in
+    // the distance become blurry when walking and clear after stopping".
+    //
+    // Applied before all of that, in one place, so every consumer agrees.
+    // gameYawUnitsRaw is captured ABOVE it, so body::on_calcview keeps steering
+    // by the engine own value and this stays camera-only, as chosen.
+    float turnStickX = 0.0f;
+    if (scripted::wants_turn_axis()) {
+        // Only read the pad when something needs it: the accessor takes the
+        // input mutex and this runs on the game thread every CalcView.
+        bvr::input::Gamepad xr{};
+        bool xrActive = false;
+        bvr::input::last_xr_pad(&xr, &xrActive);
+        if (xrActive) turnStickX = static_cast<float>(xr.rx) / 32767.0f;
+    }
+    scripted::observe(self, gameYawUnitsRaw, turnStickX);
+    if (rot) rot->yaw += scripted::yaw_adjust_units();
 
     // Session 22: the strict gameplay-view verdict (body.cpp predicate, no
     // menu-attract escape hatch) now gates the live head drive, the FOV
@@ -1179,6 +1498,19 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
     // scripted cameras bypass CalcView entirely).
     bool strictGameplay = body::is_gameplay_view(viewActor ? *viewActor : nullptr);
     bvr::vr::publish_gameplay_view(strictGameplay);
+    // Alternate-eye stereo (alt_eye.h): the eye THIS FRAME renders - the same for every
+    // CalcView call of the frame (the hands node takes its camera from the calls before
+    // the build's own), decided once per frame at the render view. Applies a pending
+    // method change here, outside the build. 0 = no alternate method / not a stereo frame.
+    const int altSign = alt_eye::frame_sign(strictGameplay && !bvr::vr::cinematic_active());
+
+    // s64: the scripted-EVENT signals (BRVR's M7 window). Deliberately NOT
+    // gated on strictGameplay - a scripted sequence is exactly when the view
+    // actor may not be the pawn, and the signals read the hands actor and the
+    // controller, not the view. Read-only, three dwords, gates nothing yet.
+    // The turn axis, read once. Both comfort accumulators need it and both are
+    // advanced inside observe(), which runs on every CalcView - including the
+    // ones where the game owns the camera and the head-drive block is skipped.
 
     // Session 29: the cinematic drive policy (vrcine drive off|authored|
     // authored+look). `cineHold` is the draw-based signal ORed with the pixel
@@ -1223,9 +1555,19 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         // above stay ungated for flat tests.
         driveHead = true;
         liveHead = true;
+        // AER: one head sample per eye pair (BRVR's latch) - no-op for every other method.
+        alt_eye::latch_head(&hp, altSign);
     }
     if (loc && rot && driveHead) {
         UeAngles a = hmd_angles(hp);
+        // RAW, not recenter-relative. Subtracting recenter_yaw_rad() here is
+        // what made s74c's verdict detector silent for an entire run: the
+        // transfer advances g_recenterYawUnits by whatever it took, so that
+        // difference is very nearly CONSTANT while the head sweeps - measured
+        // flat to within 5-10 deg across +-180 deg. The consumers all take
+        // differences over time, and any fixed offset cancels in a difference,
+        // so raw is both correct and the only version that cannot self-cancel.
+        headYawRelRad = a.yawRad;
         if (g_recenterRequested.exchange(false, std::memory_order_relaxed) || !g_haveRecenter) {
             g_recenterPose = hp;
             g_recenterYawUnits = static_cast<int32_t>(lroundf(a.yawRad * kRotUnitsPerRadian));
@@ -1294,6 +1636,52 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         driveYawOffsetRad = static_cast<float>(residualUnits) / kRotUnitsPerRadian;
         rot->yaw = gameYawUnits + residualUnits;
 
+        // HEAD BOB, THE LANDING DIP AND DAMAGE SHAKE. The engine adds all
+        // three to the camera location inside CalcView. Rather than filter
+        // them out afterwards - which cannot tell a bob from a lift, a stair
+        // or a slope - take the view origin the engine started from: the
+        // pawn's own Location plus its eye height, which is exactly what
+        // APawn::GetViewPoint computes (ENGINE_NOTES, "+0x550 float eye
+        // height"). Everything below still stacks on top additively, so the
+        // HMD offset, the height sliders and the IPD are untouched.
+        //
+        // This is the pawn-eye-point anchoring already queued as next-step 4
+        // in STATUS.md. Ported from BRVR, where it ships on by default.
+        //
+        // NOT during a cinematic: an authored camera position is authored, not
+        // derived, and substituting a pawn-derived origin would fight it.
+        if (g_killHeadBob.load(std::memory_order_relaxed) &&
+            !bvr::vr::cinematic_active()) {
+            float eye[3];
+            if (pawn_eye_point(viewActor ? *viewActor : nullptr, eye)) {
+                loc->x = eye[0];
+                loc->y = eye[1];
+                loc->z = eye[2];
+                if (!g_loggedHeadBob.exchange(true))
+                    BVR_LOG("[b1r] headbob: camera base = Pawn.Location + eyeHeight "
+                            "(bob, landing dip and damage shake bypassed)");
+            }
+        }
+
+        // RE-TAKE THE HAND/RAY ORIGIN. baseLoc was snapshotted ~150 lines above,
+        // BEFORE the head-bob substitution that just ran, and the hand viewmodel
+        // and the aim ray are both built on it (frame_context.h:
+        // out.loc.z = ctx.baseZ + d[2] * worldScale). So the head-bob fix stopped
+        // the VIEW bobbing and left the GUN bobbing - the two consumers of the
+        // camera location silently diverged the moment that fix landed.
+        //
+        // MEASURED 2026-08-22 (bracketed bob probe, hand still): with the pawn's
+        // own world Z perfectly flat, bone 43 after our write still moved 2.91 UU
+        // mean in ABSOLUTE world space - our write is authoritative and lands
+        // exactly where told, it was simply being told a bobbing number. Relative
+        // to the pawn the gun swung 9.28 UU while walking. That is this line.
+        //
+        // Here and not earlier: AFTER the substitution, BEFORE the head offset
+        // below - which is what "pre eye-offset" has always meant. When the
+        // head-bob kill is off this is a no-op, so `vrcam headbob off` still A/Bs
+        // the whole behaviour.
+        if (loc) baseLoc = *loc;
+
         float dxr[3] = {hp.px - g_recenterPose.px, hp.py - g_recenterPose.py,
                         hp.pz - g_recenterPose.pz};
         float d[3];
@@ -1325,6 +1713,9 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
             loc->x += cosf(vyaw) * hoFwd;
             loc->y += sinf(vyaw) * hoFwd;
             loc->z += hoUp;
+            headAnchor[0] = cosf(vyaw) * hoFwd;
+            headAnchor[1] = sinf(vyaw) * hoFwd;
+            headAnchor[2] = hoUp;
         }
 
         // AlternateEye (M4 rung 1): shift the camera half an IPD along
@@ -1332,10 +1723,31 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         // successive game frames render alternating eyes. Suppressed under
         // SequentialReentry stereo (rung 2), which applies both eye offsets
         // itself at the end of this body.
-        int eyeSign = scenedraw::stereo_active() ? 0 : bvr::vr::current_eye_sign();
+        // An alt_eye method (AER, AFW) owns the alternation on the game thread - one eye
+        // per frame; otherwise core's published sign (its own AlternateEye test).
+        int eyeSign = scenedraw::stereo_active()                   ? 0
+                      : alt_eye::method() != alt_eye::kBoth ? altSign
+                                                             : bvr::vr::current_eye_sign();
+        // AER's pair lock: the right frame renders from the left frame's camera (this
+        // call site's), so both eyes of a pair are one instant - BRVR's PairLockCamera.
+        if (eyeSign != 0) alt_eye::pair_lock(_ReturnAddress(), loc, rot, eyeSign);
         // Session 22: routed through apply_eye_offset so SR and AER share ONE
         // implementation (full-rotation right axis, head-roll correct).
-        if (eyeSign != 0) apply_eye_offset(loc, *rot, eyeSign);
+        if (eyeSign != 0) {
+            const FVector head = *loc;
+            apply_eye_offset(loc, *rot, eyeSign);
+            aerEyeTranslation = {loc->x - head.x, loc->y - head.y, loc->z - head.z};
+        }
+        aerSignApplied = eyeSign;
+        if (eyeSign != 0 && loc && rot) {
+            // The player-scene constructor runs AFTER this build's CalcView. Keep the
+            // driven camera before commit_render_view advances the next eye; the ctor
+            // selects this build's committed sign (ENGINE_NOTES tenth-run correction).
+            const int e = eyeSign > 0 ? 1 : 0;
+            g_eyeCamLoc[e] = *loc;
+            g_eyeCamRot[e] = *rot;
+            g_eyeCamStampMs[e] = GetTickCount64();
+        }
 
         vrFov = g_forceHeadsetFov.load(std::memory_order_relaxed)
                     ? bvr::vr::suggested_hfov_deg()
@@ -1427,6 +1839,21 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
             loc->z += g_wobbleAmp.load(std::memory_order_relaxed) * sinf(2.0f * kPi * t);
         }
     }
+    // s64 comfort: the game's own authored rotation, and only when the game is
+    // the one rotating the view. `vrDrove` is the head drive's own verdict, so
+    // !vrDrove is exactly the pass-through case - CalcView's rotator reaching
+    // the player untouched. During ordinary VR gameplay the head has already
+    // overwritten pitch and roll absolutely above, so there is nothing there for
+    // this to remove; the axes only survive when the head is NOT driving.
+    //
+    // The scene term matters as much as the drive term: a MENU also stops the
+    // head drive, and holding a menu's framing is pointless and would log on
+    // every inventory open. A no-op at the default (follow both axes).
+    if (rot) {
+        scripted::apply_rotation_policy(!vrDrove, cineHold || scripted::scripted_window(),
+                                        &rot->pitch, &rot->yaw, &rot->roll);
+    }
+
     if (rot) {
         rot->pitch += static_cast<int32_t>(g_pitchDeg.load(std::memory_order_relaxed) * kRotUnitsPerDegree);
         rot->yaw   += static_cast<int32_t>(g_yawDeg.load(std::memory_order_relaxed) * kRotUnitsPerDegree);
@@ -1436,24 +1863,29 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
     // M6/M7: publish the frame the camera just produced so the aim ray and the
     // hand viewmodel both land in exactly this frame (pre eye-offset - the eye
     // shift belongs to the render, not to where the player is standing).
+    FrameContext temporalFrame{};
     {
         FrameContext fc{};
         fc.vrDriving = vrDrove;
-        if (loc) {
-            fc.camX = loc->x;
-            fc.camY = loc->y;
-            fc.camZ = loc->z;
-        }
+        // AFW/AER already applied their render-eye shift above. Publishing that
+        // eye as the head moved IK shoulders left/right each frame while wrists
+        // stayed on the controllers (run eleven's sleeve flicker).
+        if (loc) set_frame_head_position(fc, *loc, aerEyeTranslation);
         fc.baseX = baseLoc.x;
         fc.baseY = baseLoc.y;
         fc.baseZ = baseLoc.z;
+        fc.anchorX = headAnchor[0];
+        fc.anchorY = headAnchor[1];
+        fc.anchorZ = headAnchor[2];
         if (rot) {
             fc.camPitch = rot->pitch;
             fc.camYaw = rot->yaw;
             fc.camRoll = rot->roll;
         }
         fc.driveYawOffsetRad = driveYawOffsetRad;
+        fc.headYawRad = headYawRelRad;
         fc.recenterYawRad = recenter_yaw_rad();
+        if (g_haveRecenter) fc.recenterHeadYawRad = hmd_angles(g_recenterPose).yawRad;
         fc.recenterPx = g_recenterPose.px;
         fc.recenterPy = g_recenterPose.py;
         fc.recenterPz = g_recenterPose.pz;
@@ -1615,7 +2047,14 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         aim::on_calcview(fc);
         // The viewmodel write goes LAST in the frame: the engine placed the
         // hands during its own tick, so ours has to be the one that survives.
+        // The bob probe brackets the drive: `pre` reads the bone array as the
+        // ENGINE evaluated it, `post` re-reads the same slot once we have
+        // written it, so "did our write land" is measured rather than assumed.
+        // Read-only on both sides, and neither may scan.
+        probe_bob::on_calcview_pre(fc);
         hands::on_calcview(fc);
+        probe_bob::on_calcview_post(fc);
+        temporalFrame = fc;
     }
 
     // Foreground lens match: post-tick, pre-render, every frame - nothing
@@ -1669,7 +2108,45 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
                     k = (4.0f / 3.0f) * (static_cast<float>(bbH) /
                                          static_cast<float>(bbW));
                 float fg = 2.0f * atanf(tanW * k) * kRadToDeg;
+                // s67 FOVPROBE, modelled on BRVR's line so the two logs can be
+                // read side by side. BRVR prints, every run:
+                //     >>> FOVPROBE: writing ForegroundFov at +0x460 = 117.5 (was 60.0)
+                // This tree has computed the same 117.5 all along and NEVER SAID
+                // SO, which is why nobody could tell the write from a no-op. It
+                // matters because `[hud] fov watch` reports "1 lens(es)" and
+                // "FG tanH=0.000000" on every run: if a 117.5 foreground pass
+                // really rendered beside the 100 deg world pass there would be
+                // TWO distinct lenses in the constant buffers, and there is one.
+                //
+                // Two lines: the first write (with the value we displaced, which
+                // should read 60.0 if this field is the one BRVR drives), then a
+                // 1 Hz readback of what the field holds NOW. If it reads back as
+                // something other than what we wrote, the engine is restamping
+                // it and the lens match has never actually been in effect.
+                const float wasFg = *fgFov;
                 *fgFov = fg;
+                {
+                    static bool s_toldFg = false;
+                    if (!s_toldFg) {
+                        s_toldFg = true;
+                        BVR_LOG("[b1r] FOVPROBE: writing ForegroundFov at +0x%X = %.1f "
+                                "(was %.1f) | world %d deg, k=%.6f, backbuffer %ux%u",
+                                patterns::kPcForegroundFovOffset, fg, wasFg, *opt, k, bbW,
+                                bbH);
+                    }
+                    static uint64_t s_lastFgMs = 0;
+                    const uint64_t nowFg = GetTickCount64();
+                    if (nowFg - s_lastFgMs >= 1000) {
+                        s_lastFgMs = nowFg;
+                        BVR_LOG("[b1r] FOVPROBE: field held %.2f before our write this "
+                                "frame (we write %.2f) %s",
+                                wasFg, fg,
+                                (wasFg > fg + 0.5f || wasFg < fg - 0.5f)
+                                    ? "<-- ENGINE IS RESTAMPING IT: our lens match is NOT "
+                                      "reaching the renderer"
+                                    : "(our value is holding)");
+                    }
+                }
                 g_fgFovWritten.store(fg, std::memory_order_relaxed);
                 g_fgFovK.store(k, std::memory_order_relaxed);
             }
@@ -1701,8 +2178,23 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         g_eyeCamLoc[0] = *loc; // fg view-sync stash, LEFT eye
         g_eyeCamRot[0] = *rot;
         g_eyeCamStampMs[0] = GetTickCount64();
+        // DLSS guides: the render view only (the build's own CalcView, one per frame).
+        if (scenedraw::in_gameplay_build()) {
+            temporal::note_camera(g_srBaseEyed ? -1 : 0, *loc, *rot, &temporalFrame);
+            const float proofWorldEye[3] = {loc->x,loc->y,loc->z};
+            native_proof::note_eye(g_srBaseEyed ? -1 : 0, 2*eye_half_separation_uu(), proofWorldEye);
+        }
     } else {
         g_srBaseValid = false;
+        // AlternateEye or mono, the render view (one per frame - the engine's other CalcView
+        // calls are movement/AI/audio consumers, not frames): the camera this frame renders
+        // with, after every offset; then the frame is tagged and the eye advances.
+        if (loc && rot && scenedraw::in_gameplay_build()) {
+            temporal::note_camera(aerSignApplied, *loc, *rot, &temporalFrame);
+            const float proofWorldEye[3] = {loc->x,loc->y,loc->z};
+            native_proof::note_eye(aerSignApplied, 2*eye_half_separation_uu(), proofWorldEye);
+            alt_eye::commit_render_view(aerSignApplied);
+        }
     }
 
     // FOV: the VR drive wins over the manual override; both share the same
@@ -1762,6 +2254,96 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         }
     }
 
+    // Which interface screen is up, by NAME. The pause menu and the machine
+    // flows draw over a live world, so no render-side signal can see them; the
+    // engine's own movie stack names them exactly.
+    screens::on_calcview(self, viewActor ? *viewActor : nullptr);
+
+    // s64 part 2: PausePC.swf IS ON THE STACK DURING BATHYSPHERE RIDES AND EVERY
+    // SCRIPTED SCENE, not just at the pause menu. Measured 2026-08-22:
+    //
+    //   23:07:56.892  screens: top = "..\FlashMovies\PausePC.swf" (2 playing) -> PANEL
+    //   23:07:56.928  xr: cinematic quad ON (... uiPaused=1)
+    //   23:08:14.929  screens: top = "..\FlashMovies\HUDRadial.swf" -> gameplay
+    //   23:08:14.929  scripted: bathysphere off          <- the same millisecond
+    //
+    // uiPaused is an unconditional term in core's wantCine, so the ride and every
+    // scripted scene dropped to the head-locked quad ("a square that is headlocked
+    // with black behind it"). And because cinematic_active() also gates the head
+    // drive below, it is why looking around during a scene did nothing at all -
+    // two reported defects, one cause.
+    //
+    // Narrow by construction: at the REAL pause menu neither signal is set, so
+    // that path is untouched, and genuinely screen-only cases (hack minigame,
+    // loading, FMV) arrive through screen_only() instead and are also untouched.
+    const bool panelUp = screens::panel_screen_up();
+    const bool sceneOwnsPanel = scripted::scripted_window() || scripted::bathysphere();
+    {
+        // ONE line, and it states the decision actually taken. The s64 version
+        // read `panelUp && sceneOwnsPanel` and so announced "NOT treating it as
+        // a UI pause" even on the frame we were treating it as exactly that,
+        // once the menu-press latch above started overriding it.
+        static bool s_wasSuppressing = false;
+        const bool suppressing = panelUp && sceneOwnsPanel && !g_playerOpenedPanel;
+        if (suppressing != s_wasSuppressing) {
+            s_wasSuppressing = suppressing;
+            BVR_LOG("[b1r] scripted: panel during a %s - %s",
+                    scripted::bathysphere() ? "bathysphere ride" : "scripted scene",
+                    suppressing
+                        ? "the SCENE pushed it (no menu press) - not a UI pause, so the "
+                          "scene keeps its stereo projection and your head keeps steering"
+                        : "YOU pressed menu - a real pause, so it gets the anchored quad");
+        }
+        if (!panelUp) g_playerOpenedPanel = false; // cleared only after logging
+    }
+    // ---- did the PLAYER open this panel, or did the scene? -----------------
+    //
+    // s64 stopped treating PausePC as a UI pause during a scene, correctly: the
+    // game pushes it for bathysphere rides and scripted scenes, and treating it
+    // as a pause flattened the whole ride to a quad and froze head steering.
+    // The cost was that a REAL pause taken during a scene also lost the quad,
+    // and the quad is the only thing that ever gets anchored - reported as "the
+    // pause menu is unanchored during scripted events".
+    //
+    // BRVR solves this with a true pause flag (Level.Pauser, its `paused` term
+    // in Hooks.cpp). THAT FIELD IS NOT ON LEVELINFO ON THIS BUILD, and this
+    // time that is a measured result rather than a copied offset: the hunt in
+    // screens.cpp swept Level+0x0..0x2000 across a real pause and every slot
+    // that moved was a TArray {Data,Num,Max} growing by one - menu allocation
+    // churn, not a flag. ENGINE_NOTES has the table.
+    //
+    // So use the one signal this mod owns outright: IT COMPOSES THE PAD. The
+    // game cannot open the pause menu without the player pressing menu, and the
+    // scene's own PausePC arrives with no press at all. Latch on the press,
+    // hold it until the panel closes.
+    //
+    // FAILS TOWARDS TODAY'S BEHAVIOUR. A pause opened some way the composed pad
+    // cannot see - a keyboard Escape - simply misses the window and behaves
+    // exactly as it does now, rather than flattening a ride.
+    {
+        constexpr uint16_t kPadStart = 0x0010; // XINPUT_GAMEPAD_START
+        constexpr uint64_t kPressWindowMs = 2000;
+        uint16_t btns = 0;
+        bvr::input::last_composed_buttons(&btns);
+        const uint64_t nowMs = GetTickCount64();
+        if (btns & kPadStart) g_lastMenuPressMs = nowMs;
+        static bool s_wasPanelUp = false;
+        if (panelUp && !s_wasPanelUp)
+            g_playerOpenedPanel = (nowMs - g_lastMenuPressMs) <= kPressWindowMs;
+        s_wasPanelUp = panelUp;
+        // NOT cleared here. The verdict has to survive until the block below
+        // has logged it, or the close edge reports the post-reset value and
+        // every close reads "no menu press" however it opened - which is
+        // exactly what the first cut did.
+    }
+    scripted::publish_panel_state(panelUp, panelUp && sceneOwnsPanel);
+    bvr::vr::publish_ui_pause(panelUp && (!sceneOwnsPanel || g_playerOpenedPanel));
+    // Suppress the aim laser and the aim dot while a scene owns the view. The
+    // game's own reticle is NOT this call - it goes out through the engine SET
+    // handler in assert_crosshair, which reads the same predicate so the three
+    // can never disagree.
+    bvr::vr::publish_aim_suppressed(aim_suppressed());
+
     {
         int32_t moved = body::on_calcview(self, viewActor ? *viewActor : nullptr,
                                           gameYawUnitsRaw, residualUnits, vrDrove);
@@ -1769,6 +2351,9 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         // These two are the same integer, which is what makes the invariant a
         // theorem instead of a tolerance.
         if (moved) g_recenterYawUnits = wrap_rot(g_recenterYawUnits + moved);
+        // The rotation freeze must not treat our own body transfer as the game
+        // turning the player - that is what inverted left/right head look.
+        scripted::note_body_yaw(moved);
 
         // Feedback session (2026-08-13): instant move direction. Publish the
         // NOT-YET-TRANSFERRED body error (residual minus what the transfer
@@ -1781,10 +2366,29 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         // Infinite's model, so the walk still tracks the head. Publishing an
         // explicit 0 when off/not-driving closes the gate now instead of
         // riding the core lane's 500 ms staleness window.
+        //
+        // s64: THE COMFORT YAW BELONGS IN THIS SUM TOO. The freeze and the
+        // scripted-scene turn move the CAMERA away from the pawn, so the
+        // camera-to-pawn angle is `residual - moved + yaw_adjust` and not
+        // `residual - moved`. Leaving the term out meant stick-forward tracked
+        // the pawn while the view tracked something else - reported as "the
+        // walking direction is now going to the wrong place", and it appeared
+        // the moment the freeze became a default. Exactly the same units the
+        // camera was adjusted by, so the two cannot drift apart.
         bvr::input::publish_move_yaw_offset(
             (vrDrove && body::move_dir_instant())
-                ? kMoveYawSign *
-                      static_cast<float>(wrap_rot(residualUnits - moved)) /
+                ? body::move_yaw_sign() *
+                      static_cast<float>(wrap_rot(residualUnits - moved +
+                                                  scripted::yaw_adjust_units())) /
+                      kRotUnitsPerDegree
+                : 0.0f);
+        // Hand the probe exactly what was published, rather than letting it
+        // rebuild the expression and quietly diverge from it.
+        body::note_published_move_yaw(
+            (vrDrove && body::move_dir_instant())
+                ? body::move_yaw_sign() *
+                      static_cast<float>(wrap_rot(residualUnits - moved +
+                                                  scripted::yaw_adjust_units())) /
                       kRotUnitsPerDegree
                 : 0.0f);
     }
@@ -1843,6 +2447,9 @@ bool install(void* eventPlayerCalcView) {
     // BS2's input auto-arm ("on") is deliberately NOT ported - that was a
     // BS2-local session-41 decision and would change BS1's boot behaviour.
     load_vr_preset_values();
+    // The migrations belong to the LOAD, not to the arming - a values-only
+    // boot with autoVr=0 would otherwise keep a pre-s64 cineDrive=1 forever.
+    apply_preset_migrations();
     aim::note_preset_baseline();
     aim::reapply_weapon_profile();
     // Feedback session 2 (user ask): start the game IN VR. Post the same
@@ -1850,6 +2457,7 @@ bool install(void* eventPlayerCalcView) {
     // arms the full stack on the first CalcView. `autoVr=0` (or the pinned
     // checkbox) opts out. Must run AFTER load_vr_preset_values so a saved
     // autoVr=0 is honoured.
+    menu::load_preferences(); // includes AutoStart, before the launch decision
     if (g_autoVr.load(std::memory_order_relaxed)) {
         g_vrPresetPending.store(true, std::memory_order_relaxed);
         BVR_LOG("[b1r] auto-VR: preset apply queued for the first frame (autoVr=0 or "
@@ -1906,6 +2514,35 @@ void get_recenter_state(bvr::vr::HeadPose* pose, int32_t* yawUnits, float* world
     if (worldScale) *worldScale = g_worldScale.load(std::memory_order_relaxed);
 }
 
+// See camera.h: cm in (BRVR's unit and key name), UU stored, converted once
+// against the world scale as it stands at ini-read time.
+float set_head_up_cm(float cm) {
+    const float ws = g_worldScale.load(std::memory_order_relaxed);
+    const float uu = cm * (ws > 1.0f ? ws : 100.0f) / 100.0f;
+    g_headOffUpUu.store(uu, std::memory_order_relaxed);
+    return uu;
+}
+
+float head_up_uu() {
+    return g_headOffUpUu.load(std::memory_order_relaxed);
+}
+
+float eye_half_separation_uu() {
+    return (g_ipdMm.load(std::memory_order_relaxed) / 2000.0f) * g_worldScale.load(std::memory_order_relaxed);
+}
+
+float foreground_lens_gain() {
+    if (!g_fgFovMatch.load(std::memory_order_relaxed)) return 1.0f;
+    if (!(g_fgFovWritten.load(std::memory_order_relaxed) > 0.0f)) return 1.0f;
+    const float k = g_fgFovK.load(std::memory_order_relaxed);
+    return k > 0.1f ? k : 1.0f;
+}
+
+void request_game_resolution(uint32_t w, uint32_t h) {
+    if (w < 1024 || h < 1024 || w > 8192 || h > 8192) return;
+    g_resWritePending.store((static_cast<uint64_t>(w) << 32) | h, std::memory_order_relaxed);
+}
+
 bool driven_eye_cam(int eye, float loc[3], int32_t rot[3]) {
     if (eye < 0 || eye > 1) return false;
     if (GetTickCount64() - g_eyeCamStampMs[eye] > 200) return false; // stale/idle
@@ -1938,6 +2575,54 @@ void set_fov_override(float hfovDeg) {
         g_fovOverride.store(false, std::memory_order_relaxed);
     }
 }
+
+// F10 preference access. Called through the game-thread menu queue; no engine writes.
+float menu_read(menu::Setting id) {
+    using S = menu::Setting;
+    switch(id) {
+        case S::RemoveBob: return static_cast<float>(g_killHeadBob.load(std::memory_order_relaxed));
+        case S::AutoStart: return static_cast<float>(g_autoVr.load(std::memory_order_relaxed));
+        case S::GameFov: return static_cast<float>(g_gameFovDeg.load(std::memory_order_relaxed));
+        case S::GameCrosshair: return static_cast<float>(g_crosshairVisible.load(std::memory_order_relaxed));
+        case S::HideUnarmedReticle: return static_cast<float>(g_hideAimUnarmed.load(std::memory_order_relaxed));
+        case S::LockOnDisabled: return static_cast<float>(g_lockOnDisabled.load(std::memory_order_relaxed));
+        case S::EyeSeparation: return static_cast<float>(g_ipdMm.load(std::memory_order_relaxed));
+        case S::WorldScale: return g_worldScale.load(std::memory_order_relaxed)/100.f;
+        case S::Height: return g_headOffUpUu.load(std::memory_order_relaxed)*100.f/g_worldScale.load(std::memory_order_relaxed);
+        case S::ViewForward: return g_headOffFwdUu.load(std::memory_order_relaxed)*100.f/g_worldScale.load(std::memory_order_relaxed);
+        case S::CustomFov: return g_gameFovWrite.load(std::memory_order_relaxed) && !g_forceHeadsetFov.load(std::memory_order_relaxed);
+        default: return std::numeric_limits<float>::quiet_NaN();
+    }
+}
+bool menu_write(menu::Setting id, float value) {
+    using S = menu::Setting;
+    switch(id) {
+        case S::RemoveBob: g_killHeadBob.store(static_cast<decltype(g_killHeadBob.load())>(value), std::memory_order_relaxed); return true;
+        case S::AutoStart: g_autoVr.store(static_cast<decltype(g_autoVr.load())>(value), std::memory_order_relaxed); return true;
+        case S::GameFov: g_gameFovDeg.store(static_cast<decltype(g_gameFovDeg.load())>(value), std::memory_order_relaxed); return true;
+        case S::GameCrosshair: g_crosshairVisible.store(static_cast<decltype(g_crosshairVisible.load())>(value), std::memory_order_relaxed); return true;
+        case S::HideUnarmedReticle: g_hideAimUnarmed.store(static_cast<decltype(g_hideAimUnarmed.load())>(value), std::memory_order_relaxed); return true;
+        case S::LockOnDisabled: g_lockOnDisabled.store(static_cast<decltype(g_lockOnDisabled.load())>(value), std::memory_order_relaxed); return true;
+        case S::EyeSeparation: g_ipdMm.store(static_cast<decltype(g_ipdMm.load())>(value), std::memory_order_relaxed); return true;
+        case S::WorldScale: {
+            const float ratio=value*100.f/g_worldScale.load(std::memory_order_relaxed);
+            g_headOffUpUu.store(g_headOffUpUu.load(std::memory_order_relaxed)*ratio,std::memory_order_relaxed);
+            g_headOffFwdUu.store(g_headOffFwdUu.load(std::memory_order_relaxed)*ratio,std::memory_order_relaxed);
+            g_worldScale.store(value*100.f,std::memory_order_relaxed); return true;
+        }
+        case S::Height: set_head_up_cm(value); return true;
+        case S::ViewForward: g_headOffFwdUu.store(value*g_worldScale.load(std::memory_order_relaxed)/100.f,std::memory_order_relaxed); return true;
+        case S::CustomFov:
+            g_forceHeadsetFov.store(false,std::memory_order_relaxed);
+            g_gameFovWrite.store(value!=0,std::memory_order_relaxed); return true;
+        default: return false;
+    }
+}
+void menu_recenter() {
+    g_recenterRequested.store(true,std::memory_order_relaxed);
+    bvr::vr::release_screen_anchor();
+}
+
 
 void draw_debug_ui() {
     if (!hook_live()) {
@@ -2001,6 +2686,13 @@ void draw_debug_ui() {
     bool autoVr = g_autoVr.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Auto-start VR at launch (no F10 needed)", &autoVr))
         g_autoVr.store(autoVr, std::memory_order_relaxed);
+    {
+        bool nobob = g_killHeadBob.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox("Remove head bob, landing dip and damage shake", &nobob)) {
+            g_killHeadBob.store(nobob, std::memory_order_relaxed);
+            BVR_LOG("[b1r] headbob: removal %s", nobob ? "ON" : "off");
+        }
+    }
     ImGui::Separator();
 
     if (ImGui::CollapsingHeader("VR camera (M3/M4)", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -2014,6 +2706,21 @@ void draw_debug_ui() {
         bool xhair = g_crosshairVisible.load(std::memory_order_relaxed);
         if (ImGui::Checkbox("Flat-screen crosshair (default off in VR)", &xhair))
             g_crosshairVisible.store(xhair, std::memory_order_relaxed);
+        bool hideUnarmed = g_hideAimUnarmed.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox("Hide every crosshair with empty hands", &hideUnarmed))
+            g_hideAimUnarmed.store(hideUnarmed, std::memory_order_relaxed);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Aim dot, aim laser and the game's own reticle, all three, whenever\n"
+                "NOTHING is equipped - no weapon and no plasmid. A plasmid counts as\n"
+                "armed; you aim those.\n\n"
+                "From the BRVR mod: a dot floating in front of you before the game has\n"
+                "given you anything to aim - the whole opening - reads as a bug, and it\n"
+                "follows you into every scene where the game takes your weapon away.\n\n"
+                "Separate from the scripted-scene switch under Scripted events: empty\n"
+                "hands does NOT cover cutscenes, which is why both exist.");
+        ImGui::TextDisabled("     crosshairs are %s RIGHT NOW",
+                            aim_suppressed() ? "SUPPRESSED" : "live");
         bool lockoff = g_lockOnDisabled.load(std::memory_order_relaxed);
         if (ImGui::Checkbox("Lock-on disabled (pad aim magnetism off)", &lockoff))
             g_lockOnDisabled.store(lockoff, std::memory_order_relaxed);
@@ -2116,11 +2823,14 @@ void draw_debug_ui() {
                 }
                 ImGui::Text("selected: %d x %d, %.1f MPx per eye", s_w, s_h,
                             static_cast<double>(s_w) * s_h / 1.0e6);
+                if (ImGui::Button("Apply now (live)")) resize::request((uint32_t)s_w, (uint32_t)s_h, "F10 render resolution");
+                ImGui::SameLine();
                 if (ImGui::Button("Write to Bioshock.ini")) {
                     g_resWritePending.store((static_cast<uint64_t>(s_w) << 32) |
                                                 static_cast<uint32_t>(s_h),
                                             std::memory_order_relaxed);
                 }
+                ImGui::Text("live resize: %s", resize::status());
                 ImGui::TextWrapped(
                     "Restart the game for it to take effect. The game rewrites "
                     "Bioshock.ini from its own settings at exit, which can undo "

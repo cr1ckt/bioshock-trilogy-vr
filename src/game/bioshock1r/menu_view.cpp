@@ -1,0 +1,394 @@
+#include "menu_view.h"
+#include "menu_theme.h"
+#include "display_modes.h"
+#include <imgui_internal.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace bvr::b1r::menu {
+namespace {
+const ViewOptions* g_options = nullptr;
+void record(const char* name, bool disabled = false) {
+    if(g_options && g_options->hits) {
+        const auto* ctx=ImGui::GetCurrentContext();
+        g_options->hits->push_back({name,ImGui::GetItemRectMin(),ImGui::GetItemRectMax(),
+            ctx->LastItemData.ID,disabled,ctx->CurrentWindow->Name});
+    }
+}
+void label(const char* text,bool slider=false,const char* key=nullptr) {
+    ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);
+    float controlOffset=0;
+    if(slider) {
+        const float railHeight=std::max(theme::unit(39),ImGui::GetFontSize()+theme::unit(8));
+        const float textHeight=ImGui::CalcTextSize(text,nullptr,false,ImGui::GetContentRegionAvail().x).y;
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY()+std::max(0.f,(railHeight-textHeight)*.5f));
+        controlOffset=std::max(0.f,(textHeight-railHeight)*.5f);
+    } else ImGui::AlignTextToFramePadding();
+    ImGui::TextWrapped("%s",text);
+    if(key) record((std::string("label:")+key).c_str());
+    ImGui::TableSetColumnIndex(1);
+    if(controlOffset) ImGui::SetCursorPosY(ImGui::GetCursorPosY()+controlOffset);
+    ImGui::SetNextItemWidth(-1);
+}
+bool section(const char* name) {
+    if(g_options->expandSections) ImGui::SetNextItemOpen(true,ImGuiCond_Once);
+    bool open=theme::section(name);
+    record((std::string("section:")+name).c_str());
+    return open;
+}
+void send(Backend& backend,const Spec& s,int hand,float value,bool commit) {
+    if(s.scope==Scope::Global) backend.edit(s.id,-1,value,commit);
+    else if(hand==-1 && s.scope==Scope::Hand) {
+        backend.edit(s.id,0,value,commit);backend.edit(s.id,1,value,commit);
+    } else backend.edit(s.id,hand,value,commit);
+}
+void control(Backend& backend,const Spec& s,int hand) {
+    const int upscaler = static_cast<int>(backend.read(Setting::Upscaler,-1));
+    if((s.id==Setting::DlssQuality || s.id==Setting::DlssModel) && upscaler!=1 && upscaler!=2) return;
+    if(s.condition==Condition::Snap && !backend.read(Setting::SnapTurn,0)) return;
+    if(s.condition==Condition::Smooth && backend.read(Setting::SnapTurn,0)) return;
+    const int readHand=s.scope==Scope::Global?-1:(hand<0?1:hand);
+    float value=backend.read(s.id,readHand);
+    const char* reason=disabled_reason(s,backend,hand);
+    ImGui::PushID(s.key);
+    label(s.label,s.kind==Kind::Slider,s.key);
+    ImGui::BeginDisabled(reason!=nullptr);
+    bool changed=false,commit=false;
+    if(s.id==Setting::Upscaler) {
+        bool on=upscaler==1 || upscaler==2;
+        changed=ImGui::Checkbox("##value",&on);value=on?1.f:0.f;commit=changed;
+        record(s.key,reason!=nullptr);
+    } else if(s.id==Setting::DlssQuality) {
+        const int current=display::mode_index(upscaler,static_cast<int>(value));
+        if(ImGui::BeginCombo("##value",display::kModeNames[current])) {
+            for(int i=0;i<6;++i) {
+                if(ImGui::Selectable(display::kModeNames[i],i==current)) {
+                    if(i) send(backend,s,hand,static_cast<float>(display::kQualityOrder[i]),true);
+                    send(backend,spec(Setting::Upscaler),hand,i?2.f:1.f,true);
+                }
+                record((std::string("DlssMode:")+std::to_string(i)).c_str());
+                if(ImGui::IsItemHovered()) ImGui::SetTooltip("%s",display::kModeTips[i]);
+            }
+            ImGui::EndCombo();
+        }
+        record(s.key,reason!=nullptr);
+    } else if(s.kind==Kind::Toggle) {
+        bool on=value!=0;
+        changed=ImGui::Checkbox("##value",&on);value=on?1.f:0.f;commit=changed;
+        record(s.key,reason!=nullptr);
+    } else if(s.kind==Kind::Slider) {
+        changed=theme::slider("##value",&value,s.min,s.max,s.format);
+        commit=ImGui::IsItemDeactivatedAfterEdit();
+        record(s.key,reason!=nullptr);
+        // Float-backed integer preferences retain integer semantics.
+        if(s.id==Setting::LaserDots || s.id==Setting::SwingCooldown || s.id==Setting::SwingDelay ||
+            s.id==Setting::ElbowSmoothing || s.id==Setting::SceneHold || s.id==Setting::EffectVertexLimit)
+            value=std::round(value);
+    } else {
+        int current=static_cast<int>(value-s.min);
+        int count=static_cast<int>(s.max-s.min)+1;
+        std::vector<const char*> names;
+        for(const char* p=s.choices;*p;p+=std::strlen(p)+1) names.push_back(p);
+        count=std::min(count,static_cast<int>(names.size()));
+        if(count==2) {
+            const float width=(ImGui::GetContentRegionAvail().x-ImGui::GetStyle().ItemSpacing.x)*.5f;
+            for(int i=0;i<count;++i) {
+                if(i) ImGui::SameLine();
+                // Turn style keeps the approved draft's Snap-then-Smooth order.
+                int choice=s.id==Setting::SnapTurn?1-i:i;
+                if(theme::button(names[choice],ImVec2(width,0),current==choice)) {
+                    current=choice;changed=true;
+                }
+                record((std::string(s.key)+":"+std::to_string(choice)).c_str(),reason!=nullptr);
+            }
+        } else {
+            changed=ImGui::Combo("##value",&current,names.data(),count);
+            record(s.key,reason!=nullptr);
+        }
+        if(changed) {value=static_cast<float>(current)+s.min;commit=true;}
+    }
+    ImGui::EndDisabled();
+    if((changed||commit) && !reason) send(backend,s,hand,value,commit);
+    if(reason) theme::note(reason);
+    else if(s.id==Setting::LockOnDisabled) theme::note(s.help);
+    else if(s.help && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s",s.help);
+    ImGui::PopID();
+}
+void hand_selector(ViewState& state,const Context& context) {
+    ImGui::TextUnformatted("Edit hand");ImGui::SameLine();
+    const float w=theme::unit(113);
+    if(theme::button("Left",ImVec2(w,0),state.hand==0)) state.hand=0;
+    record("hand:Left");ImGui::SameLine();
+    if(theme::button("Right",ImVec2(w,0),state.hand==1)) state.hand=1;
+    record("hand:Right");ImGui::SameLine();
+    if(theme::button("Both",ImVec2(w,0),state.hand==-1)) state.hand=-1;
+    record("hand:Both");
+    if(state.tab!=Tab::IK) {
+        const std::string profile=context.profile.empty()?"No equipped profile":
+            std::string(context.profileHand==0?"Plasmid profile: ":"Weapon profile: ")+context.profile;
+        theme::note(profile.c_str());
+    }
+}
+void rendering_method(Backend& backend,Level level) {
+    const int selected=static_cast<int>(backend.read(Setting::StereoMethod,-1));
+    const char* names[]={"Stereo","Alternate eyes (AER)","Alternate frame warping (AFW) (experimental)"};
+    const char* tips[]={"Both eyes are drawn every game frame.",
+        "One eye per game frame; a pair makes one headset frame.",
+        "One eye per game frame; the other is rebuilt. Each frame goes to the headset."};
+    for(int i=0;i<3;++i) {
+        if(i==1 && level!=Level::Debug) continue;
+        if(ImGui::RadioButton(names[i],selected==i)) backend.edit(Setting::StereoMethod,-1,static_cast<float>(i),true);
+        record((std::string("StereoMethod:")+std::to_string(i)).c_str());
+        if(ImGui::IsItemHovered()) ImGui::SetTooltip("%s",tips[i]);
+    }
+}
+void resolution_controls(Backend& backend,ViewState& state) {
+    const auto r=backend.resolution();
+    if(state.pixelPercent<=0 && r.referenceW && r.referenceH)
+        state.pixelPercent=r.outputW && r.outputH ? 100.f*(static_cast<float>(r.outputW)/r.referenceW)*
+            (static_cast<float>(r.outputH)/r.referenceH):100.f;
+    ImGui::TextUnformatted("Total pixels (%)");ImGui::SetNextItemWidth(-1);
+    theme::slider("##RenderPixels",&state.pixelPercent,25.f,400.f,"%.0f%%");record("RenderPixels");
+    if(ImGui::IsItemHovered()) ImGui::SetTooltip("100%% is 2750 x 2850. Both axes scale together. Press Set resolution to apply.");
+    uint32_t w=0,h=0;display::pixel_size(r.referenceW,r.referenceH,state.pixelPercent,&w,&h);
+    ImGui::Text("Preview: %ux%u | now %ux%u",w,h,r.outputW,r.outputH);
+    const bool disabled=r.busy || w<640 || h<480 || w>8192 || h>8192;
+    ImGui::BeginDisabled(disabled);
+    if(theme::button("Set resolution")) {
+        backend.edit(Setting::OutputWidth,-1,static_cast<float>(w),true);
+        backend.edit(Setting::OutputHeight,-1,static_cast<float>(h),true);
+    }
+    record("SetResolution",disabled);ImGui::EndDisabled();
+    theme::note(r.status.c_str());
+}
+void draw_page(Backend& backend,ViewState& state,Level level,const Context& context) {
+    if(state.tab==Tab::Hands || (state.tab==Tab::IK && context.handMode<4) || state.tab==Tab::Aim) hand_selector(state,context);
+    std::size_t count=0;const Spec* all=specs(count);
+    std::vector<std::string> sections;
+    if(state.tab==Tab::Display) sections={"Rendering method: Stereo or AFW","Resolution (render size)","Upscaling and anti-aliasing (DLSS)"};
+    for(std::size_t i=0;i<count;++i) if(all[i].tab==state.tab && *all[i].section && visible(all[i],level,context)) {
+        if(std::find(sections.begin(),sections.end(),all[i].section)==sections.end()) sections.emplace_back(all[i].section);
+    }
+    if(state.tab==Tab::IK) {
+        const auto shoulder=std::find(sections.begin(),sections.end(),"Shoulder position");
+        if(shoulder!=sections.end()) std::rotate(sections.begin(),shoulder,shoulder+1);
+    }
+    // s86f: Dishonored's hand rows (its MpTrimPanel): move or turn the selected hand the way
+    // the player sees it, a fixed step per press, held to repeat; the backend converts each
+    // press into the hand's stored trim at that instant.
+    auto hand_rows=[&]{
+        if(!(state.tab==Tab::Hands && context.handMode>=4 && section("Move the hand (as you see it)"))) return;
+        static int stepIx=1;
+        static const float kStepCm[3]={.2f,.5f,2.f},kStepDeg[3]={.5f,2.f,5.f};
+        static const char* kStepName[3]={"Fine","Normal","Coarse"};
+        const float w=(ImGui::GetContentRegionAvail().x-2*ImGui::GetStyle().ItemSpacing.x)/3;
+        for(int i=0;i<3;++i) {
+            if(i) ImGui::SameLine();
+            if(theme::button(kStepName[i],ImVec2(w,0),stepIx==i)) stepIx=i;
+        }
+        theme::note(stepIx==0?"0.2 cm or 0.5 degrees per press.":stepIx==1?"0.5 cm or 2 degrees per press.":"2 cm or 5 degrees per press.");
+        struct Row { const char* neg; const char* pos; bool rot; int axis; };
+        static const Row kRows[6]={{"Move left","Move right",false,0},{"Move down","Move up",false,2},{"Move back","Move forward",false,1},
+                                   {"Pitch down","Pitch up",true,1},{"Yaw left","Yaw right",true,0},{"Roll left","Roll right",true,2}};
+        ImGui::PushItemFlag(ImGuiItemFlags_ButtonRepeat,true);
+        for(int r=0;r<6;++r) {
+            ImGui::PushID(r);
+            for(int sgn=0;sgn<2;++sgn) {
+                if(sgn) ImGui::SameLine();
+                const float bw=(ImGui::GetContentRegionAvail().x-(sgn?0:ImGui::GetStyle().ItemSpacing.x))/(sgn?1:2);
+                if(theme::button(sgn?kRows[r].pos:kRows[r].neg,ImVec2(bw,0))) {
+                    const float amt=(sgn?1.f:-1.f)*(kRows[r].rot?kStepDeg[stepIx]:kStepCm[stepIx]);
+                    if(state.hand==-1) {backend.hand_step(0,kRows[r].rot,kRows[r].axis,amt);backend.hand_step(1,kRows[r].rot,kRows[r].axis,amt);}
+                    else backend.hand_step(state.hand,kRows[r].rot,kRows[r].axis,amt);
+                }
+                record((std::string("step:")+(sgn?kRows[r].pos:kRows[r].neg)).c_str());
+            }
+            ImGui::PopID();
+        }
+        ImGui::PopItemFlag();
+        theme::note("Hold a button to repeat. Saved at once. Anything held moves with the hand.");
+    };
+    for(const auto& name:sections) {
+        if(!section(name.c_str())) continue;
+        ImGui::PushID(name.c_str());
+        if(name=="Rendering method: Stereo or AFW") rendering_method(backend,level);
+        if(name=="Resolution (render size)") resolution_controls(backend,state);
+        if(ImGui::BeginTable("settings",2,ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("label",0,.44f);ImGui::TableSetupColumn("value",0,.56f);
+            for(std::size_t i=0;i<count;++i)
+                if(all[i].id!=Setting::StereoMethod && all[i].tab==state.tab && name==all[i].section && visible(all[i],level,context))
+                    control(backend,all[i],state.hand);
+            ImGui::EndTable();
+        }
+        if(name=="Upscaling and anti-aliasing (DLSS)") backend.temporal_status();
+        if(name=="Turning") theme::note(backend.read(Setting::SnapTurn,0)?
+            "One stick push turns you by a fixed angle.":"Hold the stick to turn continuously.");
+        if(name=="Controller shortcuts") {
+            const int modifier=static_cast<int>(backend.read(Setting::AmmoModifier,0));
+            const bool left=backend.read(Setting::AmmoStick,0)!=0;
+            if((modifier==1&&!left)||(modifier==4&&left))
+                theme::note("Choose the opposite stick: one thumb cannot use its thumbrest and stick together.");
+        }
+        if(name=="Grip pivot") theme::note("Changes where the model pivots. Hand position changes where it sits.");
+        if(name=="Hand and weapon size") hand_rows();
+        if(name=="Flat screen for menus and loading") {
+            if(theme::button("Recenter screen")) backend.action(Action::RecenterScreen);
+            record("RecenterScreen");
+        }
+        ImGui::PopID();
+    }
+    if(state.tab==Tab::Runtime || state.tab==Tab::Diagnostics)
+        backend.diagnostics(state.tab);
+    if(level==Level::Debug && state.tab==Tab::Diagnostics) {
+        theme::note("Debug changes last for this session unless explicitly saved.");
+        if(theme::button("Save debug defaults")) ImGui::OpenPopup("Save debug defaults?");
+        record("SaveDebugDefaults");
+        if(ImGui::BeginPopupModal("Save debug defaults?",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Save the current applicable Debug switches for future launches?");
+            if(theme::button("Save")) {backend.action(Action::SaveDebugDefaults);ImGui::CloseCurrentPopup();}
+            ImGui::SameLine();if(theme::button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+}
+}
+void draw(Backend& backend,ViewState& state,const ViewOptions& options) {
+    g_options=&options;
+    if(options.hits) options.hits->clear();
+    const auto context=backend.context();
+    const auto level=static_cast<Level>(std::clamp(static_cast<int>(backend.read(Setting::ViewLevel,-1)),0,2));
+    const float text=std::clamp(backend.read(Setting::TextSize,-1),.8f,1.5f);
+    if(level!=Level::Debug && state.tab>=Tab::Runtime) state.tab=Tab::Controls;
+    const bool capture=options.captureSize.x>0;
+    const auto display=ImGui::GetIO().DisplaySize;
+    // Match Dishonored's accepted eye-space placement (649x685 at 1027,1021
+    // in a 2750x2850 eye). Resolution is a multiplier, never an absolute font
+    // size or clamped DPI value. The player's text-size choice is independent.
+    const float scale=capture?options.captureScale:(display.x/2750.f)*(649.f/760.f);
+    theme::begin(scale,text);
+    ImVec2 size=capture?options.captureSize:ImVec2(display.x*(649.f/2750.f),display.y*(685.f/2850.f));
+    ImVec2 position=capture?ImVec2(0,0):ImVec2(display.x*(1027.f/2750.f),display.y*(1021.f/2850.f));
+    const bool first=state.lastDisplay.x<=0;
+    const bool resized=!capture && !first &&
+        (display.x!=state.lastDisplay.x || display.y!=state.lastDisplay.y);
+    if(resized) {
+        const float x=display.x/state.lastDisplay.x,y=display.y/state.lastDisplay.y;
+        position=ImVec2(state.lastPosition.x*x,state.lastPosition.y*y);
+        size=ImVec2(state.lastSize.x*x,state.lastSize.y*y);
+    }
+    const auto condition=capture||first||resized?ImGuiCond_Always:ImGuiCond_FirstUseEver;
+    ImGui::SetNextWindowSize(size,condition);
+    ImGui::SetNextWindowPos(position,condition);
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(std::min(theme::unit(570),display.x*.95f),std::min(theme::unit(640),display.y*.95f)),
+        capture?display:ImVec2(display.x*.95f,display.y*.95f));
+    const ImGuiWindowFlags flags=ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoCollapse|
+        ImGuiWindowFlags_NoScrollbar|ImGuiWindowFlags_NoScrollWithMouse|
+        (capture?(ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove):0);
+    if(ImGui::Begin("BioShock VR settings###B1RSettings",nullptr,flags)) {
+        if(!capture) {
+            state.lastDisplay=display;state.lastPosition=ImGui::GetWindowPos();state.lastSize=ImGui::GetWindowSize();
+            state.fontPixels=ImGui::GetFontSize();
+        }
+        theme::background();
+        theme::title();theme::subtitle();
+        ImGui::Dummy(ImVec2(0,theme::unit(3)));
+        theme::rule();
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(theme::unit(10),theme::unit(4)));
+        if(ImGui::BeginTable("top",3,ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("recenter",0,.30f);ImGui::TableSetupColumn("height",0,.40f);
+            ImGui::TableSetupColumn("level",0,.30f);
+            ImGui::TableNextRow();ImGui::TableSetColumnIndex(0);
+            if(theme::button("Recenter",ImVec2(-1,0))) backend.action(Action::Recenter);
+            record("Recenter");ImGui::TableSetColumnIndex(1);
+            float height=backend.read(Setting::Height,-1);
+            char heightCaption[64];std::snprintf(heightCaption,sizeof heightCaption,"Height %+.0f cm###height",height);
+            if(theme::button(heightCaption,ImVec2(-1,0))) ImGui::OpenPopup("Height offset");
+            record("HeightPopup");
+            if(ImGui::BeginPopup("Height offset")) {
+                ImGui::TextUnformatted("Height offset");ImGui::SetNextItemWidth(theme::unit(340));
+                ImGui::BeginDisabled(!context.engineReady);
+                bool changed=theme::slider("##height",&height,-150,150,"%+.0f cm");
+                bool commit=ImGui::IsItemDeactivatedAfterEdit();record("Height");
+                ImGui::EndDisabled();
+                if(changed||commit) backend.edit(Setting::Height,-1,height,commit);
+                theme::note("Adjust your viewpoint height without changing world scale.");
+                ImGui::EndPopup();
+            }
+            ImGui::TableSetColumnIndex(2);
+            const char* currentLevel=level==Level::Basic?"Basic":level==Level::Advanced?"Advanced":"Debug";
+            char levelCaption[48];std::snprintf(levelCaption,sizeof levelCaption,"%s###level",currentLevel);
+            if(theme::button(levelCaption,ImVec2(-1,0))) ImGui::OpenPopup("Options level");
+            record("Options");
+            if(ImGui::BeginPopup("Options level")) {
+                for(int i=0;i<3;++i) {
+                    const char* name=i==0?"Basic":i==1?"Advanced":"Debug";
+                    if(ImGui::Selectable(name,static_cast<int>(level)==i))
+                        backend.edit(Setting::ViewLevel,-1,static_cast<float>(i),true);
+                    record((std::string("level:")+name).c_str());
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::EndTable();
+        }
+        const int tabCount=level==Level::Debug?9:7;
+        // A native single-line tab strip. Narrow windows scroll horizontally;
+        // navigation never turns into a second row of action buttons.
+        const bool selectRequested=!state.tabsInitialized || state.tab!=state.renderedTab;
+        Tab selected=state.tab;
+        ImGui::PushStyleVar(ImGuiStyleVar_TabBorderSize,std::max(1.f,theme::unit(1)));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing,ImVec2(theme::unit(2),theme::unit(6)));
+        ImGui::PushStyleColor(ImGuiCol_Border,ImVec4(191.f/255,157.f/255,94.f/255,1));
+        if(ImGui::BeginTabBar("pages",ImGuiTabBarFlags_FittingPolicyScroll|ImGuiTabBarFlags_TabListPopupButton|ImGuiTabBarFlags_DrawSelectedOverline)) {
+            for(int i=0;i<tabCount;++i) {
+                const auto tab=static_cast<Tab>(i);
+                const bool active=ImGui::BeginTabItem(tab_name(tab),nullptr,
+                    selectRequested && state.tab==tab?ImGuiTabItemFlags_SetSelected:ImGuiTabItemFlags_None);
+                record((std::string("tab:")+tab_name(tab)).c_str());
+                if(active) {selected=tab;ImGui::EndTabItem();}
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::PopStyleColor();ImGui::PopStyleVar(2);
+        if(!selectRequested) state.tab=selected;
+        state.renderedTab=selected;state.tabsInitialized=true;
+        ImGui::PopStyleVar();
+        // Geometry and font height scale separately. Reserving the entire
+        // footer times text size wasted body space at larger text settings.
+        const float footerHeight=theme::unit(92+20*text);
+        const float bodyHeight=std::max(theme::unit(50),ImGui::GetContentRegionAvail().y-footerHeight);
+        ImGui::PushID(tab_name(state.tab));
+        if(ImGui::BeginChild("body",ImVec2(0,bodyHeight),ImGuiChildFlags_None,ImGuiWindowFlags_AlwaysVerticalScrollbar))
+            draw_page(backend,state,level,context);
+        ImGui::EndChild();ImGui::PopID();
+        const float bodyEnd=ImGui::GetItemRectMax().y;
+        theme::rule();
+        float percent=text*100.f;
+        if(ImGui::BeginTable("footer",2,ImGuiTableFlags_SizingStretchProp,
+            ImVec2(ImGui::GetContentRegionAvail().x-ImGui::GetStyle().ScrollbarSize,0))) {
+            ImGui::TableSetupColumn("label",0,.44f);ImGui::TableSetupColumn("value",0,.56f);
+            label("Text size",true,"TextSize");
+            bool changed=theme::slider("##text",&percent,80,150,"%.0f%%");
+            bool commit=ImGui::IsItemDeactivatedAfterEdit();record("TextSize");
+            if(changed||commit) backend.edit(Setting::TextSize,-1,percent/100.f,commit);
+            ImGui::EndTable();
+        }
+        std::string status=context.notice;
+        if(!context.cameraHook) status="Camera hook unavailable - game settings cannot be applied yet.";
+        else if(!context.tracking && status.empty()) status="Headset tracking unavailable.";
+        if(status.empty()) status="Player settings save automatically. F10 closes.";
+        theme::note(status.c_str());
+        if(!theme::assets_loaded()) theme::note("Some menu artwork could not be loaded.");
+        if(options.layoutValid) {
+            const float bottom=ImGui::GetWindowPos().y+ImGui::GetWindowSize().y-ImGui::GetStyle().WindowPadding.y;
+            *options.layoutValid &= ImGui::GetItemRectMax().y<=bottom+1 && bodyEnd<bottom;
+        }
+    }
+    ImGui::End();theme::end();g_options=nullptr;
+}
+} // namespace bvr::b1r::menu

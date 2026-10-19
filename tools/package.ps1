@@ -6,7 +6,10 @@
 # NOTE: keep this file pure ASCII (PowerShell 5.1 misreads BOM-less UTF-8).
 param(
     [string]$OutDir = "$PSScriptRoot\..\dist",
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # v0.9.0: fail instead of quietly packaging without the x64 DLSS helper
+    # (tools\fetch-ngx.ps1 + tools\build-dlss-host.ps1 build it). CI sets this.
+    [switch]$RequireDlss
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -69,6 +72,26 @@ foreach ($n in @("vrpreset.ini", "weapons.ini", "HOW-TO-USE.txt")) {
 # design like BS2, defaults are baked into the DLL.
 foreach ($n in @("vrpreset.ini", "HOW-TO-USE.txt")) {
     Copy-Item "$repo\release\preset-bsi\$n" "$stage\preset-bsi\$n"
+}
+
+# v0.9.0: the launcher (installs, updates and configures the BS1 mod - it embeds the
+# DLLs and presets above) and the x64 DLSS helper folder install.ps1 copies to
+# <game>\bvr_dlss\. Both postdate this script and were missing from the zip.
+$launcher = "$bin\BioShockVR-Launcher-v$version.exe"
+if (-not (Test-Path $launcher)) { throw "missing build output: $launcher" }
+Copy-Item $launcher $stage
+$dlss = "$repo\build\dlss_host"
+$dlssFiles = @("bvr_dlss_host64.exe", "nvngx_dlss.dll", "NVIDIA-DLSS-LICENSE.txt", "NOTICE.md")
+if (Test-Path "$dlss\bvr_dlss_host64.exe") {
+    New-Item -ItemType Directory -Path "$stage\bvr_dlss" -Force | Out-Null
+    foreach ($n in $dlssFiles) {
+        if (-not (Test-Path "$dlss\$n")) { throw "missing DLSS helper file: $dlss\$n" }
+        Copy-Item "$dlss\$n" "$stage\bvr_dlss\$n"
+    }
+} elseif ($RequireDlss) {
+    throw "DLSS helper not built: run tools\fetch-ngx.ps1 then tools\build-dlss-host.ps1"
+} else {
+    "note: no DLSS helper in build\dlss_host - packaging without bvr_dlss\"
 }
 
 $zip = "$OutDir\bioshock-vr-v$version.zip"

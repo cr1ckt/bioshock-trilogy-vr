@@ -20,6 +20,7 @@ namespace {
 std::atomic<bool> g_enabled{true};
 std::atomic<bool> g_force{false};
 std::atomic<bool> g_gate{false};
+std::atomic<bool> g_gateLog{false}; // [hudgate] issue #31 witness, opt-in
 // Session 42 (BS2): the game composites gameswf directly on the BACKBUFFER
 // (bind = RENDER_TARGET only) and its tonemap is an INDEXED quad - both fail
 // BS1's fingerprints. Per-game opt-in; default off keeps BS1 bit-identical.
@@ -65,6 +66,11 @@ DXGI_FORMAT g_curFmt = DXGI_FORMAT_UNKNOWN;
 // Scene-RT vote: the resource hosting the most DSV-bound DrawIndexed calls.
 struct Vote { ID3D11Resource* res; unsigned n; };
 Vote g_votes[4] = {};
+// s65: the render target we were CONFIDENT about, latched by identity. See the
+// banner on scene_leader() - default off in core, BioShock 1 opts in.
+ID3D11Resource* g_worldRtLatched = nullptr;
+std::atomic<bool> g_sceneLeaderLatch{false};
+std::atomic<uint32_t> g_leaderRescues{0};
 ID3D11Resource* g_hudTarget = nullptr; // set when the tonemap is identified
 bool g_hudThisInterval = false;
 bool g_hadHudLastInterval = false;
@@ -854,14 +860,48 @@ void fov_watch_on_present(ID3D11DeviceContext* ctx) {
     }
 }
 
+// A COUNT CANNOT TELL A THIN WORLD FROM A MENU. IDENTITY CAN.
+//
+// The >= 32 rule asks "did some render target take enough DSV-bound draws to be
+// a scene", and it is right about menus - a hack screen, a loading screen or an
+// FMV draws no world at all. It is WRONG about a wall. Walk into one and the
+// view is a single near surface: the world is still rendered, it is just cheap,
+// and the count falls under the bar. screen_only() then trips and wantCine drops
+// the projection to the M2 quad, so the player gets the pause menu's anchored
+// square mid-gameplay with the hand frozen, toggling as they face the wall.
+//
+// MEASURED 2026-08-23, 19 transitions in one run, "swf draws 145" IDENTICAL on
+// both sides of every one - so the >= 20 swf floor contributes nothing here and
+// the verdict is scene_leader() == nullptr alone.
+//
+// No threshold fixes this: "how much geometry is on screen" is a property of the
+// LEVEL, not the mode, so every number has a wall behind it somewhere. The latch
+// does not lower the bar - it remembers WHICH target was the world while we were
+// confident and keeps calling that target the world while it still draws at all.
+// A menu is still caught, because on a menu that target draws NOTHING.
+//
+// Default off so BS2 and Infinite keep the pre-s65 rule exactly.
 ID3D11Resource* scene_leader() {
     Vote* best = nullptr;
     for (Vote& v : g_votes)
         if (v.res && (!best || v.n > best->n)) best = &v;
     // A handful of DSV-bound draws is not a scene (the fg rig pass has ~14);
     // the world pass has hundreds. 32 is comfortably between.
-    return (best && best->n >= 32) ? best->res : nullptr;
+    if (best && best->n >= 32) {
+        g_worldRtLatched = best->res; // confident: this IS the world target
+        return best->res;
+    }
+    if (g_sceneLeaderLatch.load(std::memory_order_relaxed) && g_worldRtLatched) {
+        for (Vote& v : g_votes) {
+            if (v.res != g_worldRtLatched || v.n == 0) continue;
+            // Same target, still drawing - a thin world, not a menu.
+            g_leaderRescues.fetch_add(1, std::memory_order_relaxed);
+            return v.res;
+        }
+    }
+    return nullptr;
 }
+
 
 bool ensure_rt(ID3D11DeviceContext* ctx, UINT w, UINT h, DXGI_FORMAT fmt) {
     if (g_tex && g_texW == w && g_texH == h) return true;
@@ -1394,6 +1434,41 @@ void on_present(ID3D11DeviceContext* ctx, IDXGISwapChain* swapchain) {
     (void)swapchain; // letterbox sampling moved to letterbox_sample (detour HEAD)
     fov_watch_on_present(ctx); // session 22: map last interval's cb0 copy
 
+    // [hudgate] (issue #31, opt-in): the two one-eye HUD-burn signatures, read
+    // at interval end BEFORE the counters roll. Runs after vr::on_present_end
+    // popped this present's eye tag, so the interval is eye-attributable.
+    //   burn:       gameswf draws hit the unarmed route while a world pass ran
+    //               (the gate was still down - the menu-exit H1 window).
+    //   leaderMiss: >=20 swf draws but NO scene leader this interval, outside
+    //               a declared screen-only span - the whole HUD rendered into
+    //               this eye's world image (the muzzle-flash H4 window); the
+    //               3-interval hysteresis swallows exactly these blips.
+    // The unarmed-route delta is tracked on EVERY present (one relaxed load),
+    // so arming the witness later never sees the pre-arm cumulative count as
+    // a burn - the first live run, and the first re-arm, were both fooled by
+    // an inside-the-gate delta.
+    static unsigned s_prevUnarmed = 0; // present thread only
+    const unsigned unarmed = g_cPass[kRouteUnarmed].load(std::memory_order_relaxed);
+    const unsigned unarmedDelta = unarmed - s_prevUnarmed;
+    s_prevUnarmed = unarmed;
+    if (g_gateLog.load(std::memory_order_relaxed)) {
+        const bool world = scene_leader() != nullptr;
+        const int eye = bvr::vr::sr_last_pop_sign();
+        const char* eyeName = eye < 0 ? "LEFT" : (eye > 0 ? "RIGHT" : "untagged");
+        // Only eye-TAGGED presents can burn: with stereo off the gate is down
+        // by design on every present, and that is not the menu-exit window.
+        if (unarmedDelta > 0 && world && eye != 0)
+            BVR_LOG("[hudgate] burn eye=%s unarmedSwfDraws=%u swf=%d (gate was "
+                    "DOWN while a world pass ran - HUD burned into this eye)",
+                    eyeName, unarmedDelta, g_swfDrawsThisInterval);
+        if (!world && g_swfDrawsThisInterval >= 20 && eye != 0 &&
+            !g_screenOnlyOn.load(std::memory_order_relaxed))
+            BVR_LOG("[hudgate] leaderMiss eye=%s swf=%d (no scene leader this "
+                    "interval outside a screen-only span - HUD went into this "
+                    "eye's image)",
+                    eyeName, g_swfDrawsThisInterval);
+    }
+
     // Session 22 kind (a): screen-only interval verdict (hysteresis over
     // present intervals, transitions logged - the flat instrument). Computed
     // BEFORE the vote reset below. The 20-draw floor keeps single stray swf
@@ -1488,8 +1563,27 @@ void set_enabled(bool on) {
 bool enabled() { return g_enabled.load(std::memory_order_relaxed); }
 
 void set_gate(bool stereoActive) {
+    // [hudgate] (issue #31, opt-in): the gate is set at present TAIL but
+    // consumed by the NEXT draw, so a rising edge always lands one pass late -
+    // and the first tagged pass after a menu is the LEFT one. Transition lines
+    // make that window visible in a tester log.
+    if (g_gateLog.load(std::memory_order_relaxed)) {
+        bool was = g_gate.load(std::memory_order_relaxed);
+        if (was != stereoActive)
+            BVR_LOG("[hudgate] gate %s (consumed by the NEXT draw pass; eye "
+                    "this present popped: %d)",
+                    stereoActive ? "RAISED" : "dropped", bvr::vr::sr_last_pop_sign());
+    }
     g_gate.store(stereoActive, std::memory_order_relaxed);
 }
+
+void set_gate_log(bool on) {
+    g_gateLog.store(on, std::memory_order_relaxed);
+    BVR_LOG("[hudgate] witness %s", on ? "ARMED (gate transitions + one-eye "
+                                         "HUD-burn intervals will log)"
+                                       : "off");
+}
+bool gate_log() { return g_gateLog.load(std::memory_order_relaxed); }
 
 void set_force(bool on) {
     g_force.store(on, std::memory_order_relaxed);
@@ -1658,6 +1752,21 @@ bool fov_mismatch() {
     return g_fovMismatchOn.load(std::memory_order_relaxed);
 }
 
+void set_scene_leader_latch(bool on) {
+    if (g_sceneLeaderLatch.exchange(on, std::memory_order_relaxed) == on) return;
+    if (!on) g_worldRtLatched = nullptr;
+    BVR_LOG("[hud] scene-leader identity latch %s - a target that was the world "
+            "stays the world while it still draws (stops a near wall reading as a "
+            "menu); rescues so far %u",
+            on ? "ON" : "off", g_leaderRescues.load(std::memory_order_relaxed));
+}
+
+bool scene_leader_latch() { return g_sceneLeaderLatch.load(std::memory_order_relaxed); }
+
+unsigned scene_leader_rescues() {
+    return g_leaderRescues.load(std::memory_order_relaxed);
+}
+
 bool screen_only() {
     return g_screenOnlyOn.load(std::memory_order_relaxed);
 }
@@ -1803,6 +1912,9 @@ void fix_blend_alpha(ID3D11DeviceContext* ctx) {
 }
 
 void release_resources() {
+    // The latch is a bare pointer used ONLY for comparison, never dereferenced -
+    // but a freed address can be reused by another target, so drop it here.
+    g_worldRtLatched = nullptr;
     if (g_srv) { g_srv->Release(); g_srv = nullptr; }
     if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
     if (g_tex) { g_tex->Release(); g_tex = nullptr; }

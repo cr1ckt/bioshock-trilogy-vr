@@ -330,6 +330,60 @@ void set_pose_audit(bool on);
 void publish_gameplay_view(bool strictGameplay);
 void handle_cine_command(const char* args);
 
+// A full-screen pause interface is up. Published by the adapter from the game's
+// own pause field, because the pause menu draws OVER a live world and so is
+// invisible to every render-side signal the verdict already has: CalcView keeps
+// firing, the view actor is still the pawn, the fov matches, and the frame is
+// not pure gameswf. Games that never call this behave exactly as before.
+void publish_ui_pause(bool paused);
+
+// Aiming furniture should be hidden right now. Published by the adapter, for the
+// same reason publish_ui_pause is: the reasons are all game-side facts no
+// render-side signal can see. Consumed ONLY to suppress the aim laser and the
+// aim dot. It changes no setting and nothing else reads it, so a game that never
+// calls this behaves exactly as before.
+//
+// The adapter owns the POLICY - core deliberately does not know why. BS1
+// publishes it for two reasons: a scripted scene owns the view, or nothing is
+// equipped at all (no weapon and no plasmid, so there is nothing to aim).
+//
+// The game's OWN reticle is not here: it goes through that game's engine SET
+// handler, so each adapter hides its own (BS1: camera.cpp assert_crosshair).
+void publish_aim_suppressed(bool active);
+
+// --- Screen placement: where the cinema quad hangs ---------------------------
+// Applies to every frame that goes to the quad instead of the projection layer:
+// menus, the map, the manual, machine flows, the hack board, loading screens
+// and cutscenes. `vrscreen anchor mode anchor|head|origin`.
+//
+//   anchor (default) - world-locked, placed ONCE from the head pose at the
+//                      moment the screen opens, yaw flattened so it is never
+//                      tilted. It stays put while you look around, which is
+//                      what makes it readable, and re-places on the next
+//                      screen. Ported from the BRVR mod.
+//   head             - rides the view space. Follows your gaze; swims.
+//   origin           - world-locked at the recenter origin's forward. The
+//                      pre-port default, and the reason a menu could open
+//                      behind a player who had turned since recentring.
+//
+// release_screen_anchor() forces the next screen frame to re-place. Call it
+// from a recenter so the screen comes back to the player.
+void handle_screen_command(const char* args);
+void release_screen_anchor();
+int screen_place_mode();
+void set_screen_place_mode(int mode);
+const char* screen_place_name(int mode);
+float screen_height_m();
+float screen_distance_m();
+void set_screen_distance_m(float meters);
+bool cinematic_stereo();
+void set_cinematic_stereo(bool on);
+void set_screen_height_m(float m);
+// Quad width in metres. The core DEFAULT is unchanged (2.4); a game opts into a
+// different size from its own adapter, the same way screen placement does.
+float screen_width_m();
+void set_screen_width_m(float m);
+
 // --- Session 29: what the VR rig does while a cinematic holds ----------------
 // `vrcine drive off|authored|authored+look` (default authored). The verb is
 // `drive` and not `mode` because `vrcine mode` already means quad-vs-stereo,
@@ -370,6 +424,59 @@ float rendered_hfov_deg();
 // last image + pose is held for the compositor to reproject on its off frame.
 int current_eye_sign();
 
+// --- Temporal seams: DLSS/DLAA and the alternate frame warp (BS1) -------------
+// All null / zero by default, so a game that never sets them runs exactly the capture
+// path it always did. Only the BS1 adapter (game/bioshock1r/temporal.cpp) sets them.
+//
+// The eye processor: called on the present thread for every stereo eye image (an SR
+// tagged present, or an AlternateEye offset frame) in projection mode, INSTEAD of the
+// plain backbuffer copy. It writes `dst` (that eye's acquired swapchain image) and
+// returns true, or returns false having written nothing and the plain copy runs.
+struct EyeFrame {
+    int eye = 0;                       // 0 left, 1 right
+    int imageSign = 0;                 // the eye sign this image was rendered with
+    bool sequential = false;           // SR pair (true) or AlternateEye (false)
+    ID3D11Texture2D* src = nullptr;    // the game's backbuffer (render size)
+    uint32_t srcW = 0, srcH = 0;
+    ID3D11Texture2D* dst = nullptr;    // the swapchain image (output size)
+    uint32_t dstW = 0, dstH = 0;
+    float tanH = 0, tanV = 0;          // the symmetric tangents this layer claims
+};
+using EyeProcessorFn = bool (*)(ID3D11DeviceContext* ctx, const EyeFrame& frame);
+void set_eye_processor(EyeProcessorFn fn);
+
+// Eye swapchain size for super resolution: the processor reconstructs a backbuffer-size
+// image to this size. 0 x 0 (default) = the backbuffer size. A change rebuilds the eye
+// swapchains at the next safe present; every other capture into them (menus, the quad,
+// a refused processor) is stretched to fit.
+void set_eye_output_size(uint32_t w, uint32_t h);
+// The live eye swapchain size (0 x 0 before the first session).
+void eye_output_size(uint32_t* w, uint32_t* h);
+
+// AlternateEye: where the presented image's eye comes from. Null (default) = core's own
+// alternation (the sign published after each submit). Set, the adapter names the eye
+// sign each presented image was RENDERED with (-1 / +1; 0 = unknown, and the present
+// captures nothing), which stays right when the game thread runs a frame ahead of the
+// render thread - core's alternation then crosses the eyes.
+using AerEyeSourceFn = int (*)();
+void set_aer_eye_source(AerEyeSourceFn fn);
+
+// AlternateEye: rebuild the OTHER (held) eye every present instead of leaving it to the
+// compositor's rotation-only reprojection (the alternate frame warp, AFW). After the
+// fresh eye's capture, if ready(held) is true core acquires the held eye's swapchain
+// image and calls rebuild, which MUST write dst and returns 1 (rebuilt at the fresh
+// eye's instant: submitted with the fresh locate generation's pose) or 2 (its previous
+// image re-written as it was: the held pose is kept).
+struct HeldFrame {
+    int held = 0, fresh = 0;
+    ID3D11Texture2D* dst = nullptr;
+    uint32_t w = 0, h = 0;
+    float tanH = 0, tanV = 0;
+};
+using HeldReadyFn = bool (*)(int held);
+using HeldRebuildFn = int (*)(ID3D11DeviceContext* ctx, const HeldFrame& frame);
+void set_held_rebuild(HeldReadyFn ready, HeldRebuildFn rebuild);
+
 // --- M4 rung 2: SequentialReentry stereo ------------------------------------
 // The game adapter double-calls the engine's scene build, rendering two
 // frames per game tick (left eye then right - DR-5). Because every submitted
@@ -382,14 +489,25 @@ int current_eye_sign();
 // clears it and logs (self-heal after a mode-boundary skew).
 void sr_push_eye(int eyeSign); // game thread, at submit; -1 left, +1 right
 
+// BRVR's eye-queue drift resync (CameraHook_NextEye), opt-in - only BS1's alternate-eye
+// stereo (game/bioshock1r/alt_eye.h) sets it. Depth at each pop is exactly 1 in a healthy
+// loop; when 8 pops in a row find more than one tag queued (a tag whose present never
+// came - BRVR measured it during streaming hitches), every image is being named with the
+// eye before it, which swaps the eyes until something else resets the ring. The pop then
+// drops the stale tags and takes the newest. Off (default) = the historical behaviour.
+void set_sr_drift_resync(bool on);
+
 // --- s62: the [pair] probe (issue #31, BS2 left-eye double image) -----------
 // Cumulative counters over the per-eye present pairing layer - the quantity
 // the bone-restamp [flick] instrument does NOT measure. The right-tagged
-// present submits BOTH eyes' most-recently-released images, so any pair break
-// leaves the LEFT eye stale while the right stays fresh; `staleL` counts
-// stereo submits whose left capture was older than 50 ms, and ageMax tracks
-// the worst observed capture age at submit. Read by the BS2 adapter's minute
-// line; purely additive (nothing in core prints, BS1/BSI behavior unchanged).
+// present submits BOTH eyes' most-recently-released images, so a pair break
+// parks ONE eye on an old image - WHICH eye depends on the break: a break on
+// the right present leaves the LEFT stale, but a lone-left break (pass 2
+// skipped) captures a fresh left and submits with the RIGHT old. The s62
+// premise that every break lands on the left was wrong (found this session);
+// watch staleL AND staleR. ageMax tracks the worst observed capture age at
+// submit. Read by the BS2 adapter's minute line; purely additive (nothing in
+// core prints, BS1/BSI behavior unchanged).
 struct PairProbe {
     uint32_t pairs = 0;          // completed L->R pairs
     uint32_t aborts = 0;         // total pair aborts (all kinds)
@@ -407,9 +525,20 @@ struct PairProbe {
     uint32_t ageMaxL = 0;        // worst capture age at submit, ms - DRAINED on read
     uint32_t ageMaxR = 0;        //   (window = the caller's own read cadence)
     uint32_t ringPushed = 0, ringPopped = 0, ringDropped = 0, ringCleared = 0;
+    uint32_t popDeep = 0;        // pops that found a full pair queued (H3 phase-offset tell)
     bool mirrorOn = false;       // desktop mirror pin state (vrmirror)
 };
 void pair_probe(PairProbe* out);
+
+// Issue #31 event-edge witness (this session): timestamped one-shot log lines
+// at each pairing-break site, so a reported sighting can be matched to a
+// mechanism by wall clock. Off by default; only the BS2 adapter arms it.
+void set_pair_edge_log(bool on);
+bool pair_edge_log();
+// The eye sign the CURRENT present popped (-1 left, +1 right, 0 none) - lets
+// per-present consumers running after the pop (hud interval roll) attribute
+// their interval to an eye.
+int sr_last_pop_sign();
 
 // --- M7: the aim laser ------------------------------------------------------
 // A row of soft dots along the hand's aim ray, submitted as extra XR quad
@@ -442,6 +571,14 @@ struct LaserConfig {
     float modelPitchTrimDeg = 0.0f;
     float modelYawTrimDeg = 0.0f;
     float modelRollTrimDeg = 0.0f;
+    // A FIXED ray (2026-10-14, BS1 opts in): the adapter hands over the beam's start and
+    // direction in XR space, already converted from the game's own fire ray, and the laser
+    // draws exactly that - no controller pose, trims or origin offsets. Its dots run from
+    // nearM to farM along it. For a beam that must leave the drawn gun and meet the drawn
+    // reticle, which a fresher re-derivation from the pose cannot promise. Off: unchanged.
+    bool fixedRay = false;
+    float fixedStartXr[3] = {0.0f, 0.0f, 0.0f};
+    float fixedDirXr[3] = {0.0f, 0.0f, -1.0f};
 };
 
 // Publish the laser state (game thread, once per frame). The render thread

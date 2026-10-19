@@ -83,9 +83,37 @@ void handle_command(const char* args);
 // whose trigger last fired, or the forced choice. Shared with the aim laser so
 // the beam leaves the hand that is actually holding the weapon.
 int active_hand();
+// s82: the hands drive mode (0 gun, 1 hands, 2 bones, 3 BRVR, 4 Dishonored), for logs.
+int drive_mode();
 
 // Live mesh-alignment trim (degrees, per hand) - read by `vraim synccheck` so
 // its model chain sweeps the REAL tuned values (session 20).
+// The MODEL GRIP OFFSET, in cm, in the controller's own final frame (fwd along
+// the barrel as oriented, then right, then up). This is what makes a weapon
+// pivot about its GRIP instead of about its actor origin: with all three at
+// zero the model's origin is pinned to the controller and everything else
+// swings on a radius as you rotate - reported as "the weapon is connected to a
+// circle and the axis is the controller".
+//
+// PER WEAPON, NOT PER HAND. BRVR tuned the same three numbers per slot and its
+// shipped values are nowhere near each other - forward 58 for the wrench, 44
+// for the pistol, 16 for the shotgun - because the number IS the model's
+// origin-to-grip vector and every model has its own. aim.cpp's weapon profiles
+// carry them and push them here on a weapon change; these accessors are that
+// seam. The F10 sliders still edit the live value, which is how a profile gets
+// its numbers in the first place (it is a visual judgement - BRVR's note is
+// blunt that it "cannot be made from a log").
+void model_offset_cm(int hand, float* fwdCm, float* rightCm, float* upCm);
+void set_model_offset_cm(int hand, float fwdCm, float rightCm, float upCm);
+
+// Per weapon since s65, for the same reason the grip offset is: a residual
+// ROTATION error shows up as a POSITION error at the end of the grip lever
+// (err ~ r * delta), so it vanishes at whatever orientation the offset was
+// tuned in and returns everywhere else. Tuning position alone cannot fix it -
+// which is why BRVR's shipped table carries a rotation column per slot, and
+// why its pistol needs 8 degrees of yaw.
+void set_model_trim_deg(int hand, float pitchDeg, float yawDeg, float rollDeg);
+
 float model_trim_pitch_deg(int hand);
 float model_trim_yaw_deg(int hand);
 float model_trim_roll_deg(int hand);
@@ -114,12 +142,65 @@ bool weapon_scan_in_progress();
 // the stale weapon). False = the rig is unknown/unreadable (fall back to
 // the legacy paths); true with *out possibly null. The per-weapon profile
 // layer's identity source - it validates by CLASS NAME, not vtable.
+// s70l: the actor transform WE INTEND, as last written by the drive.
+//
+// bones::drive() runs BEFORE the actor write each frame, so anything in drive()
+// that reads the actor's live loc/rot reads whatever the ENGINE last left there
+// - and the engine rewrites that rotator every frame by tens of degrees
+// (measured: ACTORWATCH, 27-60 pitch / up to 80 yaw / 40-60 roll). Any world <->
+// component conversion built on the live read is therefore wrong by that much,
+// intermittently. Use this instead.
+//
+// Returns false before the first write, when there is nothing to report.
+bool last_actor_write(float loc[3], int32_t rot[3]);
+
 bool current_holdable(void** out);
+
+// Is a weapon OR a plasmid equipped? Ported from BRVR, which gates its crosshair
+// on exactly this. Returns TRUE on every failure path - the consumer is a
+// cosmetic suppression and must fail towards the crosshair being shown.
+bool armed();
+
+// s69: the equipped PLASMID actor, from Hands.CurrentAbility (+0x454). Abilities
+// live in their own slot, which is why current_holdable() reads NULL with a
+// plasmid up. The profile layer resolves this pointer's CLASS NAME to key a
+// per-plasmid profile, the same way it keys weapons. False when the rig is
+// unreadable; *out null means no plasmid equipped.
+bool current_ability(void** out);
 
 // Persist the per-hand model offsets to hands.ini (same as `vrhands save`).
 // Called by `vrpreset save` too, so the one in-headset save button covers the
 // model sliders along with the preset's own values.
 void save_offsets();
+// s86f: the F10 step rows (Dishonored's MpTrimViewStep). A press on the render thread is
+// queued here and converted on the game thread, in the hand's frame of that instant, into
+// the stored trim (bones::off_hand_cm / off_hand_rot_deg). `rot` false: axis 0 right,
+// 1 forward, 2 up, amount in cm. `rot` true: axis 0 yaw (+ right), 1 pitch (+ up),
+// 2 roll (+ top to the right), amount in degrees. steps_pending: any still queued.
+void queue_hand_step(int hand, bool rot, int axis, float amount);
+bool steps_pending();
+
+// s67 view-frame placement (where the gun SITS; cannot create an orbit, unlike
+// the grip offset which is the pivot). Per weapon since s67 - the shotgun sits
+// differently in the hand from the pistol.
+//
+// s68: and PER HAND. It was one global triple serving both hands while the
+// per-weapon profiles rewrote it from the RIGHT hand on every weapon change, so
+// switching to a gun and back left the left-hand PLASMIDS parked at the gun's
+// placement with nothing to restore them. hand 0 = left/plasmid, 1 = right/weapon.
+void view_offset_cm(int hand, float* fwdCm, float* rightCm, float* upCm);
+void set_view_offset_cm(int hand, float fwdCm, float rightCm, float upCm);
+
+// s67: re-apply the viewmodel rotation AFTER the game tick has reset it.
+//
+// BRVR measured the tick erasing ROLL by 5-102 deg (pitch and yaw held), and
+// fixed it by writing the rotator a second time from Present. Verified on this
+// machine: BRVR's readback reports r=0.0 all run, and its viewmodel is clean.
+//
+// Called from scenedraw's build detour at depth 0 - game thread, after
+// CalcView, before the frame is built. Same place camera.cpp restores a stale
+// FOV from, and for the same reason. Cheap and safe when nothing was written.
+void late_write();
 
 // Overlay section (render thread).
 void draw_debug_ui();

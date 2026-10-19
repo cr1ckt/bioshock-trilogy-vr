@@ -21,12 +21,24 @@ add_library(bioshockvr SHARED
     core/debug/value_scan.h
     core/gfx/blit.cpp
     core/gfx/blit.h
+    core/gfx/dlss_client.cpp
+    core/gfx/dlss_client.h
+    core/gfx/dlss_ipc.h
+    core/gfx/desktop_present.cpp
+    core/gfx/desktop_present.h
+    core/gfx/frame_pacing.cpp
+    core/gfx/frame_pacing.h
+    core/gfx/frame_pacing_queue.h
     core/gfx/frame_inspector.cpp
     core/gfx/frame_inspector.h
+    core/gfx/shader_bytecode.cpp
+    core/gfx/shader_bytecode.h
     core/gfx/gfx_hud.cpp
     core/gfx/gfx_hud.h
     core/gfx/hud_capture.cpp
     core/gfx/hud_capture.h
+    core/hooks/d3d11_debug.cpp
+    core/hooks/d3d11_debug.h
     core/hooks/d3d11_hook.cpp
     core/hooks/d3d11_hook.h
     core/hooks/heap_scan.cpp
@@ -39,6 +51,8 @@ add_library(bioshockvr SHARED
     core/input/xinput_bridge.h
     core/ui/overlay.cpp
     core/ui/overlay.h
+    core/vr/apilayer_guard.cpp
+    core/vr/apilayer_guard.h
     core/vr/openxr_input.cpp
     core/vr/openxr_input.h
     core/vr/openxr_runtime.cpp
@@ -57,6 +71,13 @@ add_library(bioshockvr SHARED
     game/bioshock1r/bioshock1r_adapter.cpp
     game/bioshock1r/bioshock1r_adapter.h
     game/bioshock1r/body.cpp
+    game/bioshock1r/menu_model.cpp
+    game/bioshock1r/menu_preferences.cpp
+    game/bioshock1r/menu_theme.cpp
+    game/bioshock1r/menu_view.cpp
+    game/bioshock1r/menu_backend.cpp
+    game/bioshock1r/screens.cpp
+    game/bioshock1r/probe_bob.cpp
     game/bioshock1r/body.h
     game/bioshock1r/bones.cpp
     game/bioshock1r/bones.h
@@ -68,6 +89,15 @@ add_library(bioshockvr SHARED
     game/bioshock1r/console_exec.h
     game/bioshock1r/frame_context.h
     game/bioshock1r/hands.cpp
+    game/bioshock1r/palette.cpp
+    game/bioshock1r/handback.cpp
+    game/bioshock1r/attach_census.cpp
+    game/bioshock1r/muzzle.cpp
+    game/bioshock1r/muzzle.h
+    game/bioshock1r/laser_draw.cpp
+    game/bioshock1r/laser_draw.h
+    game/bioshock1r/hands_state.cpp
+    game/bioshock1r/hands_state.h
     game/bioshock1r/hands.h
     game/bioshock1r/input_drive.cpp
     game/bioshock1r/input_drive.h
@@ -77,6 +107,29 @@ add_library(bioshockvr SHARED
     game/bioshock1r/recorder.h
     game/bioshock1r/scenedraw.cpp
     game/bioshock1r/scenedraw.h
+    game/bioshock1r/scripted.cpp
+    game/bioshock1r/scripted.h
+    game/bioshock1r/afw_gpu.cpp
+    game/bioshock1r/afw_gpu.h
+    game/bioshock1r/alt_eye.cpp
+    game/bioshock1r/alt_eye.h
+    game/bioshock1r/resize.cpp
+    game/bioshock1r/resize.h
+    game/bioshock1r/native_proof_mask.cpp
+    game/bioshock1r/native_proof_mask.h
+    game/bioshock1r/native_proof_eye.cpp
+    game/bioshock1r/native_proof_eye.h
+    game/bioshock1r/native_proof_eye_math.h
+    game/bioshock1r/native_proof.cpp
+    game/bioshock1r/native_repair.cpp
+    game/bioshock1r/native_proof.h
+    game/bioshock1r/native_audit.cpp
+    game/bioshock1r/native_audit.h
+    game/bioshock1r/native_audit_com.h
+    game/bioshock1r/temporal.cpp
+    game/bioshock1r/temporal.h
+    game/bioshock1r/temporal_gpu.cpp
+    game/bioshock1r/temporal_gpu.h
     game/bioshock2r/aim.cpp
     game/bioshock2r/aim.h
     game/bioshock2r/bioshock2r_adapter.cpp
@@ -161,6 +214,21 @@ set_target_properties(bioshockvr PROPERTIES PREFIX "")
 # the log always matches the tree it was built from. Session 23: the old
 # hand-edited #define shipped "0.1.0" for v0.1.0, v0.2.0 AND v0.3.0, which made a
 # user's crash log unattributable to a release.
+configure_file(game/bioshock1r/menu_resources.rc.in "${CMAKE_BINARY_DIR}/generated/menu_resources.rc" @ONLY)
+target_sources(bioshockvr PRIVATE "${CMAKE_BINARY_DIR}/generated/menu_resources.rc")
+target_link_libraries(bioshockvr PRIVATE windowscodecs shlwapi ole32)
+option(BIOSHOCKVR_WITH_F10_PREVIEW "Build the offscreen BS1 production-menu renderer" ON)
+if(BIOSHOCKVR_WITH_F10_PREVIEW)
+    add_executable(bvr_f10_preview
+        tools/f10_preview/main.cpp
+        game/bioshock1r/menu_model.cpp
+        game/bioshock1r/menu_preferences.cpp
+        game/bioshock1r/menu_theme.cpp
+        game/bioshock1r/menu_view.cpp
+        "${CMAKE_BINARY_DIR}/generated/menu_resources.rc")
+    target_include_directories(bvr_f10_preview PRIVATE .)
+    target_link_libraries(bvr_f10_preview PRIVATE imgui d3d11 windowscodecs shlwapi ole32)
+endif()
 set(BVR_VERSION_HEADER "${CMAKE_BINARY_DIR}/generated/bvr_version.h")
 # Once at configure time so the header exists for a fresh tree and for IDE parsing.
 execute_process(COMMAND ${CMAKE_COMMAND}
@@ -186,6 +254,7 @@ target_link_libraries(bioshockvr PRIVATE
     minhook
     imgui
     d3d11
+    dxgi
     d3dcompiler
     dbghelp
 )
@@ -201,6 +270,17 @@ endif()
 if(BIOSHOCKVR_WITH_OPENXR)
     add_executable(xr_hello32 tools/xr_hello32/main.cpp)
     target_link_libraries(xr_hello32 PRIVATE openxr_loader d3d11 dxgi)
+endif()
+
+# --- armcap32 - arm ground-truth capture --------------------------------------
+# Standalone 32-bit console app that records head + both controller poses to CSV,
+# for fitting a measured elbow model instead of a hand-tuned one. Needs no game:
+# running it outside BioShock keeps the data clean of worldScale, recenterYaw and
+# the rig DrawScale. See docs/bioshock1/IK-RESEARCH.md section 7. Not shipped
+# with the mod - tools/package.ps1 stages an explicit file list.
+if(BIOSHOCKVR_WITH_OPENXR)
+    add_executable(armcap32 tools/armcap32/main.cpp)
+    target_link_libraries(armcap32 PRIVATE openxr_loader d3d11 dxgi)
 endif()
 
 # --- bvr_xrsim32 - the simulated OpenXR runtime -------------------------------
@@ -267,4 +347,9 @@ if(BIOSHOCKVR_WITH_OPENXR AND BIOSHOCKVR_WITH_OVRSHIM)
     # openvr_api.dll and d3dcompiler are LoadLibrary'd at runtime - link only
     # the D3D11 the compositing pipeline needs.
     target_link_libraries(bvr_ovr_shim PRIVATE d3d11)
+endif()
+
+option(BIOSHOCKVR_WITH_LAUNCHER "Build the BioShock Remastered VR launcher" ON)
+if(BIOSHOCKVR_WITH_LAUNCHER AND TARGET bvr_ovr_shim)
+    add_subdirectory(tools/launcher)
 endif()

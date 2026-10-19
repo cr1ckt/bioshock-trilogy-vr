@@ -1,11 +1,13 @@
 #include "framework.h"
 
+#include "core/hooks/d3d11_debug.h"
 #include "core/hooks/d3d11_hook.h"
 #include "core/input/xinput_bridge.h"
 #include "core/ui/overlay.h"
 #include "core/util/crash.h"
 #include "core/util/diag.h"
 #include "core/util/log.h"
+#include "core/vr/apilayer_guard.h"
 #include "core/vr/openxr_runtime.h"
 #include "game/adapter_registry.h"
 #include "game/igame_adapter.h"
@@ -137,12 +139,22 @@ void init() {
     // whose only caller is that detour: the session then ran with whatever
     // exception filter had displaced ours (CSERHelper) and produced no dumps at
     // all. This way a hanging runtime costs VR and nothing else.
+    // The D3D11 debug layer, only when the tester armed it for this launch (a marker in the
+    // data dir): the device-creation hooks must be in before the game creates its device.
+    d3d11_debug::install();
+
     if (diag::skip("d3d11")) {
         BVR_LOG("BVR_SKIP: D3D11 swapchain hooks NOT installed");
     } else if (!d3d11_hook::install()) {
         BVR_LOG("D3D11 hook install failed - mod disabled, game runs flat");
         return;
     }
+
+    // Ahead of the first OpenXR call, which LoadLibrary's every implicit API
+    // layer: one whose library is x64 cannot load into this 32-bit process and
+    // fails xrCreateInstance for EVERY runtime, native and shim alike. An OBS
+    // capture layer is the measured case. See apilayer_guard.cpp.
+    vr::apilayer_guard();
 
     if (diag::skip("xr")) BVR_LOG("BVR_SKIP: OpenXR instance NOT created");
     else vr::init_instance(); // fail-soft: no runtime just means flat mode

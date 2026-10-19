@@ -1,3 +1,5 @@
+#include "menu_bindings.h"
+#include "menu_backend.h"
 // M6 decoupled aim. Hook behavior (call the original, then adjust the writable
 // out-param) follows the same shape as the CalcView camera hook, i.e.
 // itsloopyo/bioshock-remastered-headtracking (MIT), src/engine_hook.rs.
@@ -19,7 +21,10 @@
 #include "core/vr/openxr_runtime.h"
 #include "game/bioshock1r/body.h"
 #include "game/bioshock1r/bones.h"
+#include "game/bioshock1r/handback.h"
 #include "game/bioshock1r/hands.h"
+#include "game/bioshock1r/muzzle.h"
+#include "game/bioshock1r/temporal.h"
 #include "game/shared/ue_math.h"
 
 #include <windows.h>
@@ -76,6 +81,46 @@ std::atomic<bool> g_useAimPose{true};
 // manual trim. The left/plasmid hand keeps the pointing ray: there is no
 // barrel to follow.
 std::atomic<bool> g_muzzleRay{false};
+// The ray starts at the DRAWN barrel (2026-10-14): the held weapon's "muzzle" socket, through
+// the engine's own GetBoneCoords (muzzle.h), kept in the weapon hand's ray frame so the bullet
+// and the laser both leave the gun the player sees. The per-weapon F10 origin offsets still
+// apply on top, as trims. The gun the engine poses was placed by LAST frame's hand target
+// (aim runs before hands in CalcView), so the socket is measured against last frame's ray.
+std::atomic<bool> g_barrelOrigin{true};
+struct RayBase {
+    bool valid = false;
+    int hand = -1;
+    FVector rayOrigin{};                // before any origin offset
+    FRotator rayRot{};
+    bool aimValid = false;
+    FRotator aimRot{};                  // the aim pose untrimmed, roll included: the controller's frame
+};
+RayBase g_prevBase;
+// The ray points ALONG the drawn barrel too (2026-10-14): the muzzle socket's axis that lies
+// along the barrel, held in the controller's own frame (roll included), so it turns with the
+// wrist exactly; the laser's controller-local direction mode draws the same one. Replaces the
+// per-weapon tilt/turn trims while it holds.
+std::atomic<bool> g_barrelAim{true};
+std::atomic<int> g_barrelAxisSrc{0}; // 0 = the gun body's frame, 1 = the muzzle socket's
+// The laser and reticle drawn into the eye images (laser_draw.h) instead of as XR quads.
+std::atomic<bool> g_laserInImage{true};
+laser_draw::Segment g_seg; // this frame's, game thread
+struct Barrel {
+    bool valid = false;
+    int hand = -1;
+    void* weapon = nullptr;
+    float rayCm[3] = {}; // in the ray frame: fwd, right, up
+    // The barrel direction: which socket axis (0..5 = +X -X +Y -Y +Z -Z, 6 = none lies along
+    // the aim ray, -1 = not chosen yet for this weapon) and that axis in the aim pose's frame.
+    int axis = -1;
+    float axisDot = 0.0f;
+    bool dirValid = false;
+    float local[3] = {1, 0, 0};
+    uint64_t stampMs = 0;
+    uint32_t hits = 0, misses = 0, implausible = 0;
+    float muzzle[3] = {}, barrelAxis[3] = {}; // the last measurement, world (for captures)
+};
+Barrel g_barrel;
 // Per-hand since session 16 part 3 (user request): each controller's wrist
 // posture wants its own trim. 0 = left (plasmid), 1 = right (weapon).
 // Defaults = the user's in-headset calibration (their explicit ask: the
@@ -85,6 +130,10 @@ std::atomic<bool> g_muzzleRay{false};
 // accepted hand/weapon scaling - the right hand now carries a small nonzero
 // trim of its own (the per-weapon profiles still override it per weapon;
 // this is the baseline they start from).
+// s70: THE CROSSHAIR IS GLOBAL, so these two are the live values outright - the
+// weapon profile no longer swaps them. The defaults are the seeded set's own
+// numbers (plasmid -11.00/37.00, the weapons' common 0.83/-9.20) so a fresh
+// install lands where the per-weapon table used to put it.
 std::atomic<float> g_pitchOffsetDeg[2] = {-11.0f, 0.2f};
 std::atomic<float> g_yawOffsetDeg[2] = {37.0f, -4.5f};
 // Per-hand aim-ray ORIGIN offsets in cm (session 18 part 2, user request):
@@ -112,6 +161,22 @@ std::atomic<float> g_posUpCm[2] = {0.5f, 12.9f};
 // an in-headset checklist item. Game thread only (except the UI name copy).
 struct WeaponProfile {
     float trimPitch, trimYaw, posFwd, posRight, posUp;
+    // s65: the MODEL grip offset (hands.cpp), as opposed to the four above
+    // which steer the aim RAY. Per weapon because the number is the model's
+    // own origin-to-grip vector - see hands.h's banner. Zero means "as before":
+    // a profile written by an older build has no grip keys, loads them as 0,
+    // and the model sits exactly where it used to.
+    float gripFwd, gripRight, gripUp;
+    // s67: view-frame PLACEMENT, per weapon. Distinct from the grip offset
+    // above: grip is the PIVOT, this is where the gun sits. A shotgun sits
+    // differently in the hand from a pistol, so it needs its own.
+    float viewFwd, viewRight, viewUp;
+    // s67: may this weapon adopt the engine's animation? BRVR's HandAnimSlot.
+    // 1 for guns (recoil and reload play); 0 for the wrench, whose swing
+    // animation fights manual melee - the tester's words: "manual swinging with
+    // the wrench feels amazing without the swing animation".
+    float animOn;
+    float modelPitch, modelYaw, modelRoll;
 };
 std::map<std::string, WeaponProfile> g_weaponProfiles;
 std::string g_weaponKey;          // active profile key ("" = none)
@@ -132,7 +197,7 @@ bool g_presetBaselineValid = false;
 // M7 laser: the visible form of this same ray, published to core every frame.
 // It lives here rather than with the hands so it cannot drift from the trim
 // above - a laser that disagrees with the bullet is worse than no laser.
-std::atomic<bool> g_laser{false};
+std::atomic<bool> g_laser{true}; // s90: on by default (the tester's choice; a saved preset still wins)
 std::atomic<int> g_laserDots{6};
 std::atomic<float> g_laserNearM{0.30f}, g_laserFarM{6.0f}, g_laserSizeDeg{0.7f};
 // Session 29 aim dot: ONE lever, default OFF. Unlike the laser it is not a
@@ -875,6 +940,7 @@ std::atomic<bool>* sub_flag_by_name(const char* name) {
     return nullptr;
 }
 
+void log_barrel(); // below; the barrel origin's status line
 void log_status() {
     BVR_LOG("[aim] pose=%s cal L pitch%+.1f yaw%+.1f | R pitch%+.1f yaw%+.1f deg",
             g_useAimPose.load(std::memory_order_relaxed) ? "aim" : "grip",
@@ -925,6 +991,23 @@ void log_status() {
     BVR_LOG("[aim]   objects: right=%p left=%p (learn events %u), gameplayView=%d",
             g_objRight, g_objLeft, g_learnEvents.load(std::memory_order_relaxed),
             g_gameplayView ? 1 : 0);
+    log_barrel();
+}
+
+void log_barrel() {
+    BVR_LOG("[aim] barrel origin %s: %s hand %d, ray fwd %+.1f right %+.1f up %+.1f cm | "
+            "hits %u misses %u implausible %u",
+            g_barrelOrigin.load(std::memory_order_relaxed) ? "ON" : "off", g_barrel.valid ? "ACTIVE" : "inactive",
+            g_barrel.hand, g_barrel.rayCm[0], g_barrel.rayCm[1], g_barrel.rayCm[2], g_barrel.hits, g_barrel.misses,
+            g_barrel.implausible);
+    BVR_LOG("[aim] barrel direction %s: %s, %s axis %d (%.2f with the aim ray when chosen), "
+            "in the controller fwd %+.3f right %+.3f up %+.3f | usage: vraim barrel on|off|aim on|off|axis|src body|socket",
+            g_barrelAim.load(std::memory_order_relaxed) ? "ON" : "off",
+            g_barrel.valid && g_barrel.dirValid ? "ACTIVE" : "inactive",
+            g_barrelAxisSrc.load(std::memory_order_relaxed) == 1 ? "muzzle socket" : "gun body", g_barrel.axis,
+            g_barrel.axisDot,
+            g_barrel.local[0], g_barrel.local[1], g_barrel.local[2]);
+    muzzle::log_status();
 }
 
 // ---- per-weapon profile machinery (session 21) ------------------------------
@@ -939,15 +1022,64 @@ std::string narrow_key(const wchar_t* w) {
     return s;
 }
 
-// Capture the live R-hand values into the active profile (no-op keyless).
+// s69: fold an ability class name down to the plasmid it is.
+//
+// Upgrade tiers are separate engine classes - ElectricBoltAbility,
+// ElectricBoltTwoAbility, ElectricBoltThreeAbility, ElectricBoltZeroAbility,
+// TelekinesisAbility, TelekinesisTwoAbility - so keying on the raw name would
+// hand an upgraded plasmid a fresh profile and drop the position the tester had
+// tuned. Strip the trailing "Ability", then a trailing tier word, and all tiers
+// of one plasmid share a profile. Yields ~11 keys, which is what BioShock ships.
+std::string plasmid_key(std::string s) {
+    auto chop = [&s](const char* suffix) {
+        const size_t n = strlen(suffix);
+        if (s.size() > n && s.compare(s.size() - n, n, suffix) == 0) {
+            s.erase(s.size() - n);
+            return true;
+        }
+        return false;
+    };
+    chop("Ability");
+    // Only one tier word, and only after "Ability" is gone.
+    chop("Three") || chop("Two") || chop("Zero");
+    return s.empty() ? std::string("Plasmid") : s;
+}
+
+// s69b: which HAND does a profile own? Weapons the right, plasmids the LEFT.
+//
+// Measured, not reasoned. Three observations in one session pin it down:
+// the numpad tuning hand 1 did not move a plasmid; retargeted to active_hand()
+// it did; and tuning one plasmid then moved the other. That is only possible if
+// plasmids render from hand 0, hand 0 carries ONE shared set of values, and the
+// profile layer - which read and wrote hand 1 throughout - was inert for them.
+// Per-plasmid profiles existed but nothing they stored was ever rendered.
+bool is_plasmid_key(const std::string& k) {
+    static const char* kPlasmids[] = {
+        "ElectricBolt", "Telekinesis", "Incineration", "IcicleAssault", "InsectSwarm",
+        "SecurityBeacon", "SpringBoardTrap", "SummonProtector", "AirBlast",
+        "BerserkRage", "DecoyHuman", "Plasmid"};
+    for (const char* n : kPlasmids)
+        if (k == n) return true;
+    return false;
+}
+int profile_hand(const std::string& key) { return is_plasmid_key(key) ? 0 : 1; }
+
+// Capture the live values of the active profile's OWN hand (no-op keyless).
 void stash_active_profile() {
     if (g_weaponKey.empty()) return;
+    const int ph = profile_hand(g_weaponKey);
     WeaponProfile& p = g_weaponProfiles[g_weaponKey];
-    p.trimPitch = g_pitchOffsetDeg[1].load(std::memory_order_relaxed);
-    p.trimYaw = g_yawOffsetDeg[1].load(std::memory_order_relaxed);
-    p.posFwd = g_posFwdCm[1].load(std::memory_order_relaxed);
-    p.posRight = g_posRightCm[1].load(std::memory_order_relaxed);
-    p.posUp = g_posUpCm[1].load(std::memory_order_relaxed);
+    p.trimPitch = g_pitchOffsetDeg[ph].load(std::memory_order_relaxed);
+    p.trimYaw = g_yawOffsetDeg[ph].load(std::memory_order_relaxed);
+    p.posFwd = g_posFwdCm[ph].load(std::memory_order_relaxed);
+    p.posRight = g_posRightCm[ph].load(std::memory_order_relaxed);
+    p.posUp = g_posUpCm[ph].load(std::memory_order_relaxed);
+    hands::model_offset_cm(ph, &p.gripFwd, &p.gripRight, &p.gripUp);
+    hands::view_offset_cm(ph, &p.viewFwd, &p.viewRight, &p.viewUp);
+    p.animOn = bones::anim_allowed() ? 1.0f : 0.0f;
+    p.modelPitch = hands::model_trim_pitch_deg(ph);
+    p.modelYaw = hands::model_trim_yaw_deg(ph);
+    p.modelRoll = hands::model_trim_roll_deg(ph);
 }
 
 void apply_weapon_key(const std::string& key, const char* why) {
@@ -958,7 +1090,18 @@ void apply_weapon_key(const std::string& key, const char* why) {
         std::lock_guard<std::mutex> lock(g_weaponKeyUiMutex);
         strcpy_s(g_weaponKeyUi, key.empty() ? "-" : key.c_str());
     }
-    if (key.empty()) return;
+    const int ph = profile_hand(key);
+    if (key.empty()) {
+        menu::profile_changed("",-1);
+        // s68: a genuinely UNKNOWN holdable (the rig itself unreadable). This is
+        // no longer the plasmid case - that resolves to "Plasmid" below - so it
+        // is rare, and it is worth saying out loud rather than silently leaving
+        // the previous weapon's whole profile applied, which is what it does.
+        BVR_LOG("[aim] holdable unresolved - profile UNCHANGED, '%s' stays applied "
+                "(%s). Slider edits will land in that profile.",
+                g_weaponKeyUi, why);
+        return;
+    }
     ++g_weaponSwaps;
     auto it = g_weaponProfiles.find(key);
     if (it == g_weaponProfiles.end()) {
@@ -972,27 +1115,52 @@ void apply_weapon_key(const std::string& key, const char* why) {
                                               g_yawOffsetDeg[1].load(std::memory_order_relaxed),
                                               g_posFwdCm[1].load(std::memory_order_relaxed),
                                               g_posRightCm[1].load(std::memory_order_relaxed),
-                                              g_posUpCm[1].load(std::memory_order_relaxed)};
+                                              g_posUpCm[1].load(std::memory_order_relaxed),
+                                              0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (!g_presetBaselineValid) {
+            hands::model_offset_cm(ph, &p.gripFwd, &p.gripRight, &p.gripUp);
+            hands::view_offset_cm(ph, &p.viewFwd, &p.viewRight, &p.viewUp);
+            p.animOn = 1.0f;
+            p.modelPitch = hands::model_trim_pitch_deg(ph);
+            p.modelYaw = hands::model_trim_yaw_deg(ph);
+            p.modelRoll = hands::model_trim_roll_deg(ph);
+        }
         g_weaponProfiles[key] = p;
-        g_pitchOffsetDeg[1].store(p.trimPitch, std::memory_order_relaxed);
-        g_yawOffsetDeg[1].store(p.trimYaw, std::memory_order_relaxed);
-        g_posFwdCm[1].store(p.posFwd, std::memory_order_relaxed);
-        g_posRightCm[1].store(p.posRight, std::memory_order_relaxed);
-        g_posUpCm[1].store(p.posUp, std::memory_order_relaxed);
+        g_pitchOffsetDeg[ph].store(p.trimPitch, std::memory_order_relaxed);
+        g_yawOffsetDeg[ph].store(p.trimYaw, std::memory_order_relaxed);
+        g_posFwdCm[ph].store(p.posFwd, std::memory_order_relaxed);
+        g_posRightCm[ph].store(p.posRight, std::memory_order_relaxed);
+        g_posUpCm[ph].store(p.posUp, std::memory_order_relaxed);
+        hands::set_model_offset_cm(ph, p.gripFwd, p.gripRight, p.gripUp);
+        hands::set_view_offset_cm(ph, p.viewFwd, p.viewRight, p.viewUp);
+        bones::set_anim_allowed(p.animOn != 0.0f);
+        hands::set_model_trim_deg(ph, p.modelPitch, p.modelYaw, p.modelRoll);
         BVR_LOG("[aim] weapon profile '%s' CREATED from the %s (%s): trim %.2f/%.2f pos "
                 "%.1f/%.1f/%.1f",
                 key.c_str(), g_presetBaselineValid ? "preset baseline" : "current R values",
                 why, p.trimPitch, p.trimYaw, p.posFwd, p.posRight, p.posUp);
     } else {
         const WeaponProfile& p = it->second;
-        g_pitchOffsetDeg[1].store(p.trimPitch, std::memory_order_relaxed);
-        g_yawOffsetDeg[1].store(p.trimYaw, std::memory_order_relaxed);
-        g_posFwdCm[1].store(p.posFwd, std::memory_order_relaxed);
-        g_posRightCm[1].store(p.posRight, std::memory_order_relaxed);
-        g_posUpCm[1].store(p.posUp, std::memory_order_relaxed);
-        BVR_LOG("[aim] weapon profile '%s' applied: trim %.2f/%.2f pos %.1f/%.1f/%.1f (%s)",
-                key.c_str(), p.trimPitch, p.trimYaw, p.posFwd, p.posRight, p.posUp, why);
+        g_pitchOffsetDeg[ph].store(p.trimPitch, std::memory_order_relaxed);
+        g_yawOffsetDeg[ph].store(p.trimYaw, std::memory_order_relaxed);
+        g_posFwdCm[ph].store(p.posFwd, std::memory_order_relaxed);
+        g_posRightCm[ph].store(p.posRight, std::memory_order_relaxed);
+        g_posUpCm[ph].store(p.posUp, std::memory_order_relaxed);
+        hands::set_model_offset_cm(ph, p.gripFwd, p.gripRight, p.gripUp);
+        hands::set_view_offset_cm(ph, p.viewFwd, p.viewRight, p.viewUp);
+        bones::set_anim_allowed(p.animOn != 0.0f);
+        hands::set_model_trim_deg(ph, p.modelPitch, p.modelYaw, p.modelRoll);
+        // s70b: the trim is NOT printed here any more, and that matters. It was
+        // still reporting the profile's stored trimPitch/trimYaw as "applied"
+        // after the crosshair went global and stopped applying them - an
+        // instrument describing behaviour the code no longer has, which is the
+        // exact failure this file's own s68 notes were written about.
+        BVR_LOG("[aim] weapon profile '%s' applied: trim %.2f/%.2f pos %.1f/%.1f/%.1f "
+                "grip %.1f/%.1f/%.1f (%s)",
+                key.c_str(), p.trimPitch, p.trimYaw, p.posFwd, p.posRight, p.posUp,
+                p.gripFwd, p.gripRight, p.gripUp, why);
     }
+    menu::profile_changed(key.c_str(),ph);
 }
 
 // Scan-fallback dormancy (session 27). A structural latch, deliberately NOT a
@@ -1062,29 +1230,266 @@ void update_weapon_profile(const FrameContext& ctx) {
         }
     }
     if (haveRig || w) g_weaponScanMisses = 0;
-    if (w == g_weaponKeyActor) return;
-    g_weaponKeyActor = w;
-    const wchar_t* name = w ? patterns::object_class_name(w) : nullptr;
-    if (w && !name)
-        BVR_LOG("[aim] holdable %p has NO resolvable class name - profile key cleared, "
-                "slider edits will touch no profile until it resolves",
-                w);
-    apply_weapon_key(name ? narrow_key(name) : std::string(), "weapon change");
+
+    // ---- s69 THE PLASMID KEY, PER PLASMID -----------------------------------
+    // `Hands.CurrentHoldable` is NULL while a plasmid is equipped - abilities
+    // live in their own slot (`CurrentAbility`, patterns.h +0x454). s68 turned
+    // that null into ONE key, "Plasmid", shared by every plasmid.
+    //
+    // That cannot work, and the tester's own BRVR config is the proof. With
+    // PerPlasmidTuning=1 it carries wildly different rotations per plasmid -
+    // PlasmidRot0 = -111,-64,22 against PlasmidRot1 = -35,-20,22 - because the
+    // plasmids' authored poses genuinely differ. Nine attempts to find the
+    // "right" shared capture instant failed because there is no such instant:
+    // no single set of numbers serves both. BRVR never had the defect because
+    // per-plasmid grip/rot ABSORBS the difference.
+    //
+    // So each plasmid gets its own profile, keyed on its class name through the
+    // same path weapons already use. BRVR resolves identity by scanning the pawn
+    // for AvailableAbilities and matching ActiveAbility into it; that is not
+    // needed here, because object_class_name() walks obj -> +0x30 UClass ->
+    // validated vtable -> +0x28 FName -> GNames and names an Ability instance
+    // exactly as it names a Shotgun. No pawn scan, no new offsets.
+    void* abil = nullptr;
+    const bool haveAbil = hands::current_ability(&abil) && abil != nullptr;
+
+    // IDENTITY IS THE PAIR. Both plasmids leave the holdable null, so keying the
+    // change-detector on the holdable alone makes every plasmid look like every
+    // other one and the switch is never seen.
+    void* const ident = w ? w : abil;
+    if (ident == g_weaponKeyActor && !(haveRig && !ident && g_weaponKey.empty())) return;
+    g_weaponKeyActor = ident;
+
+    std::string key;
+    const char* why = "weapon change";
+    if (haveRig && !w && haveAbil) {
+        const wchar_t* aname = patterns::object_class_name(abil);
+        if (aname) {
+            key = plasmid_key(narrow_key(aname));
+            why = "plasmid equipped (Hands.CurrentAbility)";
+        } else {
+            // Degrade to s68's shared key rather than to nothing: a plasmid with
+            // one set of numbers is worse than per-plasmid, and far better than
+            // the outgoing weapon's profile staying applied.
+            key = "Plasmid";
+            why = "plasmid equipped, class name unresolved - shared fallback";
+            static bool s_warned = false;
+            if (!s_warned) {
+                s_warned = true;
+                BVR_LOG("[aim] plasmid %p has NO resolvable class name - falling back to "
+                        "the shared 'Plasmid' profile. Per-plasmid tuning is OFF until "
+                        "this resolves; report this line.",
+                        abil);
+            }
+        }
+    } else if (haveRig && !w) {
+        why = "hands empty (no holdable, no ability)";
+    } else {
+        const wchar_t* name = w ? patterns::object_class_name(w) : nullptr;
+        if (w && !name)
+            BVR_LOG("[aim] holdable %p has NO resolvable class name - profile key cleared, "
+                    "slider edits will touch no profile until it resolves",
+                    w);
+        if (name) key = narrow_key(name);
+    }
+    apply_weapon_key(key, why);
 }
 
-// v0.3.0 default profiles = the user's calibrated set (session 21 part 4,
-// their ask: the saved preset becomes the defaults - dot==shot per weapon
-// out of the box). Seeded BEFORE weapons.ini loads, so a user's own file
-// always overrides, key by key.
+// DEFAULT PROFILES = the tester's calibrated set. Refreshed s67 after the
+// viewmodel drive was rebuilt on BRVR's architecture (actor carries the rig,
+// cluster frozen, bone 43 position-only), so every field below was measured
+// against THAT drive and none of it transfers to the old bone retarget.
+//
+// Field order matches WeaponProfile: trimPitch, trimYaw (the AIM ray - dot and
+// bullet come off it), posFwd/Right/Up (aim origin), animOn (may this weapon
+// adopt engine animation - 0 on the wrench so manual swinging is not fought by
+// a swing animation), viewFwd/Right/Up (PLACEMENT - where the gun sits; safe),
+// gripFwd/Right/Up (PIVOT - what it turns about; BRVR's values, leave alone),
+// modelPitch/Yaw/Roll.
+//
+// The wrench keeps BRVR's PIVOT but carries its own aim trim and placement,
+// re-tuned after the s67 animOn bug was fixed (before the fix it was wearing
+// the previous weapon's reference pose, so its earlier numbers measured that
+// bug rather than the wrench). animOn=0: manual swinging, no swing animation.
+//
+// Seeded BEFORE weapons.ini loads, so a user's own file always overrides,
+// key by key.
 void seed_default_profiles() {
-    g_weaponProfiles["ChemicalThrower"] = {0.00f, -8.17f, 0.93f, -0.43f, -9.78f};
-    g_weaponProfiles["Crossbow"] = {0.23f, -6.65f, 0.00f, -4.40f, 11.00f};
-    g_weaponProfiles["GrenadeLauncher"] = {0.00f, 0.00f, 0.00f, -2.80f, 7.50f};
-    g_weaponProfiles["MachineGun"] = {2.80f, -1.17f, 0.00f, -3.50f, 13.10f};
-    g_weaponProfiles["Pistol"] = {-1.17f, -4.20f, -0.70f, -2.06f, 18.71f};
-    g_weaponProfiles["ResearchCamera"] = {0.00f, 0.00f, 0.00f, -2.80f, 7.50f};
-    g_weaponProfiles["Shotgun"] = {0.00f, 0.00f, 0.00f, -2.76f, 7.50f};
-    g_weaponProfiles["Wrench"] = {0.00f, 0.00f, 0.00f, -2.80f, 7.50f};
+    // s68: DESIGNATED INITIALISERS, and that is the point of this rewrite.
+    //
+    // These rows used to be bare aggregate lists written in the order the comment
+    // above gives (trim, pos, animOn, view, grip, model) while the STRUCT declares
+    // grip BEFORE view and animOn AFTER both - so every field past posUp was
+    // silently assigned to the wrong member. The Wrench came out with
+    // animOn = -16.70: nonzero, so its animation gate read as ON, which is the one
+    // thing it must not be. Every weapon's grip and placement were scrambled into
+    // each other besides.
+    //
+    // Worse, a stale duplicate block underneath re-assigned all eight with FIVE
+    // values each, and aggregate init zero-fills the rest - grip, view, animOn and
+    // the model trims all went to zero, so a FRESH INSTALL had no recoil on any
+    // weapon at all. Both bugs were invisible to anyone whose weapons.ini already
+    // overrode every field by name, which is how they survived s67 and a headset
+    // run: the tester's own file was hiding them.
+    //
+    // Named initialisers cannot drift out of order again. The values are the
+    // tester's calibrated set, transcribed from their weapons.ini - which is what
+    // the live tuning writes, and therefore the ground truth.
+    //
+    // Seeded BEFORE weapons.ini loads, so a user's own file always overrides,
+    // key by key.
+    //
+    // "Plasmid" is s68 and is ONE key for EVERY plasmid - the tester's call,
+    // "global, not per plasmid". See resolve_holdable_key() for why a plasmid
+    // needs a key at all: the engine parks Hands.CurrentHoldable at NULL while
+    // one is equipped, which used to leave the last WEAPON's profile applied.
+    g_weaponProfiles["ChemicalThrower"] = {
+        .trimPitch = 0.83f, .trimYaw = -9.20f,
+        .posFwd = 0.93f, .posRight = -0.43f, .posUp = -9.78f,
+        .gripFwd = 42.00f, .gripRight = 14.70f, .gripUp = 1.00f,
+        .viewFwd = 0.00f, .viewRight = 0.00f, .viewUp = 15.00f,
+        .animOn = 1.00f,
+        .modelPitch = 0.00f, .modelYaw = 0.00f, .modelRoll = 0.00f};
+    g_weaponProfiles["Crossbow"] = {
+        .trimPitch = 0.83f, .trimYaw = -9.20f,
+        .posFwd = 0.00f, .posRight = -4.40f, .posUp = 11.00f,
+        .gripFwd = 44.00f, .gripRight = 14.70f, .gripUp = -21.00f,
+        .viewFwd = 0.00f, .viewRight = 0.00f, .viewUp = 15.00f,
+        .animOn = 1.00f,
+        .modelPitch = 0.00f, .modelYaw = 0.00f, .modelRoll = 0.00f};
+    g_weaponProfiles["GrenadeLauncher"] = {
+        .trimPitch = 0.83f, .trimYaw = -9.20f,
+        .posFwd = 0.00f, .posRight = -2.80f, .posUp = 7.50f,
+        .gripFwd = 24.00f, .gripRight = 16.70f, .gripUp = -15.00f,
+        .viewFwd = 0.00f, .viewRight = 0.00f, .viewUp = 15.00f,
+        .animOn = 1.00f,
+        .modelPitch = 0.00f, .modelYaw = 0.00f, .modelRoll = 0.00f};
+    g_weaponProfiles["MachineGun"] = {
+        .trimPitch = 1.83f, .trimYaw = -10.20f,
+        .posFwd = 0.00f, .posRight = -3.50f, .posUp = 13.10f,
+        .gripFwd = 52.00f, .gripRight = 17.00f, .gripUp = -14.70f,
+        .viewFwd = 1.50f, .viewRight = 0.50f, .viewUp = 12.00f,
+        .animOn = 1.00f,
+        .modelPitch = -0.50f, .modelYaw = -9.00f, .modelRoll = -1.00f};
+    g_weaponProfiles["Pistol"] = {
+        .trimPitch = 2.83f, .trimYaw = -9.70f,
+        .posFwd = -0.70f, .posRight = -2.06f, .posUp = 18.71f,
+        .gripFwd = 44.00f, .gripRight = 16.70f, .gripUp = -15.40f,
+        .viewFwd = 2.00f, .viewRight = 0.00f, .viewUp = 11.00f,
+        .animOn = 1.00f,
+        .modelPitch = 0.00f, .modelYaw = -8.00f, .modelRoll = 0.00f};
+    g_weaponProfiles["ResearchCamera"] = {
+        .trimPitch = 0.83f, .trimYaw = -9.20f,
+        .posFwd = 0.00f, .posRight = -2.80f, .posUp = 7.50f,
+        .gripFwd = 44.00f, .gripRight = 14.70f, .gripUp = -13.00f,
+        .viewFwd = 0.00f, .viewRight = 0.00f, .viewUp = 15.00f,
+        .animOn = 1.00f,
+        .modelPitch = 0.00f, .modelYaw = 0.00f, .modelRoll = 0.00f};
+    g_weaponProfiles["Shotgun"] = {
+        .trimPitch = -2.17f, .trimYaw = -6.70f,
+        .posFwd = 0.00f, .posRight = -2.76f, .posUp = 7.50f,
+        .gripFwd = 16.00f, .gripRight = 11.80f, .gripUp = -11.80f,
+        .viewFwd = 2.50f, .viewRight = 1.00f, .viewUp = 6.00f,
+        .animOn = 1.00f,
+        .modelPitch = -2.00f, .modelYaw = -8.00f, .modelRoll = 0.00f};
+    g_weaponProfiles["Wrench"] = {
+        .trimPitch = -6.67f, .trimYaw = -14.70f,
+        .posFwd = 0.00f, .posRight = -2.80f, .posUp = 7.50f,
+        .gripFwd = 58.00f, .gripRight = 18.30f, .gripUp = -16.70f,
+        .viewFwd = -4.00f, .viewRight = -2.00f, .viewUp = 15.00f,
+        .animOn = 0.00f,
+        .modelPitch = -12.00f, .modelYaw = -16.00f, .modelRoll = -18.00f};
+    // s69b PLASMIDS: ONE row for every plasmid, and it is a LEFT-HAND row.
+    //
+    // s70d: ALL ELEVEN START FROM THE TESTER'S OWN TUNED PLASMID ROW, which is
+    // where they were before s70c and where testing put them back.
+    //
+    // BRVR's config does show the authored poses differ a lot between plasmids
+    // (PlasmidRot0 -111,-64,22 against PlasmidRot1 -35,-20,22, and 2/4/5 near
+    // -111,-14,22), so per-plasmid rotation is real and this table should
+    // eventually carry eleven different rows. What it must NOT carry is BRVR's
+    // numbers transcribed across: that was tried in s70c and moved the plasmids
+    // to the wrong position, because the model trim rotation is the basis the
+    // grip offset is applied along - the two are one calibration, not two.
+    //
+    // Derive them on this rig with the numpad tuner, one plasmid at a time.
+    WeaponProfile kPlasmid{
+        .trimPitch = -11.00f, .trimYaw = 37.00f,
+        .posFwd = -2.80f, .posRight = 0.60f, .posUp = 0.50f,
+        .gripFwd = 45.50f, .gripRight = -14.90f, .gripUp = -12.30f,
+        .viewFwd = 0.00f, .viewRight = -4.00f, .viewUp = 13.00f,
+        .animOn = 1.00f,
+        .modelPitch = -59.00f, .modelYaw = -32.00f, .modelRoll = 22.00f};
+    for (const char* k : {"ElectricBolt", "Telekinesis", "Incineration", "IcicleAssault",
+                          "InsectSwarm", "SecurityBeacon", "SpringBoardTrap",
+                          "SummonProtector", "AirBlast", "BerserkRage", "DecoyHuman",
+                          "Plasmid"})
+        g_weaponProfiles[k] = kPlasmid;
+
+    // ---- s70d: THE BRVR ROTATIONS WERE TRIED AND REVERTED. Read this before
+    // ---- transcribing them again.
+    //
+    // s70c set these from the tester's BRVR config - ElectroBolt to
+    // PlasmidRot0 (-111,-64,22) and Telekinesis to PlasmidRot1 (-35,-20,22),
+    // with PlasmidGrip1 for Telekinesis. Tested, and it was WORSE: the plasmids
+    // moved to the wrong POSITION and the animation direction did not change at
+    // all.
+    //
+    // TWO THINGS THAT COST NOTHING TO KNOW, both from that one run:
+    //
+    //   1. The model trim ROTATION MOVES THE PLASMID. Position was correct
+    //      before and wrong after, and rotation was all that changed - so the
+    //      grip offset is applied along the model's rotated basis and the two
+    //      cannot be transcribed independently. BRVR's rot values are not
+    //      portable without its grip values AND whatever else composes that
+    //      basis; the matching roll of 22.00 was not enough to license the
+    //      transfer, and CLAUDE.md's "never copy a number, derive it" applied
+    //      here even though both mods are the same game.
+    //
+    //   2. A 48 DEG YAW CHANGE DID NOT MOVE THE ANIMATION DIRECTION. That is
+    //      the useful half. If the direction were a product of the actor's
+    //      rotation, 48 deg would have been unmissable. It is not the model
+    //      trim, and it is not the drive hand, the freeze anchor or the
+    //      adoption policy either - the symptom has now survived a change to
+    //      every one of them. Look somewhere else entirely.
+    //
+    // So these are the tester's own tuned values, unchanged, and they stay that
+    // way until something derives a replacement on this rig.
+    g_weaponProfiles["ElectricBolt"].viewFwd = -2.00f;
+    g_weaponProfiles["ElectricBolt"].viewRight = 2.00f;
+    g_weaponProfiles["ElectricBolt"].viewUp = 11.00f;
+    g_weaponProfiles["ElectricBolt"].modelPitch = -111.00f;
+    g_weaponProfiles["ElectricBolt"].modelYaw = -16.00f;
+    g_weaponProfiles["ElectricBolt"].modelRoll = 22.00f;
+
+    // TELEKINESIS ANIMATES, and this one DID hold. s69b gated it off because its
+    // grab animation threw the rig "super far away" - but that was the mode-3
+    // late write never replaying the cluster (s69d), so ANY adopted left-hand
+    // animation walked off. The animation was never the fault.
+    //
+    // SET EXPLICITLY, because a weapons.ini written while the gate was on still
+    // carries animOn=0 and that file overrides these seeds. A stale 0 there was
+    // the whole of "tele doesnt animate at all".
+    g_weaponProfiles["Telekinesis"].animOn = 1.00f;
+
+    // ---- s70o: PLASMIDS DO NOT ADOPT ENGINE ANIMATION -----------------------
+    //
+    // "lets completely disable plasmid firing animations." A reversal of s70c,
+    // and a reasoned one: that change turned Telekinesis back on because the
+    // tester asked for the animations, and seeing them is what showed the cast
+    // travelling through the plasmid's heavily trimmed frame and ending up
+    // pointed wrong. The animation was never the thing they wanted; a hand that
+    // stays where they put it is.
+    //
+    // Set AFTER the Telekinesis line above rather than by editing it, so the
+    // history stays readable: that line records why it was turned on, this
+    // records why it went off again. animOn is per profile, so any single
+    // plasmid can be turned back on without touching the rest.
+    for (const char* k : {"ElectricBolt", "Telekinesis", "Incineration", "IcicleAssault",
+                          "InsectSwarm", "SecurityBeacon", "SpringBoardTrap",
+                          "SummonProtector", "AirBlast", "BerserkRage", "DecoyHuman",
+                          "Plasmid"})
+        g_weaponProfiles[k].animOn = 0.00f;
 }
 
 void weapons_ini_path(wchar_t* out, size_t count) {
@@ -1111,6 +1516,18 @@ void load_weapon_profiles() {
         else if (strcmp(field, "posFwd") == 0) p.posFwd = v;
         else if (strcmp(field, "posRight") == 0) p.posRight = v;
         else if (strcmp(field, "posUp") == 0) p.posUp = v;
+        // s65 grip keys. A file written before this existed simply has none of
+        // them, they stay 0, and the model sits exactly where it used to.
+        else if (strcmp(field, "animOn") == 0) p.animOn = v;
+        else if (strcmp(field, "viewFwd") == 0) p.viewFwd = v;
+        else if (strcmp(field, "viewRight") == 0) p.viewRight = v;
+        else if (strcmp(field, "viewUp") == 0) p.viewUp = v;
+        else if (strcmp(field, "gripFwd") == 0) p.gripFwd = v;
+        else if (strcmp(field, "gripRight") == 0) p.gripRight = v;
+        else if (strcmp(field, "gripUp") == 0) p.gripUp = v;
+        else if (strcmp(field, "modelPitch") == 0) p.modelPitch = v;
+        else if (strcmp(field, "modelYaw") == 0) p.modelYaw = v;
+        else if (strcmp(field, "modelRoll") == 0) p.modelRoll = v;
         else continue;
         ++n;
     }
@@ -1118,9 +1535,46 @@ void load_weapon_profiles() {
     if (n)
         BVR_LOG("[aim] %d weapon-profile value(s) loaded from weapons.ini (%u weapon(s))", n,
                 static_cast<unsigned>(g_weaponProfiles.size()));
+
+    // s70c: SAY OUT LOUD WHICH PROFILES HAVE ANIMATION GATED OFF.
+    //
+    // This file OVERRIDES the seeds, and animOn=0 is a gate that silently
+    // disables a whole feature for one holdable. Telekinesis carried a stale 0
+    // from s69b - written when its grab animation was blamed for throwing the
+    // rig, a premise s69d then disproved - and it survived every later change
+    // because nothing ever mentioned it. The tester reported it as "tele doesnt
+    // animate at all" and the search went to thresholds and settle windows,
+    // where the answer was one line in a config file.
+    //
+    // A gate nobody can see is a gate nobody can question, so it gets a line.
+    for (const auto& kv : g_weaponProfiles)
+        if (kv.second.animOn == 0.0f)
+            BVR_LOG("[aim] NOTE: '%s' has engine animation GATED OFF (animOn=0). Its rig "
+                    "will not move at all. Intended for the wrench; anything else here is "
+                    "probably a stale value in weapons.ini.",
+                    kv.first.c_str());
 }
 
 } // namespace
+
+// s91: the aim ray the fire seams substitute, for the bones' effect follow (the bolt's beam points
+// along it, as the damage trace does).
+bool laser_segment(laser_draw::Segment* out) {
+    if (!out || !g_seg.valid) return false;
+    *out = g_seg;
+    return true;
+}
+
+bool hand_ray(int hand, float origin[3], float dir[3]) {
+    FVector o{};
+    FRotator r{};
+    if (!ray_for(hand ? Hand::Right : Hand::Left, &o, &r)) return false;
+    origin[0] = o.x;
+    origin[1] = o.y;
+    origin[2] = o.z;
+    ue_rot_to_dir(r, dir);
+    return true;
+}
 
 void init(const bvr::pattern_scan::ProcessImage& image, const patterns::Symbols& symbols) {
     g_imageBase = image.base;
@@ -1128,6 +1582,7 @@ void init(const bvr::pattern_scan::ProcessImage& image, const patterns::Symbols&
     g_syms = symbols;
     seed_default_profiles();
     load_weapon_profiles(); // a user's weapons.ini overrides the seeds key by key
+    muzzle::init(g_syms.actorGetBoneCoords);
     BVR_LOG("[aim] init: weapon fire-start=%p ability fire-start=%p", g_syms.weaponFireStart,
             g_syms.abilityFireStart);
 }
@@ -1140,7 +1595,15 @@ void note_preset_baseline() {
                         g_yawOffsetDeg[1].load(std::memory_order_relaxed),
                         g_posFwdCm[1].load(std::memory_order_relaxed),
                         g_posRightCm[1].load(std::memory_order_relaxed),
-                        g_posUpCm[1].load(std::memory_order_relaxed)};
+                        g_posUpCm[1].load(std::memory_order_relaxed), 0.0f, 0.0f, 0.0f};
+    hands::model_offset_cm(1, &g_presetBaseline.gripFwd, &g_presetBaseline.gripRight,
+                           &g_presetBaseline.gripUp);
+    hands::view_offset_cm(1, &g_presetBaseline.viewFwd, &g_presetBaseline.viewRight,
+                          &g_presetBaseline.viewUp);
+    g_presetBaseline.animOn = 1.0f;
+    g_presetBaseline.modelPitch = hands::model_trim_pitch_deg(1);
+    g_presetBaseline.modelYaw = hands::model_trim_yaw_deg(1);
+    g_presetBaseline.modelRoll = hands::model_trim_roll_deg(1);
     g_presetBaselineValid = true;
     BVR_LOG("[aim] preset R baseline noted: trim %.2f/%.2f pos %.1f/%.1f/%.1f (seeds new "
             "weapon profiles)",
@@ -1183,6 +1646,19 @@ void save_weapon_profiles() {
         fprintf(f, "%s.posFwd=%.2f\n", key.c_str(), p.posFwd);
         fprintf(f, "%s.posRight=%.2f\n", key.c_str(), p.posRight);
         fprintf(f, "%s.posUp=%.2f\n", key.c_str(), p.posUp);
+
+        fprintf(f, "%s.animOn=%.0f\n", key.c_str(), p.animOn);
+        fprintf(f, "%s.viewFwd=%.2f\n", key.c_str(), p.viewFwd);
+        fprintf(f, "%s.viewRight=%.2f\n", key.c_str(), p.viewRight);
+        fprintf(f, "%s.viewUp=%.2f\n", key.c_str(), p.viewUp);
+        fprintf(f, "%s.gripFwd=%.2f\n", key.c_str(), p.gripFwd);
+
+        fprintf(f, "%s.gripRight=%.2f\n", key.c_str(), p.gripRight);
+
+        fprintf(f, "%s.gripUp=%.2f\n", key.c_str(), p.gripUp);
+        fprintf(f, "%s.modelPitch=%.2f\n", key.c_str(), p.modelPitch);
+        fprintf(f, "%s.modelYaw=%.2f\n", key.c_str(), p.modelYaw);
+        fprintf(f, "%s.modelRoll=%.2f\n", key.c_str(), p.modelRoll);
     }
     fclose(f);
     BVR_LOG("[aim] %u weapon profile(s) saved to weapons.ini",
@@ -1196,6 +1672,14 @@ void apply_origin_offset(int i, Ray& out, float worldScale) {
     float of = g_posFwdCm[i].load(std::memory_order_relaxed);
     float orr = g_posRightCm[i].load(std::memory_order_relaxed);
     float ou = g_posUpCm[i].load(std::memory_order_relaxed);
+    // At the barrel the muzzle IS the origin: the per-weapon sliders are bypassed, like tilt and
+    // turn are along the barrel. Added on top they were old calibrations (the pistol's +18.7 cm
+    // up) that lifted every shot and the laser off the barrel by a different amount per weapon.
+    if (g_barrel.valid && g_barrel.hand == i && !out.synthetic && g_barrelOrigin.load(std::memory_order_relaxed)) {
+        of = g_barrel.rayCm[0];
+        orr = g_barrel.rayCm[1];
+        ou = g_barrel.rayCm[2];
+    }
     if (of == 0.0f && orr == 0.0f && ou == 0.0f) return;
     float fwd[3], right[3], up[3];
     ue_rot_basis(out.rot, fwd, right, up);
@@ -1208,6 +1692,165 @@ void apply_origin_offset(int i, Ray& out, float worldScale) {
     out.origin.z += fwd[2] * of + right[2] * orr + up[2] * ou;
 }
 
+// Where the headset shows game point `p`, as a point game_point_to_xr can take: the camera
+// carries the head anchor (camera.cpp's head-offset sliders) on top of the pose map, so the
+// pose map's image of p minus the anchor is where p is drawn.
+static FVector seen_point(const FrameContext& ctx, const FVector& p) {
+    return {p.x - ctx.anchorX, p.y - ctx.anchorY, p.z - ctx.anchorZ};
+}
+
+// `v` (world UU) in the zero-roll frame of `rot`, in cm: fwd, right, up - the frame both
+// apply_origin_offset and the XR laser put their origin offsets in.
+static void to_ray_cm(const FRotator& rot, const float v[3], float uuPerCm, float out[3]) {
+    float fwd[3], right[3], up[3];
+    ue_rot_basis(rot, fwd, right, up);
+    const float* axes[3] = {fwd, right, up};
+    for (int k = 0; k < 3; ++k)
+        out[k] = (v[0] * axes[k][0] + v[1] * axes[k][1] + v[2] * axes[k][2]) / uuPerCm;
+}
+
+// The barrel's direction from the socket's axes. Which axis runs along the barrel is chosen once
+// per weapon - the signed axis nearest the ray the gun was aimed with (calibrated to within a
+// few tens of degrees of the barrel, and the axes are 90 apart) - and refused below cos 60 deg.
+// That axis is then kept in the aim pose's own frame, smoothed like the origin (`a`).
+// The signed axis of `axes` nearest `fwd` (0..5 = +X -X +Y -Y +Z -Z) and its dot; -1 when the
+// set is degenerate.
+static int nearest_axis(const float axes[3][3], const float fwd[3], float* dot) {
+    if (axes[0][0] == 0.0f && axes[0][1] == 0.0f && axes[0][2] == 0.0f) return -1;
+    int best = -1;
+    float bestDot = -2.0f;
+    for (int k = 0; k < 6; ++k) {
+        const float* v = axes[k / 2];
+        const float d = (k & 1 ? -1.0f : 1.0f) * (v[0] * fwd[0] + v[1] * fwd[1] + v[2] * fwd[2]);
+        if (d > bestDot) { bestDot = d; best = k; }
+    }
+    *dot = bestDot;
+    return best;
+}
+
+// After the first headset look the socket's axis was off the drawn barrel by a different amount
+// per weapon: a socket's rotation is authored for its effect. The gun body's own frame (the bone
+// the socket hangs on) is how the mesh was built - the shotgun's skeleton is identity-ish along
+// +X (session 20) - so the direction comes from there by default; `vraim barrel src socket`
+// switches back. Both choices and the angle between them are logged per weapon.
+static void update_barrel_direction(const RayBase& b, const float socketAxes[3][3], const float boneAxes[3][3],
+                                    float a) {
+    const bool useSocket = g_barrelAxisSrc.load(std::memory_order_relaxed) == 1;
+    const float(*axes)[3] = useSocket ? socketAxes : boneAxes;
+    if (!b.aimValid || (axes[0][0] == 0.0f && axes[0][1] == 0.0f && axes[0][2] == 0.0f)) {
+        g_barrel.dirValid = false;
+        return;
+    }
+    if (g_barrel.axis < 0) {
+        float rf[3], rr[3], ru[3];
+        ue_rot_basis(b.rayRot, rf, rr, ru);
+        float boneDot = 0.0f, sockDot = 0.0f;
+        const int bone = nearest_axis(boneAxes, rf, &boneDot);
+        const int sock = nearest_axis(socketAxes, rf, &sockDot);
+        const int best = useSocket ? sock : bone;
+        const float bestDot = useSocket ? sockDot : boneDot;
+        g_barrel.axisDot = bestDot;
+        g_barrel.axis = best >= 0 && bestDot >= 0.5f ? best : 6;
+        static const char* kNames[6] = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"};
+        float apart = -1.0f;
+        if (bone >= 0 && sock >= 0) {
+            const float* p = boneAxes[bone / 2];
+            const float* q = socketAxes[sock / 2];
+            float d = (bone & 1 ? -1.0f : 1.0f) * (sock & 1 ? -1.0f : 1.0f) * (p[0] * q[0] + p[1] * q[1] + p[2] * q[2]);
+            d = d > 1.0f ? 1.0f : d < -1.0f ? -1.0f : d;
+            apart = acosf(d) * 57.29578f;
+        }
+        BVR_LOG("[aim] barrel direction from the %s: gun body %s (%.2f with the aim ray), muzzle socket %s (%.2f), "
+                "%.1f deg apart%s",
+                useSocket ? "muzzle socket" : "gun body", bone >= 0 ? kNames[bone] : "?", boneDot,
+                sock >= 0 ? kNames[sock] : "?", sockDot, apart,
+                g_barrel.axis < 6 ? "" : " - neither lies along the aim ray; the direction stays the controller's");
+    }
+    if (g_barrel.axis >= 6) {
+        g_barrel.dirValid = false;
+        return;
+    }
+    const float s = g_barrel.axis & 1 ? -1.0f : 1.0f;
+    const float* v = axes[g_barrel.axis / 2];
+    for (int k = 0; k < 3; ++k) g_barrel.barrelAxis[k] = s * v[k];
+    float f[3], r[3], u[3];
+    ue_rot_basis(b.aimRot, f, r, u);
+    const float w[3] = {s * v[0], s * v[1], s * v[2]};
+    const float loc[3] = {w[0] * f[0] + w[1] * f[1] + w[2] * f[2], w[0] * r[0] + w[1] * r[1] + w[2] * r[2],
+                          w[0] * u[0] + w[1] * u[1] + w[2] * u[2]};
+    const float k = g_barrel.dirValid ? a : 1.0f;
+    float n2 = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+        g_barrel.local[i] += k * (loc[i] - g_barrel.local[i]);
+        n2 += g_barrel.local[i] * g_barrel.local[i];
+    }
+    const float n = sqrtf(n2);
+    g_barrel.dirValid = n > 1e-3f;
+    if (g_barrel.dirValid)
+        for (float& c : g_barrel.local) c /= n;
+}
+
+// The barrel origin for this frame: the held weapon's muzzle socket, measured against the ray
+// that placed the gun (last frame's), in that ray's frame. Only while the controller drives the
+// weapon hand - when the game animates it (a scripted beat, the hand-back) the gun is not where
+// the controller is, and the old origin stands. A short miss holds the last offset.
+// 2026-10-14: while only a clip's own motion of the gun hand is playing on the controller (the
+// recoil, the reload's gun motion - handback::gun_motion) the offset is HELD for as long as it
+// lasts: the shot leaves along the barrel as it was before the kick, where the player points,
+// and a full-auto burst longer than the miss window does not drop to the old origin.
+static void update_barrel(const FrameContext& ctx, uint64_t now) {
+    const RayBase& b = g_prevBase;
+    const int hand = hands::active_hand() == 0 ? 0 : 1;
+    if (g_barrel.valid && g_barrel.hand == hand && handback::gun_motion(hand, now) > 0.0f &&
+        handback::weight(hand, now) >= 1.0f && handback::carry(hand, now) <= 0.0f) {
+        g_barrel.stampMs = now;
+        return;
+    }
+    void* weapon = nullptr;
+    bool ok = (g_barrelOrigin.load(std::memory_order_relaxed) || g_barrelAim.load(std::memory_order_relaxed)) &&
+              g_gameplayView && b.valid && b.hand == hand &&
+              hands::active() && !handback::active(hand, now) && hands::current_holdable(&weapon) && weapon;
+    if (ok && weapon != g_barrel.weapon) {
+        g_barrel.valid = false; // a new weapon: no smoothing across the switch
+        g_barrel.weapon = weapon;
+        g_barrel.axis = -1;     // and its own barrel axis
+        g_barrel.dirValid = false;
+    }
+    float m[3], socketAxes[3][3], boneAxes[3][3];
+    if (ok) ok = muzzle::locate(weapon, m, socketAxes, boneAxes);
+    if (ok) {
+        const float uuPerCm = (ctx.worldScale > 1.0f ? ctx.worldScale : 100.0f) / 100.0f;
+        const float d[3] = {m[0] - b.rayOrigin.x, m[1] - b.rayOrigin.y, m[2] - b.rayOrigin.z};
+        float rc[3];
+        to_ray_cm(b.rayRot, d, uuPerCm, rc);
+        const float len = sqrtf(rc[0] * rc[0] + rc[1] * rc[1] + rc[2] * rc[2]);
+        if (len > 120.0f) { // farther than any gun's reach from the hand: the socket is not on the drawn gun
+            if (++g_barrel.implausible == 1)
+                BVR_LOG("[aim] barrel origin: muzzle %.0f cm from the ray - ignored (not the drawn gun)", len);
+            ok = false;
+        } else {
+            // Light smoothing: the socket is rigid with the hand but read a frame late, so a fast
+            // turn of the wrist would otherwise shake the origin by a centimetre or two.
+            const float a = g_barrel.valid && g_barrel.hand == hand ? 0.35f : 1.0f;
+            for (int k = 0; k < 3; ++k) g_barrel.rayCm[k] += a * (rc[k] - g_barrel.rayCm[k]);
+            for (int k = 0; k < 3; ++k) g_barrel.muzzle[k] = m[k];
+            if (!g_barrel.valid)
+                BVR_LOG("[aim] barrel origin: %s hand, muzzle at fwd %+.1f right %+.1f up %+.1f cm from the ray",
+                        hand ? "RIGHT" : "LEFT", rc[0], rc[1], rc[2]);
+            update_barrel_direction(b, socketAxes, boneAxes, a);
+            g_barrel.valid = true;
+            g_barrel.hand = hand;
+            g_barrel.stampMs = now;
+            ++g_barrel.hits;
+            return;
+        }
+    }
+    ++g_barrel.misses;
+    if (g_barrel.valid && (!(g_barrelOrigin.load(std::memory_order_relaxed) || g_barrelAim.load(std::memory_order_relaxed)) ||
+                           now - g_barrel.stampMs > 250 || g_barrel.hand != hand || !g_gameplayView))
+        g_barrel.valid = false;
+}
+
 // Last published FrameContext, cached for `vraim synccheck` (session 20): the
 // sweep needs a real frame's transform to map through, outside the frame.
 // Written and read on the game thread only (commands run there too).
@@ -1217,6 +1860,7 @@ static bool g_haveCtx = false;
 void on_calcview(const FrameContext& ctx) {
     uint64_t now = GetTickCount64();
     g_rayStampMs = now;
+    g_seg = laser_draw::Segment{}; // republished below, when there is one
     g_lastCtx = ctx;
     g_haveCtx = true;
     g_worldScaleCache = ctx.worldScale > 1.0f ? ctx.worldScale : 100.0f;
@@ -1276,7 +1920,10 @@ void on_calcview(const FrameContext& ctx) {
     // Per-weapon profile hot-swap (session 21): the active R-hand trim/offsets
     // follow the equipped weapon's class (gameplay view only - see the guard).
     update_weapon_profile(ctx);
+    update_barrel(ctx, now);
 
+    RayBase base;
+    base.hand = hands::active_hand() == 0 ? 0 : 1;
     for (int i = 0; i < 2; ++i) {
         Ray& out = g_ray[i];
         out = {};
@@ -1332,13 +1979,45 @@ void on_calcview(const FrameContext& ctx) {
             }
         }
 
+        // The weapon hand's ray as it stands before any origin offset: next frame's barrel
+        // measurement relates the gun this frame places to it. Along the barrel, the ray takes
+        // the barrel's direction from the aim pose's own (untrimmed) frame.
+        if (i == base.hand) {
+            float apos[3] = {pos[0], pos[1], pos[2]}, aquat[4] = {quat[0], quat[1], quat[2], quat[3]};
+            bool haveAim = useAim;
+            bvr::vr::HeadPose ha{};
+            if (!useAim && bvr::vr::get_hand_pose(i, true, ha)) {
+                apos[0] = ha.px; apos[1] = ha.py; apos[2] = ha.pz;
+                aquat[0] = ha.qx; aquat[1] = ha.qy; aquat[2] = ha.qz; aquat[3] = ha.qw;
+                haveAim = true;
+            }
+            if (haveAim) {
+                const GamePose ap = model_pose_from_xr(ctx, apos, aquat, 0.0f, 0.0f, 0.0f);
+                base.aimValid = true;
+                base.aimRot = ap.rot;
+                if (g_barrelAim.load(std::memory_order_relaxed) && g_barrel.valid && g_barrel.dirValid &&
+                    g_barrel.hand == i) {
+                    float f[3], r[3], u[3];
+                    ue_rot_basis(ap.rot, f, r, u);
+                    const float* l = g_barrel.local;
+                    const float d[3] = {f[0] * l[0] + r[0] * l[1] + u[0] * l[2], f[1] * l[0] + r[1] * l[1] + u[1] * l[2],
+                                        f[2] * l[0] + r[2] * l[1] + u[2] * l[2]};
+                    out.rot = ue_dir_to_rot(d); // pitch/yaw; roll stays 0
+                }
+            }
+            base.valid = true;
+            base.rayOrigin = out.origin;
+            base.rayRot = out.rot;
+        }
+
         apply_origin_offset(i, out, ctx.worldScale);
         out.valid = true;
     }
+    g_prevBase = base;
 
-    // Publish the laser for the render thread. It reads the aim pose itself at
-    // submit time (later than this, so the dots are as fresh as the frame), and
-    // takes the trim from here so the beam and the bullet are one ray.
+    // Publish the laser for the render thread. With a valid fire ray it draws that ray as given
+    // (fixedRay, below); otherwise it reads the aim pose itself at submit time and takes the
+    // trim from here, so the beam and the bullet are one ray by shared algebra.
     bvr::vr::LaserConfig lc{};
     lc.enabled = g_laser.load(std::memory_order_relaxed) && ctx.vrDriving && g_gameplayView;
     lc.hand = hands::active_hand();
@@ -1366,6 +2045,67 @@ void on_calcview(const FrameContext& ctx) {
             lc.modelRollTrimDeg = hands::model_trim_roll_deg(1);
         }
     }
+    // The beam ON the fire ray (2026-10-14): from the ray's origin - the muzzle, with the
+    // barrel origin on - to the reticle's point on the same ray (the laser reach when the
+    // reticle is off), both converted the way the game draws them. A beam re-derived from the
+    // controller pose at submit time agrees with the bullet only by shared algebra and missed
+    // the muzzle flash; this one is the bullet's own line, a frame old like the gun it leaves.
+    const Ray& fr = g_ray[lh];
+    if (lc.enabled && fr.valid && !fr.synthetic) {
+        float dir[3];
+        ue_rot_to_dir(fr.rot, dir);
+        const float reachM = g_dot.load(std::memory_order_relaxed) ? g_dotDistM.load(std::memory_order_relaxed)
+                                                                    : g_laserFarM.load(std::memory_order_relaxed);
+        const float reachUu = reachM * ctx.worldScale;
+        const FVector a = seen_point(ctx, fr.origin);
+        const FVector b{a.x + dir[0] * reachUu, a.y + dir[1] * reachUu, a.z + dir[2] * reachUu};
+        float pa[3], pb[3];
+        game_point_to_xr(ctx, a, pa);
+        game_point_to_xr(ctx, b, pb);
+        lc.fixedRay = true;
+        for (int k = 0; k < 3; ++k) {
+            lc.fixedStartXr[k] = pa[k];
+            lc.fixedDirXr[k] = pb[k] - pa[k];
+        }
+        lc.nearM = 0.05f; // the first dot at the muzzle
+        lc.farM = reachM > 0.1f ? reachM : 0.1f;
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            BVR_LOG("[aim] laser drawn on the fire ray: %.2f m from (%.3f %.3f %.3f) xr", lc.farM, pa[0], pa[1], pa[2]);
+        }
+    }
+    // The in-image laser (laser_draw.h): the same ray in world UU, which temporal.cpp projects
+    // into each eye image through that image's own camera - the camera the gun in it was drawn
+    // with. While it is drawing, the XR laser and reticle quads stand down; they come straight
+    // back if it stops (no DLSS/AFW image processing, a refused render target).
+    g_seg = laser_draw::Segment{};
+    if (g_laserInImage.load(std::memory_order_relaxed) && fr.valid && !fr.synthetic && g_gameplayView) {
+        const bool laserOn = lc.enabled;
+        const bool reticleOn = g_dot.load(std::memory_order_relaxed) && g_enabled.load(std::memory_order_relaxed);
+        if (laserOn || reticleOn) {
+            const float uuPerM = ctx.worldScale > 1.0f ? ctx.worldScale : 100.0f;
+            const float reticleM = g_dotDistM.load(std::memory_order_relaxed);
+            g_seg.valid = true;
+            g_seg.laser = laserOn;
+            g_seg.reticle = reticleOn;
+            g_seg.origin[0] = fr.origin.x; g_seg.origin[1] = fr.origin.y; g_seg.origin[2] = fr.origin.z;
+            ue_rot_to_dir(fr.rot, g_seg.dir);
+            g_seg.nearUu = 0.05f * uuPerM;
+            g_seg.farUu = (reticleOn ? reticleM : g_laserFarM.load(std::memory_order_relaxed)) * uuPerM;
+            g_seg.reticleUu = reticleM * uuPerM;
+            g_seg.dots = g_laserDots.load(std::memory_order_relaxed);
+            g_seg.dotDeg = g_laserSizeDeg.load(std::memory_order_relaxed);
+            g_seg.reticleDeg = g_dotSizeDeg.load(std::memory_order_relaxed);
+            g_seg.muzzleValid = g_barrel.valid && g_barrel.hand == lh;
+            for (int k = 0; k < 3; ++k) {
+                g_seg.muzzle[k] = g_barrel.muzzle[k];
+                g_seg.barrelAxis[k] = g_barrel.barrelAxis[k];
+            }
+        }
+    }
+    const bool inImage = g_seg.valid && temporal::laser_drawn_recently();
+    if (inImage && g_seg.laser) lc.enabled = false;
     bvr::vr::set_laser(lc);
 
     // Session 29: publish the aim DOT from the finished ray, not from a second
@@ -1373,7 +2113,7 @@ void on_calcview(const FrameContext& ctx) {
     // visible if and only if a shot fired right now would be substituted -
     // which makes the dot an instrument as well as a sight.
     bvr::vr::AimDotConfig dc{};
-    dc.enabled = g_dot.load(std::memory_order_relaxed);
+    dc.enabled = g_dot.load(std::memory_order_relaxed) && !(inImage && g_seg.reticle);
     dc.sizeDeg = g_dotSizeDeg.load(std::memory_order_relaxed);
     const Ray& dr = g_ray[lh];
     if (dc.enabled && g_enabled.load(std::memory_order_relaxed) && g_gameplayView && dr.valid) {
@@ -1382,6 +2122,7 @@ void on_calcview(const FrameContext& ctx) {
         float distUu = g_dotDistM.load(std::memory_order_relaxed) * ctx.worldScale;
         FVector at{dr.origin.x + dir[0] * distUu, dr.origin.y + dir[1] * distUu,
                    dr.origin.z + dir[2] * distUu};
+        at = seen_point(ctx, at); // where the headset shows it (the round trip below checks this)
         game_point_to_xr(ctx, at, dc.posXr);
         dc.valid = true;
 
@@ -1712,6 +2453,18 @@ void handle_command(const char* args) {
                    : "back to the trimmed controller forward",
                 haveRef ? "from the live reference" : "UNAVAILABLE yet",
                 haveRef ? d0[0] : 0.0f, haveRef ? d0[1] : 0.0f, haveRef ? d0[2] : 0.0f);
+    } else if (strcmp(verb, "barrel") == 0) {
+        if (strncmp(rest, "on", 2) == 0) g_barrelOrigin.store(true, std::memory_order_relaxed);
+        else if (strncmp(rest, "off", 3) == 0) g_barrelOrigin.store(false, std::memory_order_relaxed);
+        else if (strncmp(rest, "aim on", 6) == 0) g_barrelAim.store(true, std::memory_order_relaxed);
+        else if (strncmp(rest, "aim off", 7) == 0) g_barrelAim.store(false, std::memory_order_relaxed);
+        else if (strncmp(rest, "axis", 4) == 0) g_barrel.axis = -1; // choose the barrel axis again
+        else if (strncmp(rest, "src body", 8) == 0 || strncmp(rest, "src socket", 10) == 0) {
+            g_barrelAxisSrc.store(rest[4] == 's' ? 1 : 0, std::memory_order_relaxed);
+            g_barrel.axis = -1;
+            g_barrel.dirValid = false;
+        }
+        log_barrel();
     } else if (strcmp(verb, "synccheck") == 0) {
         run_synccheck();
     } else if (strcmp(verb, "weapon") == 0) {
@@ -1760,6 +2513,46 @@ bool hook_live() {
 
 void* learned_weapon_object() {
     return g_objRight;
+}
+
+void aim_trim_deg(int hand, float* pitchDeg, float* yawDeg) {
+    if (hand < 0 || hand > 1) return;
+    if (pitchDeg) *pitchDeg = g_pitchOffsetDeg[hand].load(std::memory_order_relaxed);
+    if (yawDeg) *yawDeg = g_yawOffsetDeg[hand].load(std::memory_order_relaxed);
+}
+
+void set_aim_trim(int hand, float pitchDeg, float yawDeg) {
+    // s70n: THE HAND MATTERS, and the crosshair branch of the numpad tuner was
+    // the last place that had not learned it.
+    //
+    // set_aim_trim_all() below writes hand 1 unconditionally - correct when the
+    // only caller was tuning a weapon, wrong the moment a plasmid is up. The
+    // tuner READ hand 1's trim, added a step, and wrote it back to hand 1, so
+    // with a plasmid equipped the keys moved the WEAPON's crosshair and left the
+    // plasmid's untouched: "the numpad doesnt work for crosshair placement on
+    // plasmids". Exactly the defect s68 fixed for grip and rotation
+    // (bdfa400, "the numpad tuned a hardcoded hand"), in the one branch that
+    // was not part of that change.
+    const int h = hand == 0 ? 0 : 1;
+    g_pitchOffsetDeg[h].store(pitchDeg, std::memory_order_relaxed);
+    g_yawOffsetDeg[h].store(yawDeg, std::memory_order_relaxed);
+}
+
+void set_aim_trim_all(float pitchDeg, float yawDeg) {
+    // PER WEAPON since s67. It was written to every profile at first, on the
+    // hope that one crosshair would serve all eight; the tester could not get
+    // them to agree, which is the same answer the grip offsets gave - each gun
+    // is held differently, so each needs its own. Writing the LIVE value only
+    // lets the existing profile stash/apply carry it per weapon, exactly like
+    // grip and placement. (Name kept so the header contract does not churn.)
+    g_pitchOffsetDeg[1].store(pitchDeg, std::memory_order_relaxed);
+    g_yawOffsetDeg[1].store(yawDeg, std::memory_order_relaxed);
+}
+
+void weapon_key_name(char* out, size_t count) {
+    if (!out || !count) return;
+    std::lock_guard<std::mutex> lock(g_weaponKeyUiMutex);
+    strncpy_s(out, count, g_weaponKeyUi, _TRUNCATE);
 }
 
 bool weapon_key_is(const char* name) {
@@ -1819,6 +2612,47 @@ void set_trim(int hand, float pitchDeg, float yawDeg) {
 bool active() {
     return g_enabled.load(std::memory_order_relaxed) && hook_live();
 }
+
+// F10 preference access. Called through the game-thread menu queue; no engine writes.
+float menu_read(menu::Setting id) {
+    using S = menu::Setting;
+    switch(id) {
+        case S::Reticle: return static_cast<float>(g_dot.load(std::memory_order_relaxed));
+        case S::ReticleDistance: return static_cast<float>(g_dotDistM.load(std::memory_order_relaxed));
+        case S::ReticleSize: return static_cast<float>(g_dotSizeDeg.load(std::memory_order_relaxed));
+        case S::Laser: return static_cast<float>(g_laser.load(std::memory_order_relaxed));
+        case S::LaserDots: return static_cast<float>(g_laserDots.load(std::memory_order_relaxed));
+        case S::LaserReach: return static_cast<float>(g_laserFarM.load(std::memory_order_relaxed));
+        case S::LaserSize: return static_cast<float>(g_laserSizeDeg.load(std::memory_order_relaxed));
+        case S::AimRuntimePose: return static_cast<float>(g_useAimPose.load(std::memory_order_relaxed));
+        case S::AimHandOrigin: return static_cast<float>(g_handOrigin.load(std::memory_order_relaxed));
+        case S::AimEnabled: return g_enabled.load(std::memory_order_relaxed);
+        case S::BarrelOrigin: return g_barrelOrigin.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        case S::BarrelAim: return g_barrelAim.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        case S::LaserInImage: return g_laserInImage.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+        default: return std::numeric_limits<float>::quiet_NaN();
+    }
+}
+bool menu_write(menu::Setting id, float value) {
+    using S = menu::Setting;
+    switch(id) {
+        case S::Reticle: g_dot.store(static_cast<decltype(g_dot.load())>(value), std::memory_order_relaxed); return true;
+        case S::ReticleDistance: g_dotDistM.store(static_cast<decltype(g_dotDistM.load())>(value), std::memory_order_relaxed); return true;
+        case S::ReticleSize: g_dotSizeDeg.store(static_cast<decltype(g_dotSizeDeg.load())>(value), std::memory_order_relaxed); return true;
+        case S::Laser: g_laser.store(static_cast<decltype(g_laser.load())>(value), std::memory_order_relaxed); return true;
+        case S::LaserDots: g_laserDots.store(static_cast<decltype(g_laserDots.load())>(value), std::memory_order_relaxed); return true;
+        case S::LaserReach: g_laserFarM.store(static_cast<decltype(g_laserFarM.load())>(value), std::memory_order_relaxed); return true;
+        case S::LaserSize: g_laserSizeDeg.store(static_cast<decltype(g_laserSizeDeg.load())>(value), std::memory_order_relaxed); return true;
+        case S::AimRuntimePose: g_useAimPose.store(static_cast<decltype(g_useAimPose.load())>(value), std::memory_order_relaxed); return true;
+        case S::AimHandOrigin: g_handOrigin.store(static_cast<decltype(g_handOrigin.load())>(value), std::memory_order_relaxed); return true;
+        case S::AimEnabled: g_pendingEnable.store(value!=0?1:0,std::memory_order_relaxed); return true;
+        case S::BarrelOrigin: g_barrelOrigin.store(value != 0, std::memory_order_relaxed); return true;
+        case S::BarrelAim: g_barrelAim.store(value != 0, std::memory_order_relaxed); return true;
+        case S::LaserInImage: g_laserInImage.store(value != 0, std::memory_order_relaxed); return true;
+        default: return false;
+    }
+}
+
 
 void draw_debug_ui() {
     if (!ImGui::CollapsingHeader("Decoupled aim (M6)", ImGuiTreeNodeFlags_DefaultOpen)) return;

@@ -32,7 +32,15 @@ void init(const bvr::pattern_scan::ProcessImage& image);
 // `handsActor` is the live AHands actor (validated by the caller). Game
 // thread, once per frame from hands::on_calcview. Returns false if the
 // skeleton could not be reached this frame (caller may fall back).
-bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int hand);
+// s77: actorWriteLoc is the actor LOCATION the caller is about to write, paired
+// with gp.rot as the rotation it is about to write. Pass it in mode 3, where we
+// own the actor; leave it null in mode 2, where the actor stays engine-placed
+// and a live read is the only truthful source. MEASURED: the engine changes the
+// rotation we wrote by pitch -24 yaw +32 roll -41 deg before the next frame sees
+// it (ACTORWATCH), so a live read is off by that much, and on the shoulder's
+// 40-70 UU lever that is 20-32 UU of displacement.
+bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int hand,
+           const float* actorWriteLoc = nullptr);
 
 // Re-write the values the last drive() produced. The stereo second pass runs
 // the ENGINE's CalcView again (which re-evaluates the skeleton over our
@@ -65,6 +73,48 @@ void release(const char* why);
 // Snapshot for the session-29 cinematic-edge instrument: what our drive left
 // behind at the moment a cutscene started or ended. Game thread.
 void debug_state(int* hiddenHand, unsigned long long* cacheAgeMs, bool* refValid);
+
+// s64 arm hide, mechanism half: model-space motion of one ENGINE-OWNED wrist
+// since the previous call, peak-held. Model space matters - the actor tracks the
+// camera every frame, so a world-space measurement reads "moving" constantly.
+//
+// RETURNS FALSE WHEN IT CANNOT ANSWER (both clusters driven). The caller must
+// treat that as "cannot say" and fail toward SHOWING the arms: the failure on
+// record is arms hidden for a whole scene, and there is no matching one for arms
+// shown for a frame. `outRaw` is the un-smoothed value, logged to calibrate the
+// threshold. Game thread. Derivation in ENGINE_NOTES.
+// Returns false until TWO samples exist - one reading is not a difference, and
+// calling that "still" hid the arms on the first frame of the first scene.
+// `outPos` is the sampled bone's own position, so a zero delta can be told apart
+// from an array that is no longer being evaluated. That distinction settled the
+// hide mechanism: the array does NOT stay live behind an actor hidden by
+// DrawScale3D (293 consecutive samples, 0 of 47 bones moving), which is why the
+// rig is hidden by collapsing bones with the actor left at full scale.
+// `outStale` is set when the bone still holds the collapse WE wrote, meaning the
+// engine has not re-evaluated since and there is no new pose to difference. The
+// caller must then leave the motion state untouched - it is not "no motion" and
+// it is certainly not the 5000-unit spike that differencing it produces.
+bool hand_motion(void* handsActor, float* outSmoothed, float* outRaw, float outPos[3],
+                 bool* outStale);
+
+// Ask the engine to re-evaluate the bone array this frame. Call once per frame
+// for as long as anything is READING the array while the drive is stood down -
+// release() sets the dirty byte once and then early-returns, so without this the
+// render pass stops rebuilding and every array-derived signal silently freezes.
+// See the banner in the .cpp for the measurement that made this necessary.
+void keep_evaluating(void* handsActor);
+
+// Hide the rig's GEOMETRY while leaving the actor in the render set, so the
+// engine keeps animating it and anything read from the bone array stays honest.
+// Call every frame for as long as it should stay hidden - it is write-only and
+// has no restore path, because the engine's own evaluation puts the authored
+// pose back the moment this stops. end_collapse() re-flags the array on the way
+// out. See the banner in the .cpp for the measurement behind it.
+void collapse_rig(void* handsActor);
+void end_collapse(void* handsActor);
+
+// Which bone hand_motion() is measuring, or -1 when both clusters are ours.
+int motion_bone();
 
 // Session 19: collapse the whole INACTIVE hand's cluster + sleeve while the
 // other hand drives (default ON; `vrhands hideinactive on|off`). The
@@ -103,20 +153,154 @@ void wskel_release(const char* why);
 // breathing (default ON; `vrhands swaykill on|off`). Real animations pass an
 // anchor-delta threshold and re-freeze when they settle. Measured baseline:
 // +-1.2 deg of barrel-direction wobble at idle without it.
+// s67 BRVR parity: replay the captured cluster pose VERBATIM instead of
+// retargeting it, and leave bone 43 to the engine. The actor (hands.cpp mode 3)
+// carries the rig to the controller, so the rig's internal pose stays exactly
+// as authored - which is what BRVR does and what this tree never has.
+// s67 per-weapon animation gate (BRVR's HandAnimSlot). When off, the reference
+// pose never adopts the engine's - used for the WRENCH, whose swing animation
+// fights manual melee. hands.cpp publishes this on every weapon switch.
+// s70: the per-STATE animation mask and the s68 canonical rest pose (with its
+// eased restore) are both GONE, along with the s69 anchor pin. They were one
+// chain of compensation: the mask cut adoption at `WeaponFiring`, which Hands.uc
+// leaves at the TOP of the recoil, so the reference stuck at the apex; the rest
+// pose put it back; the pin stopped the restored pose dragging the hand off the
+// controller. BRVR has none of them - it separates idle from real animation by
+// SIZE and lets a hold window carry adoption to the animation's settled end.
+// See ENGINE_NOTES "Session 70".
+
+// s70k arm solve: the shoulder joint (head-relative cm, per hand) and the
+// elbow's bend/smoothing. Persisted via hands.ini so headset tuning survives.
+void shoulder_cm(int hand, float* fwd, float* right, float* up);
+void set_shoulder_cm(int hand, float fwd, float right, float up);
+float elbow_out();
+void set_elbow_out(float v);
+// s81: which arm solver runs - true the Dishonored one (arm_ik.h), false s70i-s77's.
+bool arm_ik_v2();
+void set_arm_ik_v2(bool on);
+// s75: multiplies the authored arm segment lengths, sizing the rig's arm to the
+// PLAYER's. The rig's is fixed and the player's is not; when they disagree the
+// solve sits at full extension and the forearm covers the shortfall alone.
+float arm_scale();
+void set_arm_scale(float v);
+// s75: how far the forearm may pronate/supinate before it runs out, degrees.
+// The twist angle is accumulated across frames to kill the atan2 seam, and
+// without this it winds without bound. ~85 is the real joint's limit; 180
+// restores the old unlimited behaviour.
+float arm_twist_limit_deg();
+void set_arm_twist_limit_deg(float v);
+// s76: how far the HUMERUS may rotate at the shoulder, degrees - where the roll
+// past the forearm's limit goes. A hand reaches nearly 360 deg of roll out of
+// ~175 deg of forearm because internal shoulder rotation accompanies pronation.
+// 0 disables the split, so the forearm alone carries the twist and clamps: that
+// is the s75 behaviour, and it A/Bs the split against it.
+float humerus_twist_limit_deg();
+void set_humerus_twist_limit_deg(float v);
+unsigned elbow_smooth_ms();
+void set_elbow_smooth_ms(unsigned v);
+float elbow_follow_wrist();
+void set_elbow_follow_wrist(float v);
+
+// ---- s71: the free hand -----------------------------------------------------
+// begin_write_frame() must be called ONCE per frame before any drive: the
+// reapply cache is shared by both hands now, so exactly one caller may zero it.
+// drive_free_hand() then retargets the non-held hand's cluster onto its own
+// controller - BRVR's ArmHide_DriveFreeHand, whose difference from the held hand
+// is that it retargets where the held hand is replayed verbatim under the actor.
+// Offsets are per HAND, not per weapon, which is BRVR's shape.
+void begin_write_frame();
+// s71c: call after the actor write, when the transform the frame will render is
+// finally in memory. Reports how far the free hand's anchor ended up from the
+// point the drive asked for.
+// Pass BOTH: the transform the drive cancelled, and the one actually in the
+// actor right now. Their difference is what displaces the free hand.
+void free_hand_probe(const float actorLoc[3], const int32_t actorRot[3],
+                     const float liveLoc[3], const int32_t liveRot[3]);
+// actorLocNow/actorRotNow are the transform hands.cpp is ABOUT TO WRITE this
+// frame, not a read of the live actor. BRVR passes the same pair for the same
+// reason: the free hand's target cancels the actor exactly, and only if it is
+// the same actor the renderer uses. A frame-old read leaks the held hand's
+// rotation into the free hand.
+// s71y: gripFrameRot is the free controller's rotation WITHOUT the rotation
+// trim. The grip offset is expressed in it, so trimming the model's orientation
+// no longer drags the hand across the world - see the banner at its use.
+bool drive_free_hand(const FrameContext& ctx, void* handsActor, const GamePose& gp, int hand,
+                     const float actorLocNow[3], const FRotator& actorRotNow,
+                     const FRotator& gripFrameRot);
+void set_off_hand_tracked(bool on);
+bool off_hand_tracked();
+void off_hand_cm(int hand, float* fwd, float* right, float* up);
+void set_off_hand_cm(int hand, float fwd, float right, float up);
+void off_hand_rot_deg(int hand, float* pitch, float* yaw, float* roll);
+// s71n: the free hand has TWO position knobs, and they are not interchangeable.
+// off_hand_cm is applied along the hand's own axes and therefore moves the PIVOT;
+// off_hand_view_cm is applied in the view frame and only moves where it SITS.
+void off_hand_view_cm(int hand, float* fwd, float* right, float* up);
+void set_off_hand_view_cm(int hand, float fwd, float right, float up);
+void set_off_hand_rot_deg(int hand, float pitch, float yaw, float roll);
+
+void set_anim_allowed(bool on);
+bool anim_allowed();
+
+void set_freeze_only(bool on);
+bool freeze_only();
+
 void set_sway_kill(bool on);
 bool sway_kill();
 
 // Seam commands (game thread): status | list [n] | skel [hands|weapon] |
 // poke <idx> <dUU> |
 // freeze on|off | collapse on|off | ref | anchor <idx> | lcluster <lo> <hi> <anchor> |
+// attachrot on|off (s67: does the weapon-attach bone take our ROTATION, or only
+//   our position? On = today. Off = the BRVR shape, which writes position only
+//   to bone 43 because the attachment path re-derives the rest) |
 // log on|off (in-headset telemetry: head/controller/camera/actor/target/bone
 // samples at ~5 Hz so a headset session can be diagnosed from the log)
 void handle_command(const char* args);
+// s82 P1: the skeleton-evaluator probe (`vrbones evalprobe on`), once per CalcView with
+// the hands actor. A no-op while the probe is off.
+void eval_probe_tick(void* handsActor);
+
+// THE hand drive since s86 (one mode; docs/bioshock1/HANDS_DISHONORED.md). m4_frame, once
+// per CalcView: takes both hands' wrist poses (`gp[h]`: the controller's grip pose turned by
+// that hand's rotation trim, `valid[h]` when tracked), applies each hand's placement and
+// grip offsets, publishes the shoulders, and sets the dirty byte so the engine evaluates.
+// It never writes the actor. The composition itself runs in the evaluator hook
+// (m4_after_eval) and again at the scene build (m4_late, from hands::late_write).
+// m4_release hands the skeleton back.
+bool m4_frame(const FrameContext& ctx, void* handsActor, int held, const bool valid[2],
+              const GamePose gp[2], const GamePose raw[2]);
+void m4_after_eval();
+void m4_late();
+void m4_release();
+// s86g: `vrhands pivotprobe on|off` - the written palm read back from the engine's array,
+// taken to world, against the controller's grip point, 5 Hz per hand (PIVOT_SIM_PROTOCOL.md).
+void set_pivot_probe(bool on);
+bool pivot_probe();
+// Settings. One pair of shoulders: a shared centre (cm forward / right / up from the EYE)
+// and the total width between them; they stay exactly there (an arm that cannot reach
+// stretches before a shoulder moves). m4_arm_size is ONE size for both hands and both
+// arms, on the rig itself (0.83 = Dishonored's hand). m4_segment_lengths: the upper arm's
+// and the forearm's own lengths on top of that size (0.71 / 1.13 = Dishonored's fit).
+// m4_weapon_follows (default on) sizes the weapon by size / 0.8.
+void m4_shoulders(float* fwd, float* right, float* up, float* width);
+void set_m4_shoulders(float fwd, float right, float up, float width);
+float m4_arm_size();
+void set_m4_arm_size(float v);
+void m4_segment_lengths(float* upper, float* fore);
+void set_m4_segment_lengths(float upper, float fore);
+bool m4_weapon_follows();
+void set_m4_weapon_follows(bool on);
 
 // True while `vrbones log on` - camera.cpp and hands.cpp contribute their
 // raw-pose lines to the same telemetry stream (each site throttles itself to
 // ~5 Hz; the log timestamps correlate the lines of one sample).
 bool telemetry_on();
+
+// True while `vrbones probes on` (F10: "Diagnostic probes"). Gates the s71-s73
+// off-hand/arm probe families, which ship OFF - see the g_probes banner in
+// bones.cpp for what is inside the gate and what is deliberately outside it.
+bool probes_on();
 
 // |render-lock position delta| applied last frame, UU. POSITION-only by
 // construction (the lock never touches rotation) - `vraim synccheck` quotes it
@@ -131,5 +315,27 @@ bool barrel_ref_axis(float d0[3]);
 
 // Overlay section (render thread only).
 void draw_debug_ui();
+
+// s88: the arms mode from the console/simulator (0 the game's, 1 solved, 2 hidden).
+void set_arms_mode(int mode);
+// s89: the fist pivot and the grip calibration (hand_grip.h); both default ON.
+void set_fist_anchor(bool on);
+void set_grip_calibration(bool on);
+void set_head_anchor(bool on); // s90: the hands carry the camera's head offset (default ON)
+// s91: the socket bones written engine-side so the engine carries attachments with the drawn hand.
+void set_socket_write(bool on);
+// s91: the socket follow - effect sockets' offsets rewritten each frame onto the drawn hand.
+void set_socket_follow(bool on, bool axes);
+void set_beam_aim(int mode); // s91: 0 off, 1 on, 2 flip the axes' composition
+// s91: the cast effect's place on the palm, cm: toward the fingers, across the palm, out of the palm.
+void plasmid_fx_cm(float* along, float* across, float* out);
+void set_plasmid_fx_cm(float along, float across, float out);
+void set_sockets(int hand, const int* list, int count); // bones outside the hand's cluster are dropped
+void log_sockets();
+// s91: a world point into this actor's component space; a bone of its live array (component).
+bool world_to_component(void* actor, const float w[3], float out[3]);
+bool bone_component(void* actor, int idx, float p[3], float q[4]);
+// s91: a bone FName (index, number) on this actor's skeleton -> its bone index, or -1.
+int bone_index_for_name(void* actor, int32_t nameIdx, int32_t nameNum);
 
 } // namespace bvr::b1r::bones

@@ -2,6 +2,7 @@
 
 #include "core/hooks/pattern_scan.h"
 #include "core/input/swing.h"
+#include "core/ui/overlay.h"
 #include "core/util/log.h"
 
 #include <windows.h>
@@ -62,6 +63,81 @@ std::atomic<bool> g_pitchLiftOnBumpers{true};
 // sticks, which is the whole cross-game safety argument.
 std::atomic<float> g_moveYawOffDeg{0.0f};
 std::atomic<uint64_t> g_moveYawOffMs{0};
+
+// s63 MOVEMENT-STICK DEADZONE PRE-COMPENSATION, ported from the BRVR mod.
+//
+// THE BUG. The game applies its stick deadzone PER AXIS (0.225, from its own
+// User.ini bindings), not radially. Anything that ROTATES the movement vector
+// moves magnitude between the two axes, so the game's per-axis threshold then
+// bends the direction - by up to ~11 degrees - and snaps to a pure sidestep
+// once the forward component drops under the band.
+//
+// WHY IT SHOWS UP HERE. body.cpp's moveDirInstant (default ON) publishes the
+// not-yet-transferred body-yaw error every CalcView, and the rotation block
+// below turns the movement stick by it so the walk direction stays instant
+// while the body catches up under the slew cap. That rotation is exactly the
+// trigger: the error is only non-zero WHILE TURNING, and the stick is only
+// pushed WHILE WALKING - which is why the fault appears when doing both at once
+// and never when standing still. Reported as smooth turning that repeatedly
+// snaps a few degrees.
+//
+// s64: THIS CODE MOVED HERE FROM openxr_input.cpp, AND THE MOVE IS THE FIX. It
+// used to run on the raw XR stick, BEFORE the rotation below, so it compensated
+// the direction the player asked for while the game bent the ROTATED one. Modelled
+// against the 0.225 band, a 20 deg offset arrived as 9.3 at full push and 1.5 at
+// partial, and 5 and 10 deg arrived as ZERO. Rotating first is exact at every
+// angle. Applied only when we rotated, which is BRVR's rule: an unrotated stick
+// meets the game's own deadzone exactly as it always has.
+//
+// THE FIX. Split direction from magnitude, and pre-expand each axis so that
+// after the game subtracts its per-axis band what survives is proportional to
+// the direction actually asked for. The magnitude is what the player asked for
+// and must survive untouched; only the direction is being corrupted.
+//
+// NOT BY EDITING User.ini, which is BRVR's hard-won note: those are binding
+// lines carrying several bindings each (XENON_LTHUMB_XAXIS also holds
+// `Axis xLean DeadZone=0.4`), the file has multiple binding sections, and the
+// game rewrites it at exit. String surgery there risks breaking the controls
+// outright, for a value that can simply be inverted here.
+//
+// Core default is OFF so BS2 and Infinite are untouched; BS1 opts in from its
+// adapter (set_pad_brvr_defaults -> set_stick_precomp). With it off this whole
+// lane is unreachable and the composed pad is bit-identical, which is what
+// keeps the s64 move safe for the two games it was never judged on.
+std::atomic<bool> g_stickPrecomp{false};
+std::atomic<float> g_gameStickDeadzone{0.225f};
+
+void precomp_stick_deadzone(float& x, float& y) {
+    if (!g_stickPrecomp.load(std::memory_order_relaxed)) return;
+    const float d = g_gameStickDeadzone.load(std::memory_order_relaxed);
+    if (d <= 0.0f || d >= 0.95f) return;
+    const float mag = sqrtf(x * x + y * y);
+    if (mag < 1e-4f) return; // centred; leave it alone
+    const float ux = x / mag, uy = y / mag;
+    const float m = (mag > 1.0f) ? 1.0f : mag;
+
+    // s63 DEVIATION FROM BRVR, and revert it first if this feels wrong.
+    //
+    // The straight formula adds the whole band `d` the instant an axis leaves
+    // zero, so at an axis crossing that axis STEPS from 0 to +-0.225 in one
+    // frame - and lands exactly ON the game's threshold, where float rounding
+    // can dither between "inside the deadzone" and "just past it" from frame to
+    // frame. Walking near-straight while turning sweeps an axis through zero
+    // continuously, which is exactly when the residual jitter was reported.
+    //
+    // Ramping the band in over the first few percent of deflection removes the
+    // step without touching the direction anywhere it matters: past kRamp the
+    // result is bit-identical to BRVR's.
+    constexpr float kRamp = 0.06f;
+    auto axis = [&](float u) {
+        const float a = fabsf(u);
+        if (a < 1e-4f) return 0.0f;
+        const float t = (a >= kRamp) ? 1.0f : (a / kRamp);
+        return (u < 0.0f ? -1.0f : 1.0f) * (a * m * (1.0f - d) + d * t);
+    };
+    x = axis(ux);
+    y = axis(uy);
+}
 
 // ---- Session 30: the pitch SERVO, and why zeroing the stick was not enough ---
 //
@@ -264,7 +340,34 @@ Gamepad compose_synthetic(uint64_t now) {
     // (swing.cpp's gate is closed for every other holdable).
     if (bvr::input::swing::rt_pulse(now)) test.rt = 255;
 
-    return merge(syn, test);
+    Gamepad out = merge(syn, test);
+    // The F10 panel clicks with the RIGHT TRIGGER, and the right trigger is
+    // also fire. Swallow it for the GAME while the panel is up - and only it
+    // (user's call): sticks, faces and grips stay live, so you can still walk
+    // and turn with the panel open.
+    //
+    // It has to happen HERE and not where the XR pad is published: the overlay
+    // reads that same published pad to get the trigger, so zeroing it upstream
+    // would leave the panel with nothing to click with. This is the last point
+    // before the game sees anything, and it also catches the swing pulse above
+    // - a wrench swing should not fire while you are aiming at a checkbox.
+    //
+    // Session 74: ONLY under the controller-driven panel (BS1 opt-in). Without
+    // pad drive the trigger cannot click the panel anyway, and a panel that
+    // cannot be closed from inside the headset (no F10 there) would otherwise
+    // take fire and turning with it for the rest of the session - which is
+    // exactly what BS2 shipped into: right trigger and right stick dead after
+    // one F10 visit, everything else alive.
+    if (bvr::overlay::visible() && bvr::overlay::pad_drive()) {
+        out.rt = 0;
+        // ...and the right stick, which now scrolls the panel. Turning while
+        // reading a menu is not something anyone asked for, and leaving it
+        // live would mean every scroll also spun the view. The LEFT stick is
+        // deliberately untouched - walking with the panel open still works.
+        out.rx = 0;
+        out.ry = 0;
+    }
+    return out;
 }
 
 // The stick value the pitch kill substitutes for a hard zero. See the block
@@ -400,16 +503,73 @@ void compose_over(DWORD userIndex, XINPUT_STATE* xs, DWORD* result) {
             if (deg != 0.0f) {
                 const float r = deg * 0.01745329252f;
                 const float c = cosf(r), s = sinf(r);
-                const float x = static_cast<float>(out.lx);
-                const float y = static_cast<float>(out.ly);
-                const float xr = x * c + y * s;  // clockwise from above:
-                const float yr = y * c - x * s;  // +deg deflects forward toward +x
-                out.lx = static_cast<int16_t>(xr > 32767.0f    ? 32767
-                                              : xr < -32768.0f ? -32768
-                                                               : lroundf(xr));
-                out.ly = static_cast<int16_t>(yr > 32767.0f    ? 32767
-                                              : yr < -32768.0f ? -32768
-                                                               : lroundf(yr));
+                if (!g_stickPrecomp.load(std::memory_order_relaxed)) {
+                    // ---- LEGACY PATH: bit-identical to the pre-s64 composer ----
+                    // BS2 and Infinite BOTH publish a move-yaw offset
+                    // (bioshock2r/camera.cpp, bioshockinf/camera.cpp), so both
+                    // reach this block on every walking frame. Neither has ever
+                    // been in a headset with the normalised path below, so while
+                    // the pre-compensation is off they get the ORIGINAL integer
+                    // rotate, character for character.
+                    //
+                    // WHAT DIVERGED, because it is not the obvious thing. The
+                    // precomp call really is inert when the switch is off. The
+                    // 1/peak cap is not: it scales BOTH axes, where this clamps
+                    // each independently. merge() takes the larger-magnitude axis
+                    // from the PHYSICAL pad, which is square-ranged, so a real
+                    // stick at full diagonal arrives as (32767, 32767) - peak
+                    // 1.414 - and the cap pulls both axes down to 23170. That is
+                    // ~9600 units an axis, and it reads as diagonal movement
+                    // running ~29% slow WHILE TURNING (the offset is only
+                    // non-zero then). Caught in VOID's review of PR 51, against
+                    // an inertness claim that had been asserted and not checked.
+                    const float x = static_cast<float>(out.lx);
+                    const float y = static_cast<float>(out.ly);
+                    const float xr = x * c + y * s;  // clockwise from above:
+                    const float yr = y * c - x * s;  // +deg deflects forward toward +x
+                    out.lx = static_cast<int16_t>(xr > 32767.0f    ? 32767
+                                                  : xr < -32768.0f ? -32768
+                                                                   : lroundf(xr));
+                    out.ly = static_cast<int16_t>(yr > 32767.0f    ? 32767
+                                                  : yr < -32768.0f ? -32768
+                                                                   : lroundf(yr));
+                } else {
+                    // ---- BS1 PATH: normalised, capped, then pre-compensated ----
+                    // Normalised: the pre-compensation is defined on a unit stick.
+                    const float x = static_cast<float>(out.lx) / 32767.0f;
+                    const float y = static_cast<float>(out.ly) / 32767.0f;
+                    float xr = x * c + y * s;  // clockwise from above:
+                    float yr = y * c - x * s;  // +deg deflects forward toward +x
+
+                    // KEEP THE SPEED THE PLAYER ASKED FOR (BRVR). The pair the game
+                    // receives is a SQUARE - each axis clamps independently - while
+                    // this rotation is circular, so a diagonal rotated onto an axis
+                    // would be clipped by an angle-dependent amount. 1/peak caps
+                    // speed uniformly and keeps the direction. It belongs to THIS
+                    // path alone - the legacy branch above says what it costs a
+                    // game that never asked for it.
+                    {
+                        const float ax = fabsf(xr), ay = fabsf(yr);
+                        const float peak = (ax > ay) ? ax : ay;
+                        if (peak > 1.0f) {
+                            const float k = 1.0f / peak;
+                            xr *= k;
+                            yr *= k;
+                        }
+                    }
+
+                    // AFTER the rotation and only on this path - see the banner on
+                    // precomp_stick_deadzone.
+                    precomp_stick_deadzone(xr, yr);
+
+                    const float xs = xr * 32767.0f, ys = yr * 32767.0f;
+                    out.lx = static_cast<int16_t>(xs > 32767.0f    ? 32767
+                                                  : xs < -32768.0f ? -32768
+                                                                   : lroundf(xs));
+                    out.ly = static_cast<int16_t>(ys > 32767.0f    ? 32767
+                                                  : ys < -32768.0f ? -32768
+                                                                   : lroundf(ys));
+                }
             }
         }
     }
@@ -761,6 +921,9 @@ void set_pitch_kill(bool on) {
 bool pitch_kill() { return g_pitchKill.load(std::memory_order_relaxed); }
 
 float stick_deadzone() { return g_deadzone.load(std::memory_order_relaxed); }
+void set_stick_deadzone(float value) {
+    if(value >= 0.0f && value <= 0.4f) g_deadzone.store(value,std::memory_order_relaxed);
+}
 
 void last_composed_triggers(uint8_t* lt, uint8_t* rt) {
     uint16_t t = g_lastTriggers.load(std::memory_order_relaxed);
@@ -799,6 +962,66 @@ void set_ammo_mod(AmmoMod m) {
 PadProfile pad_profile() {
     return static_cast<PadProfile>(g_padProfile.load(std::memory_order_relaxed));
 }
+std::atomic<bool> g_padPassthroughDefault{false};
+bool pad_passthrough_default() {
+    return g_padPassthroughDefault.load(std::memory_order_relaxed);
+}
+void set_pad_passthrough_default(bool on) {
+    g_padPassthroughDefault.store(on, std::memory_order_relaxed);
+}
+
+std::atomic<bool> g_padBrvrDefaults{false};
+bool pad_brvr_defaults() { return g_padBrvrDefaults.load(std::memory_order_relaxed); }
+void set_pad_brvr_defaults(bool on) {
+    g_padBrvrDefaults.store(on, std::memory_order_relaxed);
+}
+
+bool stick_precomp() { return g_stickPrecomp.load(std::memory_order_relaxed); }
+void set_stick_precomp(bool on) {
+    g_stickPrecomp.store(on, std::memory_order_relaxed);
+}
+
+float game_stick_deadzone() { return g_gameStickDeadzone.load(std::memory_order_relaxed); }
+void set_game_stick_deadzone(float d) {
+    if (d < 0.0f) d = 0.0f;
+    if (d > 0.90f) d = 0.90f;
+    g_gameStickDeadzone.store(d, std::memory_order_relaxed);
+}
+
+// s63 control changes that are still BS1-only - see the banner in the header.
+// Every default here is the PRE-s63 value on purpose: these sit on core paths
+// that BioShock 2 and Infinite both walk, and neither has been tested with the
+// new behaviour. BS1 opts in from its adapter in one copyable block.
+std::atomic<bool> g_flickFourthDir{false};
+bool flick_fourth_direction() { return g_flickFourthDir.load(std::memory_order_relaxed); }
+void set_flick_fourth_direction(bool on) {
+    g_flickFourthDir.store(on, std::memory_order_relaxed);
+}
+
+std::atomic<bool> g_menuModCtxHelp{false};
+bool menu_modifier_context_help() {
+    return g_menuModCtxHelp.load(std::memory_order_relaxed);
+}
+void set_menu_modifier_context_help(bool on) {
+    g_menuModCtxHelp.store(on, std::memory_order_relaxed);
+}
+
+std::atomic<bool> g_chordTapPanel{false};
+bool chord_tap_opens_panel() { return g_chordTapPanel.load(std::memory_order_relaxed); }
+void set_chord_tap_opens_panel(bool on) {
+    g_chordTapPanel.store(on, std::memory_order_relaxed);
+}
+
+// 0.65 is main's kFlickPress. Clamped to a band that cannot make the lane
+// unreachable (too high) or fire on stick noise (too low).
+std::atomic<float> g_flickPress{0.65f};
+float flick_press_threshold() { return g_flickPress.load(std::memory_order_relaxed); }
+void set_flick_press_threshold(float v) {
+    if (v < 0.25f) v = 0.25f;
+    if (v > 0.95f) v = 0.95f;
+    g_flickPress.store(v, std::memory_order_relaxed);
+}
+
 void set_pad_profile(PadProfile p) {
     int v = static_cast<int>(p);
     if (v < 0 || v > static_cast<int>(PadProfile::Infinite))
@@ -1065,18 +1288,91 @@ void draw_debug_ui() {
             set_snap_angle_deg(sa);
     }
 
-    // Session 23: how you hold the ammo-select modifier. Thumbrest is the
-    // default; "Both" exists for controllers whose runtime reports no
-    // thumbrest at all (Pico, some SteamVR setups) - see xinput_bridge.h.
+    // ---- ammo select: the modifier, the stick, and what R3 does -----------
+    // s63: this used to be the session-23 "Ammo-select modifier" combo alone,
+    // which quietly stopped doing anything on BioShock 1 the moment that game
+    // started picking a real d-pad modifier - dpad_modifier() != Legacy means
+    // "explicit choice, no heuristic, no fallback", and the combo feeds only
+    // the heuristic. It is still the live control on BioShock 2 and Infinite,
+    // so it is shown when, and only when, it is the one being read.
+#ifdef BVR_WITH_OPENXR
+    ImGui::Separator();
+    {
+        // -1 (Legacy) is a real state but not something to OFFER: it is the
+        // pre-s63 heuristic, kept for games with no tested mode. Show it as a
+        // read-only row and let the combo pick a real mode from there.
+        const int md = dpad_modifier();
+        const char* dmNames[] = {"Off", "Right thumbrest", "R3 (right stick click)",
+                                 "Left grip", "Left thumbrest"};
+        int sel = (md >= 0 && md <= 4) ? md : 1; // preview a sane entry while legacy
+        if (md < 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "d-pad modifier: legacy heuristic (pick one below to "
+                               "take over)");
+        if (ImGui::Combo("D-pad modifier", &sel, dmNames, 5)) set_dpad_modifier(sel);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "HOLD this, then push the selecting stick up / down / left to pick an "
+                "ammo slot.\nThat stick stops walking (or turning) while held, so a "
+                "select can never move you.\n\n"
+                "The thumbrest is the capacitive pad above the face buttons - resting "
+                "your thumb\non it is enough, there is nothing to press.\n\n"
+                "Rift CV1 reports no thumbrest at all: use R3.\n"
+                "Index, Bigscreen Beyond, Varjo, Somnium: their \"thumbrest\" IS the "
+                "trackpad your\nthumb already rests on, and the modifier is HELD - so it "
+                "would suppress the\nstick continuously. Use R3 there too.\n\n"
+                "Same numbering as ControllerDpadModifier in BioshockVR.ini, and as the "
+                "BRVR mod.");
+
+        bool selLeft = dpad_select_left();
+        int side = selLeft ? 0 : 1;
+        const char* sideNames[] = {"Left stick (walking pauses)",
+                                   "Right stick (turning pauses)"};
+        if (ImGui::Combo("...selected with", &side, sideNames, 2))
+            set_dpad_select_left(side == 0);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Which stick picks the slot while the modifier is held.\n\n"
+                "Keep the modifier on the OPPOSITE hand from this stick: one thumb "
+                "cannot rest\non a thumbrest and push that same stick at the same time. "
+                "Choosing both on one\nhand logs a warning and will not work.\n\n"
+                "Left is where a d-pad lives on a real pad. Matches ControllerDpadFlip "
+                "(0 = left).");
+
+        // Only meaningful while the heuristic is the thing being read.
+        if (md < 0) {
+            int am = g_ammoMod.load(std::memory_order_relaxed);
+            const char* amNames[] = {"Right-stick click", "Left thumbrest", "Either"};
+            if (ImGui::Combo("Legacy modifier", &am, amNames, 3))
+                set_ammo_mod(static_cast<AmmoMod>(am));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The pre-s63 heuristic, read only while the d-pad "
+                                  "modifier above is legacy.\nThumbrest mode falls back "
+                                  "to the stick click until a real thumbrest\ntouch is "
+                                  "seen, so ammo select cannot go missing on a "
+                                  "controller\nthat has no thumbrest.");
+        }
+
+        bool r3j = jump_on_r3();
+        if (ImGui::Checkbox("Jump on R3 (right stick click)", &r3j)) set_jump_on_r3(r3j);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "ADDITIVE - the layout's own jump button still jumps.\n\n"
+                "The game binds R3 to zoom. A FOV zoom inside a headset is a comfort "
+                "hazard and\nis removed here, which leaves the click free.\n\n"
+                "Yields when R3 is the d-pad modifier above, or every ammo select would "
+                "also jump.\nPrecedence is modifier > jump > passthrough.\n\n"
+                "Matches JumpOnR3 in BioshockVR.ini.");
+        if (r3j && dpad_modifier() == 2)
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "   R3 is the modifier, so the jump lane is yielding");
+    }
+#else
     int am = g_ammoMod.load(std::memory_order_relaxed);
     const char* amNames[] = {"Right-stick click", "Left thumbrest", "Either"};
     if (ImGui::Combo("Ammo-select modifier", &am, amNames, 3))
         set_ammo_mod(static_cast<AmmoMod>(am));
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Hold this, then push the RIGHT stick up/down/left to pick an "
-                          "ammo slot.\nThe thumbrest is the pad above the buttons - it is "
-                          "the LEFT one,\nbecause your right thumb cannot rest and push the "
-                          "right stick at once.");
+#endif
 
     // Session 31 swing-to-attack (its own module; see core/input/swing.h).
     ImGui::Separator();

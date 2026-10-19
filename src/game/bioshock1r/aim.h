@@ -19,6 +19,7 @@
 
 #include "core/hooks/pattern_scan.h"
 #include "game/bioshock1r/frame_context.h"
+#include "game/bioshock1r/laser_draw.h"
 #include "game/bioshock1r/patterns.h"
 
 #include <cstdint>
@@ -36,6 +37,32 @@ void init(const bvr::pattern_scan::ProcessImage& image, const patterns::Symbols&
 // recenter pose, same game yaw, same world scale - so the aim ray and the
 // camera can never disagree about where the player is standing.
 void on_calcview(const FrameContext& ctx);
+
+// s67 CROSSHAIR trim, for the in-headset tuner (BRVR calls it CursorOffset).
+// This is the AIM ray: the laser, the dot and the bullet all come off it, so
+// moving it moves all three together by construction.
+// s70d: PER WEAPON AGAIN. The global crosshair was tried and reverted.
+//
+// s70 made it global at the tester's request - "the crosshair is a global
+// position", the one deviation they wanted from BRVR. Tested, and the report was
+// "now my crosshair is way off for all of my weapons".
+//
+// It is the third independent time this answer has come back the same way:
+// s67 tried a global crosshair and recorded that it "does not [serve every gun],
+// for the same reason the grip offsets are per weapon"; BRVR itself keys
+// cursorRot per slot AND per plasmid, in the config the tester calls perfect;
+// and now s70. The seeded table says why in one line - the weapons span 0.83 to
+// -6.67 in pitch and -6.70 to -14.70 in yaw, and the plasmids sit at -11.00 and
+// +37.00. A single number cannot be right for a set that wide.
+//
+// If it is wanted global again, the thing to change is not this: give the tuner
+// a way to copy one weapon's trim to all of them, so they are all THE SAME by
+// choice while each stays individually settable.
+void aim_trim_deg(int hand, float* pitchDeg, float* yawDeg);
+void set_aim_trim_all(float pitchDeg, float yawDeg);
+// s70n: per hand. set_aim_trim_all writes hand 1 whatever you ask, which is why
+// the numpad's crosshair mode could never move a plasmid.
+void set_aim_trim(int hand, float pitchDeg, float yawDeg);
 
 // Seam command handler: args after the "vraim" verb (game thread).
 //   on | off | status
@@ -69,6 +96,15 @@ void draw_debug_ui();
 // True while any seam hook is installed and enabled.
 bool hook_live();
 
+// s91: the hand's aim ray (world origin and unit direction) as the fire seams use it; false when
+// aim is off, outside gameplay, or the ray is stale. hand 0 = left (plasmid), 1 = right.
+bool hand_ray(int hand, float origin[3], float dir[3]);
+
+// 2026-10-14: this frame's laser and reticle on the fire ray, in world UU, for the in-image
+// laser (laser_draw.h). Game thread: temporal.cpp's note_camera carries it with the build.
+// Invalid when neither would show, or when the in-image laser is switched off.
+bool laser_segment(laser_draw::Segment* out);
+
 // The weapon object the trigger-keyed hand map currently attributes to the
 // RIGHT hand - i.e. the equipped gun, once it has fired at least once. Null
 // until then, and cleared on world change. Game thread only. The M7 viewmodel
@@ -79,6 +115,10 @@ void* learned_weapon_object();
 // is the equipped holdable (the key is maintained from Hands.CurrentHoldable).
 // Session 31's swing gesture gates on weapon_key_is("Wrench"). Game thread.
 bool weapon_key_is(const char* name);
+
+// The active weapon profile's key, for logging. Writes "-" when none is
+// resolved. Safe from any thread (the name is mutex-guarded).
+void weapon_key_name(char* out, size_t count);
 
 // The live aim trim (degrees), PER HAND (0 = left/plasmid, 1 = right/weapon)
 // since session 16 part 3 - shared so the laser, the fire ray and the M7

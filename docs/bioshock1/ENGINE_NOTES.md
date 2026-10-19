@@ -14,7 +14,7 @@ Game build reference: `BioshockHD.exe`, 21,214,720 bytes, linker timestamp 2022-
   **LAA flag: YES** (Characteristics 0x0122 - verified 2026-07-23 via `tools/check-laa.ps1`).
   4 GB address space available for stereo render targets.
 - **D3D11 renderer confirmed live at runtime** (2026-07-23, first Present hook log):
-  feature level 0xB000 (11_0), backbuffer DXGI format 28 (R8G8B8A8_UNORM), 2560×1440,
+  feature level 0xB000 (11_0), backbuffer DXGI format 28 (R8G8B8A8_UNORM), 2560Ãƒâ€”1440,
   `windowed=0` - the game defaults to **exclusive fullscreen** (relevant to DR-7: borderless
   test still pending). D3D9 fallback path exists in the binary but is not the default.
 - Renderer single-threaded by default (`UseMultithreadedRendering=False` in Default.ini).
@@ -29,7 +29,7 @@ Game build reference: `BioshockHD.exe`, 21,214,720 bytes, linker timestamp 2022-
 
 | Name | Pattern / method | Module | Build | Found by | Status | Date |
 |---|---|---|---|---|---|---|
-| `APlayerController::eventPlayerCalcView` | FName-chain: find wide string `"PlayerCalcView"` → its FName-init xref → `89 0D` (`MOV [imm32], ECX`) store of the FName index → walk xrefs back to MSVC prologue `CC CC CC 55 8B EC` | BioshockHD.exe | 2022-04-13 | ported from itsloopyo/bioshock-remastered-headtracking `src/memory.rs` (MIT); C++ port: `core/hooks/pattern_scan.cpp` used by `game/bioshock1r/patterns.cpp` | **RESOLVED live: RVA 0x1BE7A0** (scan: 1 wide-string match, 1 string xref, FName global +3 xrefs, exactly 1 candidate past the init-site filter). Exe loads rebased (ASLR observed, base 0x0FB20000) - RVA is the stable identifier; the live-memory scan is relocation-transparent. | 2026-07-23 |
+| `APlayerController::eventPlayerCalcView` | FName-chain: find wide string `"PlayerCalcView"` Ã¢â€ â€™ its FName-init xref Ã¢â€ â€™ `89 0D` (`MOV [imm32], ECX`) store of the FName index Ã¢â€ â€™ walk xrefs back to MSVC prologue `CC CC CC 55 8B EC` | BioshockHD.exe | 2022-04-13 | ported from itsloopyo/bioshock-remastered-headtracking `src/memory.rs` (MIT); C++ port: `core/hooks/pattern_scan.cpp` used by `game/bioshock1r/patterns.cpp` | **RESOLVED live: RVA 0x1BE7A0** (scan: 1 wide-string match, 1 string xref, FName global +3 xrefs, exactly 1 candidate past the init-site filter). Exe loads rebased (ASLR observed, base 0x0FB20000) - RVA is the stable identifier; the live-memory scan is relocation-transparent. | 2026-07-23 |
 | PlayerController FOV (live) | `PlayerController + 0xE0` (float, degrees) | BioshockHD.exe | 2022-04-13 | itsloopyo `FOV_LIVE_OFFSET`; `kFovLiveOffset` in `patterns.h` | **readable, but NOT consumed by the renderer.** Reads 100.0 by default. 2026-07-24 automated flat A/B (command-file seam + window screenshots): writes of 60/137/140 leave the rendered frame pixel-identical, in real gameplay AND the menu attract scene, under BOTH `HorizontalFOVLock` states. The earlier "override widens view" (DR-4) was observed only through the VR projection layer, where the fov CLAIM follows the written value - a claim-side artifact, retracted. The field also does not mirror the video-option FOV (option applied while field kept reading 100). In-headset swim calibration measured the true render at ~100 = the settings value. Treat this field as telemetry-only; the real control is the video option (see Config/ini facts). | 2026-07-24 |
 | `UShockUserSettings*` global | static pointer at **RVA 0x136AFA0** (`.data`); the object's **`+0x8C` = HorizontalFOV (int32, degrees)** | BioshockHD.exe | 2022-04-13 | runtime value-scan narrowing via the command seam (`memscani 130` -> user changed the video option to 100 then 117 through the in-game UI -> `memrescani` collapsed 662 candidates to 4 stable copies -> per-copy poke + screenshot img-diff found the consumed one -> `memptr` found the static root -> RTTI walk `vtable -> COL -> TypeDescriptor` read `.?AVUShockUserSettings@@`) | **RESOLVED + CONSUMED PER FRAME.** The renderer reads this field live: poking it mid-game changes the render immediately, no options APPLY needed. **NO code clamp past the UI cap: 145 renders wider than 130** (monotonic img-diff 117->130->145). Integrity check for resolution: the object's vtable == exe base + **0xDA3878**. NOTE the field is an **int32** - an ini float would serialize as `130.000000`, the bare `130` gave the type away; float scans cannot see it. `UD3DRenderDevice11` (vtable RVA 0xE38E7C) keeps a passive copy at `+0x74` - poking that changes nothing; two further copies (one heap-rooted, one at `[0x136A370]+0xCC`) are also passive. | 2026-07-24 |
 
@@ -37,9 +37,9 @@ Game build reference: `BioshockHD.exe`, 21,214,720 bytes, linker timestamp 2022-
 
 ## Known structures & conventions
 
-- **FRotator** = 3×i32 `{Pitch, Yaw, Roll}`, 65536 units per full turn. Roll is
+- **FRotator** = 3Ãƒâ€”i32 `{Pitch, Yaw, Roll}`, 65536 units per full turn. Roll is
   clockwise-positive. UE convention: forward = +X, right = +Y, up = +Z.
-- **FVector** = 3×float, Unreal units. World scale unknown - assume ~50 UU/m until calibrated
+- **FVector** = 3Ãƒâ€”float, Unreal units. World scale unknown - assume ~50 UU/m until calibrated
   in M3 (config `worldScale`).
 - `eventPlayerCalcView` hook signature (thiscall):
   `(APlayerController* this, AActor** view_actor, FVector* camera_location, FRotator* camera_rotation)`
@@ -1495,9 +1495,22 @@ BACK=ShowContextHelp, DPAD_RIGHT=hints. **DPAD_UP and DPAD_DOWN cycle the
 equipped weapon's AMMO TYPE** (CallHudFunction DPadUp/DownPressed - flat-proven:
 00 Buck -> Electric Buck -> Exploding Buck on the shotgun). The VR bindings
 re-route the face buttons XR-side (openxr_input.cpp): Touch A->XInput Y (jump),
-B->A (use), Y->B (heal), X->X; right-stick Y flicks pulse DPAD_UP/DOWN for ammo
-(rising edge past 0.65 pre-deadzone, re-arm inside 0.30, 300 ms cooldown,
-suppressed while a grip is held - the radials read the stick).
+B->A (use), Y->B (heal), X->X.
+
+**The d-pad lane (revised 2026-08-22).** Held modifier + the selecting stick,
+dominant axis past 0.5 pre-deadzone, suppressed while a grip is held (the
+radials read the stick). Emission is **per direction**, because the two kinds of
+binding sit on the same d-pad:
+
+| Direction | Binding | Emission |
+|---|---|---|
+| UP / DOWN | ammo type, and it **CYCLES** | **PULSED** - re-arm inside 0.30, 300 ms cooldown. A held cycle does not settle, it spins |
+| LEFT | nothing verified | pulsed |
+| RIGHT | **hints** - and holding it ~0.5 s is how the **MAP** opens | **HELD** |
+
+`PadMap::flickHoldBits` is the switch. See "The d-pad must be HELD" below for
+why the map was unreachable before this, and for BRVR's independent finding of
+the same thing.
 
 ### Hide-inactive: the attach bone must never be scaled
 
@@ -1726,31 +1739,22 @@ re-homing experiment.
 
 ### The foreground pass decoded: a second scene node, and the fovA zoom-pull lever (session 21)
 
-**Architecture (dump stack-diff + capstone, all constants in patterns.h
-"FOREGROUND SCENE NODE"):** the fg pass is a SECOND SCENE NODE flowing
-through the SAME render machinery as the world (fg and world skeletal draws
-share the whole draw layer; a per-section transform-provider virtual at
-vtbl+0x20 does the bake). The scene build (0x4CCE70) allocates a 0x400-byte
-fg node from the frame pool every build and constructs it at 0x56DC30 with
-MEASURED argument semantics: (parentScene, &scene.view@+0x118, x,
-vec3 cameraLoc, rotator cameraRot, float fovA <- PC+0x45C, float fovB <-
-PC+0x460), storing it at scene+0x1B0 (vtable 0xE1846C). The finisher
-(0x56DD90) builds the node's view matrix at +0x150 (+ inverse at +0x190,
-world-projection diag at +0x1D0) FROM THE LOC/ROT ARGS; the fovs land at
-+0x3F0/+0x3F4. The ctor runs BEFORE CalcView inside each build (call sites
-build+0xD59 vs +0xF1A).
+**Architecture (corrected after run ten, 2026-10-11):** the historical "foreground
+scene node" name is misleading. The build at 0x4CCE70 calls PlayerCalcView at
+0x4CCF5D, then constructs FCameraSceneNode at 0x56DC30 (call site 0x4CDC31),
+assigns FPlayerSceneNode's vtable 0xE1846C and submits that player scene. It is
+not an independent hands-only camera. The constructor stores absolute location
+at +0x310 and rotation at +0x3E4; its finisher 0x56DD90 builds view +0x150 and
+inverse +0x190. FOVs land at +0x3F0/+0x3F4. The old claim that this constructor
+ran BEFORE CalcView was false; the later call at 0x4CDD85 is not PlayerCalcView.
+See the tenth-run derivation below for binary provenance and the resulting fix.
 
-**The fg camera inputs are ALREADY world-synced per eye** (pass-labeled
-ctor-arg capture, `vrfgnode on` + `dump`): pass 1's node receives the LEFT
-eye camera, pass 2's the RIGHT (values match apply_eye_offset's +-3.17 UU
-at the live yaw exactly), rotation = the DRIVEN camera rotator. Two raised
-hypotheses measured and KILLED the same night: (a) "fg view = stale
-pre-drive camera" - simhead sweep showed the DRIVEN yaw/pitch in the args;
-(b) "crossed eyes under SR" (each pass getting the sibling's camera - would
-have inverted rig disparity) - the pass-labeled capture shows correct-eye
-delivery. The `vrfgnode sync on` substitution (feeds the ctor camera.cpp's
-per-eye stash) is therefore a measured flat-static NO-OP; kept default-OFF
-as an in-headset latency A/B only.
+The session-21 pass-labeled capture already reported correct per-eye camera
+arguments: left on pass 1, right on pass 2, driven rotation. Its reported flat
+`vrfgnode sync on` NO-OP did not prove a stale-camera defect. The eighth/ninth-run
+interpretation that the arms were necessarily rendered with the other eye was
+therefore unsupported. The fovA experiment below remains the historical measured
+result; do not infer a hands-only node from the old instrument's name.
 
 **THE LEVER - the fovA/fovB pair IS the fg zoom-pull.** fovA (from
 PC+0x45C, engine-restamped to 75.0 every frame - unpokeable as data; the
@@ -1896,6 +1900,530 @@ Also this round: the user's fixed LEFT-hand calibration (aim trim
 baked as CODE DEFAULTS (their explicit ask); their four live profiles
 rescued to weapons.ini via wsave before anything could drop them (the run
 had not pressed save).
+
+## Session 67 - the viewmodel drive ARCHITECTURE, and the Hands state machine
+
+### The desync was never an offset
+
+The BS1 viewmodel tracked the controller but swung on an oval as the wrist
+rolled: zero error at 0 deg, worst at 180, closed again at 360. Two sessions of
+offset, pose and trim tuning never touched it, and every stage measured clean -
+because the fault was structural.
+
+**The two mods drive the rig in opposite directions.** BRVR moves the ACTOR and
+leaves the skeleton alone: the hand cluster is replayed verbatim (frozen), bone
+43 takes position but not rotation, and the actor transform carries the whole
+assembly to the controller, so the rig's internal pose is always exactly as
+authored. Named by BRVR's own log rather than by reasoning:
+
+```
+>>> WEAPONHAND: freezing the RIGHT cluster, bones 27-44.
+>>> WEAPONHAND: pose settled after 359 ms (rig went still) -- freezing from here.
+>>> B43: attach rotation drift 1.29 deg (cluster frozen; this bone is still the engine's)
+```
+
+This tree did the inverse - actor left where `Hands.UpdateLocation` pins it (on
+the camera, every frame), cluster 27-44 retargeted inside it, bone 43 included,
+about a reference that is itself a snapshot of an animated pose. Source: BRVR
+`Camera/CameraHook.cpp` `DriveHands` and `Hands/ArmHide.cpp`.
+
+`vrhands mode brvr` (mode 3) is that architecture and is now the shipped
+default: position from the GRIP pose, rotation from the AIM pose, grip offset
+SUBTRACTED along the model axes, cluster frozen, bone 43 position-only.
+
+### The grip offset IS the pivot - and that is why tuning it could never work
+
+A body point renders at `gp.loc + R(theta) * (G - gripOffset)`, so the offset
+decides which mesh point stays still. Using it to correct the gun's HEIGHT
+displaces the pivot by the same amount, which becomes an orbit the moment the
+wrist rotates. Measured this session: a 15 cm height correction bought an 8 inch
+orbit (tester: +4 in at 0 deg, -12 in at 180 - midpoint -4, amplitude 8).
+
+So placement was split onto its own knob, applied in the VIEW frame after the
+model transform, where it cannot create a lever. **Two knobs, two jobs: grip =
+where it pivots, view = where it sits.** Anyone tempted to fix a height problem
+with the grip offset should read this paragraph first.
+
+### The idle animation is a WEIGHTED RANDOM draw
+
+`Holdable.uc`:
+
+```uc
+var config travel array<name>  IdlingHandsAnim;
+var config travel array<float> IdlingHandsAnimWeight;
+```
+
+`GetIdlingHandsAnim()` returns a weighted-random entry. `Hands.uc`'s
+`WeaponIdling` loops it, and skips the loop entirely when the name is `'None'`.
+Every return to idle can therefore settle the rig somewhere different - which is
+the "crosshair moves randomly between shots" report, and the randomness is the
+game's rather than the mod's. BRVR's `IdleAnimMode=1` exists for exactly this;
+its own config echo reads "(all entries -> entry[0], kills the wrench slap)".
+
+Neighbouring `config travel` properties on `Holdable`, all settable by name
+through the engine SET seam (no offsets needed, so they survive Epic and GOG):
+`EquippingHandsAnim` (the cycle on equip), `AdditiveHandBobAnim`,
+`UnEquippingHandsAnim`, `IdlingAnim`, `AttachBone`.
+
+### Every plasmid has its own idle FIDGET, and that is what a late capture samples
+
+`Hands.uc`'s `AbilityIdling` (:1556) starts the idle animation through
+`PlayAnimationOnChannelInstantEaseIn(0, CurrentAbility.GetIdlingAnim(), 4)`, and
+`Ability::GetIdlingAnim()` draws a WEIGHTED RANDOM entry from
+`IdlingAnimationName[]` - the same shape as `Holdable::GetIdlingHandsAnim()` for
+weapons. What each ability declares differs:
+
+| ability | `IdlingAnimationName` | source |
+|---|---|---|
+| `ElectricBoltAbility` | `ElectrokineticBolt_Fidget` (100), `..._Accent_A` (10) | its own defaults |
+| **`TelekinesisAbility`** | **none - inherits `Generic_Fidget`** | `Ability.uc:165` |
+| (no EVE) | `NoEve_Fidget` via `AbilityGenericIdling` (:1606, ease rate 8) | `Hands.uc:1834` |
+
+**Consequence for the viewmodel drive.** Any reference capture that samples the
+rig AFTER `Idling` begins is sampling a frame of that fidget, and each plasmid's
+fidget puts the hand somewhere different. A fixed post-equip window therefore
+lands correctly for one plasmid and wrongly for another with nothing configurable
+between them - measured 2026-08-27 as `Tele -> Weapon -> Tele` reliably wrong while
+`Electro -> Weapon -> Electro` was reliably fine.
+
+**The equip-END pose is the `Idling` EDGE**, the last frame before any fidget.
+Capture there and stop adopting; sampling later samples deeper into the fidget.
+Continuing to adopt through that window is also, exactly, what plays "one cycle of
+the idle animation" into the rig on every equip - one mechanism, both defects.
+
+A plasmid rig also never goes STILL: the fidget animates it continuously. Measured
+2156 ms to reach 1.24 deg against a +-1.2 deg idle envelope, so any "wait for the
+pose to settle" test crosses its threshold at random. Do not build one.
+
+### Hands state machine - DERIVED, not hardcoded
+
+`ShockGame.Hands` is a UnrealScript state machine; gameplay code keys off
+`GetHands().GetStateName()`. UE2 keeps the current state in the object's
+`FStateFrame`, and the offsets differ per build.
+
+`hands_state.cpp` derives both by sweeping candidate pointers off the Hands
+actor and accepting only the pair whose `UState` name resolves, through GNames,
+to a state `Hands.uc` actually declares. A wrong offset cannot pass that test,
+so no number is carried between builds or storefronts. Uses the UObject layout
+already recorded here: name index `+0x28`, class `+0x30`.
+
+The states, from `Hands.uc`: `HandsOffscreen` (auto), `WeaponEquipping`,
+`WeaponIdling`, `WeaponFiring`, `PostWeaponFiring`, `WeaponReloading`,
+`ProceduralWeaponReloading`, `WeaponUnEquipping`, the zoom quartet, the ability
+equivalents, `InjectingEve`, `UsingGathererTool`, `ExorcisingGatherer`,
+`PlayingScriptedHandAnimation`.
+
+**2026-10-14 - how a reload plays (the corpus: `Hands.uc`, `Weapon.uc`, `PlayerWeapon.uc`).**
+`ReloadWeapon()` is `ExecuteStateTransition('ReloadWeapon')`. `WeaponReloading` (Hands.uc:1242)
+calls `PlayerWeapon.PlayReloadingAnimations()` and then `FinishAnimation` on BOTH the hands'
+and the weapon's handle before it transitions, so **unlike `WeaponFiring` it lasts the whole
+clip** - the state is a sound gate for the reload's start and end. `PlayReloadingAnimations`
+goes through `PlayWeaponAnimations(handsAnim, weaponAnim, holderAnim, altFireAttachmentAnim,
+strictlySuperiorAttachmentAnim, rate, , easeIn)`: one clip on the Hands actor (channel 0), its
+partner on the weapon actor's own skeleton (the magazine, the drum, the bolt) and one on the
+third-person holder; each picked per reload rate (`GetAnimationForRate`, the reload upgrades),
+empty vs not-empty. **Three-part reloads** (`ShouldUseThreePartReloading`, the shell-fed guns)
+play start, a loop per round, then finish INSIDE the one `PlayReloadingAnimations` call, so the
+Hands state stays `WeaponReloading` from the first shell to the last: one hand-back, no gap.
+`ProceduralWeaponReloading` (:1269) is the same reload entered with the weapon hidden (it unhides
+it and plays with ease-in 0). The hand bob is a separate ADDITIVE clip on channel 2
+(`kHandBobAnimationChannel`, Hands.uc:314), weighted by the pawn's speed, so it rides on top of a
+reload. The clips are authored in the camera's frame: both hands and the gun move together in
+front of the face, which is why the reload is played at the gun in VR (handback.h).
+
+**Session 68 - where the states EXIT, which is the part the policy got wrong.**
+`WeaponFiring` (Hands.uc:1184) runs `PlayWeaponFiringAnimations()` and then
+`TransitionToNextStateInSequence()`; `PostWeaponFiring` (:1210) is a single
+`PostFired()` call and another transition. Neither waits for the gun to come back
+down, so **the state leaves the adopt mask at the TOP of the recoil, not at its
+end.** s67's policy merely ceased adopting there, which left the reference at the
+apex and froze the pistol until a weapon switch - and `Firing -> Reloading` is the
+same exit, which is why the ammo-out freeze and the shotgun's first reload had the
+same shape.
+
+`WeaponIdling` (:1147) is the counterpart and the only state that means "the
+animation is over": it re-reads the active holdable, plays the idling anim and
+LOOPS (`goto J0xBE`), redrawing `GetIdlingHandsAnim()` each time round - which is
+the weighted-random draw recorded above, and why the loop's pose cannot be trusted
+as a reference more than once.
+
+s68 uses both facts: capture ONE canonical rest during `WeaponIdling` per holdable
+and ease back to it when an adopted state exits. Design rationale in
+`ARCHITECTURE.md`, decision log 2026-08-27.
+
+**Session 68c - `Idling` is where the idle animation STARTS.** Both `WeaponIdling`
+(:1147) and `AbilityIdling` (:1556) begin the idle through an EASE-IN
+(`PlayAnimationOnChannelFlatEaseIn` / `...InstantEaseIn`), so on the first `Idling`
+frame the rig is still blending out of the equip pose. Anything captured there is
+a partial blend. The ease RATE differs per path - `AbilityIdling` at 4,
+`AbilityGenericIdling` at 8 - so a fixed capture instant lands correctly for one
+plasmid and wrong for another with nothing configurable between them. Capture when
+the pose STOPS MOVING, not on the state edge.
+
+### ROLLCHECK's "drift" is not an angle while an animation is blending
+
+`ROLLCHECK` reports `2*acos(|w|)` of the delta between our write and what is
+there now, plus the delta's imaginary parts. During a plasmid animation it reads:
+
+```
+drifted 16.64 deg (local x +0.00 y +0.00 z -0.00)
+```
+
+**Those cannot both be true of a unit quaternion.** With x=y=z=0 a unit quat has
+w=+-1 and the angle is zero. w = cos(8.32 deg) = 0.9895 with zero imaginary parts
+means the delta is not unit - the rotation is UNCHANGED and only the MAGNITUDE
+differs, by about 1%.
+
+That is `PlayAnimationOnChannelInstantEaseIn` leaving a non-normalised blend
+quaternion in the bank while it eases, which is ordinary for an nlerp. **The
+engine is not overwriting our bone write during an animation.** Read the
+imaginary parts before believing the angle; a large `drifted` with a zero
+component split is a denormalisation, not a fight.
+
+Recorded because it was read as a fight twice and produced a fix for a
+non-problem - and then, worse, because the same fact was known and NOT applied
+one commit later.
+
+**Anything that consumes a bone quat must normalise it.** `conj()` is only the
+inverse of a UNIT quaternion; for a non-unit one the inverse is `conj(q)/|q|^2`.
+Build a correction out of `conj()` on a mid-blend quat and it comes out non-unit,
+after which `qts_rotate()` scales every offset it touches by `|q|^2` and
+`quat_mul()` compounds the error into every bone downstream. The rig is skinned
+on the assumption these are rotations, so the visible result is stretched
+geometry - spikes shooting out of the hand - rather than anything that reads as a
+wrong angle. Normalise the correction, and normalise the per-bone product.
+
+**And that rule binds the INSTRUMENTS, not just the drive path.** The drive path
+was normalised in `825ced6`; the two always-on probes that read the same bank
+were not, and were still lying afterwards:
+
+- `quat_angle_deg()` took a raw dot product of two bank quats. That dot is
+  `|a||b|cos(theta/2)`, so it errs in both directions: magnitudes above 1 inflate
+  it, the `dot > 1` clamp fires, and it reports **0 deg while the bones genuinely
+  differ**; magnitudes below 1 deflate it and it **invents an angle** out of a
+  pure magnitude difference. The second case is the `ROLLCHECK` lie in another
+  form.
+- `ROLLCHECK` itself built `d = conj(qLastWritten) * cur` and read `d[3]` as
+  `cos(theta/2)` without normalising `d` - which is precisely how it produced
+  `drifted 16.64 deg (local x +0.00 y +0.00 z -0.00)`. Both readings cannot be
+  true of a rotation, and the rotation was in fact unchanged.
+
+The `quat_angle_deg()` case is the sharper one, because the `ANIMPIN` telemetry
+**gates** on its result (`angOff > 2.0`): a lying angle decides whether the line
+prints at all, and an instrument that chooses its own visibility cannot be
+checked against its own silence. A test whose only readout is a gated log line is
+worth nothing until the gate is trustworthy.
+
+**The general lesson: when a fix establishes an invariant, grep for every
+consumer of the thing the invariant is about - the diagnostics included.** The
+probes are what the next session reasons from, so a lying probe outlives the bug
+it was pointed at.
+
+## Session 71: the free hand retargets where the held hand replays
+
+Source: BRVR's `DriveFreeHand` (CameraHook.cpp:2537) -> `ArmHide_DriveFreeHand`
+(ArmHide.cpp:1565) -> `WriteCluster`. Cited here because BS1 had no off-hand
+concept at all; the other cluster was collapsed to zero scale and parked 5000
+units below the actor.
+
+**One WriteCluster, two shapes, and the difference is the whole design.**
+
+| | held hand | free hand |
+|---|---|---|
+| cluster | replayed VERBATIM (fed its own wrist, so the delta is identity) | RETARGETED to a controller-derived target |
+| carried by | the ACTOR | nothing - the actor is already carrying the held hand |
+
+So the free hand's bones are written as `inv(R_actor) * (worldTarget -
+actorLoc)`, which divides the actor out exactly.
+
+**That cancellation makes the free hand a far better INSTRUMENT than the held
+hand.** The held hand goes wherever the actor points and therefore cannot reveal
+an actor error - any mismatch just moves the whole rig, which reads as vague
+desync. The free hand is computed against a SPECIFIC actor, so a mismatch shows
+as an orbit about the actor position, with a magnitude of `|worldTarget -
+actorLoc| x mismatch`: at arm's length (50-100 UU) even 10 deg is 10-17 UU of
+visible swing. Rotation stays correct while position swings, because orientation
+is written per bone and lands, while position is what gets rotated.
+
+Two details from BRVR worth keeping:
+
+- **Grip pose, not aim.** *"The aim pose is where a weapon would shoot; on most controllers it is tilted tens of degrees off the hand. A bare hand wants the pose that describes the hand."*
+- **The actor transform is PASSED IN, never read.** `DriveFreeHand` takes `want` and `wx/wy/wz` as arguments, and its call site says why it runs last: *"Deliberately LAST, because it consumes `want` and wx/wy/wz - the actor rotation and location this function has just decided."*
+
+**The free hand needs its OWN authored reference bank.** `g_ref` is refreshed
+wholesale from the live bone array whenever the held hand adopts - and by then
+that array contains what we wrote to the free hand on the previous frame.
+Retargeting against it is retargeting against our own output. BRVR states the
+same rule for its grab point: *"latch it only on frames the ENGINE owns the
+cluster... CaptureClusterRef early-outs while driven and hands back OUR pose."*
+This is the same feedback loop that made the s70h graded arm blend a silent
+no-op, and it fails quietly rather than erroring.
+
+**Falsified here, do not re-try:** using this frame's intended actor transform in
+place of `last_actor_write()`'s frame-old one does NOT fix the free-hand orbit
+(`2cdab5e`; symptom bit-identical afterwards). Note also that `last_actor_write()`
+is the RIGHT answer for the arm solve (s70q) and the WRONG one for the free hand -
+same accessor, opposite requirement, so "use the intended transform" is not a
+general rule.
+
+## Session 70: BRVR's viewmodel chain, traced end to end
+
+Source: the BRVR mirror - `Hands/HandsProbe.cpp`, `Hands/ArmHide.cpp`,
+`Camera/CameraHook.cpp`, `Core/Config.{h,cpp}`. Every number below is BRVR's own.
+
+### The chain
+
+**Offsets are ONE LIVE SET, swapped on switch.** `handsGrip[3]`, `handsRot[3]`
+and `cursorRot[3]` are the live values and the drive path reads nothing else.
+`UpdateWeaponGrip` saves the live set back to whichever table the outgoing item
+came from and loads the incoming one - `gripBySlot[9]` for weapons (slot 8 = any
+ability), `plasmidGrip[12]` for plasmids, indexed by `ResolvePlasmidId`. There is
+no per-hand split; which controller drives is a separate decision,
+`AbilityMode() ? HAND_LEFT : HAND_RIGHT`.
+
+**The ACTOR carries everything.** `handsRot` composes onto the controller's aim
+quat for the actor rotation; `handsGrip` is subtracted along the actor's own
+forward/right/up basis for its location. The skeleton is never posed by offsets.
+`WriteCluster` is fed the reference's OWN wrist, so the delta collapses to
+identity and the cluster replays verbatim.
+
+**Animation is a size threshold plus a hold window, and nothing else.**
+`CaptureClusterRef`, when already driving: exact `memcmp` of the live cluster
+against what we last wrote (bit-identical = our own pose, nothing happened);
+otherwise measure the wrist's rotation delta; `deg >= HandAnimMinDeg (5)` stamps
+`lastBig`; `playing = (now - lastBig) < HandAnimHoldMs (1200)`; while playing,
+adopt the whole live cluster as the new reference.
+
+**The hold window IS the settle mechanism.** Adoption keeps tracking for 1.2 s
+past the animation's last big frame, so the reference lands on the SETTLED pose
+by construction. Idle breathing (1-5 deg) never clears 5 deg, so idle is rejected
+BY SIZE - no state machine is involved anywhere.
+
+**Equip: release, wait for stillness, re-capture.** On a pose-key change BRVR
+releases the cluster, lets the equip play, and captures once the rig settles:
+
+| Guard | BRVR value | What it answers |
+|---|---|---|
+| `WeaponKeyDebounceMs` | 150 ms | The engine parks `CurrentHoldable` at NULL for a frame during fire/pump. MEASURED: the raw key fired **11 times in a 3-minute session with 2 real switches** |
+| `kSettleStillUnits` | 0.05 UU/frame | Stillness is measured on the wrist's POSITION, not any angle |
+| `kSettleStillMs` | 150 ms | How long that stillness must hold |
+| `kSettleMinMs` | 350 ms | A FLOOR - many draw animations pause part-way, and quiet inside a pause is not the end |
+| `WeaponSwitchSettleMs` | 600 ms | A CEILING, not a duration |
+
+### A LOOPING IDLE NEVER GOES STILL - and the mean is the answer
+
+BRVR: *"there is no single authored pose to latch and 'the last frame before we
+take the cluster' is an arbitrary phase of the loop... accumulate while settling
+and, if the rig never stills, latch the MEAN - the centre of the loop rather than
+a point on its circumference."*
+
+**s68 measured the identical fact** on a plasmid rig - 2156 ms to reach 1.24 deg
+against a +-1.2 deg idle envelope - and concluded *"a stillness test cannot work
+here"*, then abandoned the approach after nine builds. BRVR reached the same
+observation and answered it with the mean instead of abandoning it. That fallback
+is the piece all nine attempts were missing.
+
+### Where this tree had diverged
+
+1. **The per-state animation mask was the root of s67-s69.** It adopted only
+   `Firing`/`PostFiring`; `Hands.uc` leaves `WeaponFiring` at the TOP of the
+   recoil, so adoption was cut at the apex and the reference stuck there. The
+   canonical rest, its eased restore, the anchor pin and the quaternion
+   normalisation for that pin were all built to undo that one substitution. The
+   threshold+hold mechanism it overrode was already present in this file.
+
+2. **The freeze was anchored on bone 43, the WEAPON ATTACH.** BRVR's cluster spec
+   is `{27, 44, wrist 27}` and it anchors on the wrist; 43 is precisely the one
+   bone it leaves the engine still animating (*"cluster frozen; this bone is
+   still the engine's"*, 1-5 deg idle drift, peaks of 41-135). Anchoring a frozen
+   cluster on a moving bone writes every other bone relative to a moving point.
+   The left cluster here already anchored on its wrist (6); s68 recorded the
+   asymmetry as "not a defect".
+
+   **The anchor is also the point the cluster is SCALED about** (`g_scale` =
+   0.80), so moving it from 43 to 27 shifts the whole hand by `0.2 x (p43 -
+   p27)`. The per-weapon placement offsets were tuned against the old anchor
+   and will need a re-tune. Judge the anchor A/B on whether the hand STAYS
+   PUT through an animation, not on where it sits.
+
+3. **The adoption probe sampled bone 43 too**, so "has the pose changed?" was
+   asked of a bone that moves on its own. This is what made s67 raise the adopt
+   threshold from BRVR's 5 deg to 25 - the shotgun's idle "crossing 5" was bone
+   43's own drift, not the hand. 25 deg is above some weapons' entire per-shot
+   wrist movement, which is BRVR's recorded Tommy-gun failure and was reported
+   here as well.
+
+4. **No key debounce at all** - the `(holdable, ability)` pair was compared raw
+   every frame.
+
+### One deliberate deviation from BRVR
+
+The crosshair is GLOBAL here, by the tester's direction. BRVR keys `cursorRot`
+per slot AND per plasmid; s67 tried global in this tree and recorded that it does
+not serve every gun. It is global **per hand**, because the seeded table puts the
+weapons at 0.83/-9.20 and the plasmid at -11.00/37.00 - 46 deg of yaw apart,
+which is two model frames rather than two opinions about one number.
+
+### Open question the first headset run must answer
+
+The settle block runs only when the engine RE-EVALUATED the bone array, and s68
+measured that at roughly 1 frame in 19. A 600 ms ceiling may therefore hold only
+a handful of samples, and BRVR's millisecond constants may not transfer. The
+settle log prints the sample count for exactly this reason; if it reads 2 or 3,
+the ceiling wants raising (F10, no rebuild).
+
+### An adopted animation moves the anchor, and in FREEZE-ONLY that moves the hand
+
+Mode 3 (BRVR's shape) sets `freeze_only`, which writes the cluster AS the
+reference pose - `p[i] = pa + (g_ref[i].p - pa) * s`, with `pa = g_ref[anchor].p` -
+and lets the ACTOR carry it to the controller.
+
+That holds while the reference is frozen. Once an animation is ADOPTED, `g_ref`
+tracks it, so `pa` moves and the entire cluster moves with it - while the actor
+placement, computed from the target, knows nothing about it. **The hand walks off
+the controller for the length of the animation**, which is what the plasmid firing
+screenshots show, and why `animOn=0` made Telekinesis sit still: no adoption, no
+drift.
+
+The fix is a rigid transform of the cluster back onto the captured rest anchor -
+**both position AND rotation**. `qFix = q_rest[anchor] * conj(q_ref[anchor])`
+applied to every bone's quat, and to every bone's offset from the anchor, with the
+anchor translated onto `g_rest[anchor].p`.
+
+Position alone is only half of it, and the half it leaves out is the one that
+shows. The actor's ROTATION is set from the controller on the assumption that the
+anchor still carries its captured orientation; when the animation turns the
+anchor, the whole hand turns with it and points somewhere else - reported as "the
+position stays put now but the direction of it is still incorrect even though it
+hits the same spot". The aim ray is computed separately, which is exactly why the
+shot still lands correctly while the model points wrong: **a hand that aims wrong
+while the bullet goes right is a viewmodel-frame problem, never an aim one.**
+
+What survives the pin is everything INSIDE the cluster - finger curl, splay, the
+shape of the animation. What is removed is the anchor's own motion, which is the
+only part the actor cannot absorb.
+
+This is a consequence of BRVR's architecture rather than a porting error - "the
+actor carries the assembly" only holds if the assembly's anchor stays put.
+
+### The engine's tick overwrites a bone write, but only while it is ANIMATING
+
+`ROLLCHECK` measures whether our bone write survives to the next frame. The two
+regimes are far apart, measured 2026-08-27 on an Electro Bolt:
+
+```
+idle    our bone write drifted  0.27 deg   engineEval=0   (write held)
+firing  our bone write drifted 15.73 deg   engineEval=0   <-- OUR WRITE IS BEING CHANGED
+firing  our bone write drifted 15.16 deg   engineEval=1   (local x -5.36 y -2.40 z +10.17)
+```
+
+At idle the engine barely re-evaluates the hands bone array (see the ~5%-of-frames
+note above) so our write simply stands. **The moment an animation is adopted the
+engine evaluates every frame, its tick lands AFTER ours, and it wins.** The
+rendered pose is then the animation's, so a rig pinned to the controller walks off
+it for the length of the animation - visible as the plasmid hand translating away
+from the controller while firing.
+
+This is BRVR's S59/S60 finding in a second place: BRVR measured the tick resetting
+the hands ROTATOR and fixed it by writing again later in the frame, past the tick.
+The same is required of the BONE cluster.
+
+`hands::late_write()` (called from scenedraw's build detour, game thread, after
+CalcView) is where that second write lives. **It must replay the cluster in mode 3
+as well as mode 2.** Mode 3 is "BRVR shape, both halves" - it writes the ACTOR to
+carry the rig and the CLUSTER to keep the rig rigid beneath it - so it needs the
+bone replay exactly as mode 2 does. It only replayed the actor rotator until s69d,
+which is why any adopted animation on the left hand walked off the controller.
+
+Weapons hid it because their anchor is the weapon-attach bone (43), which the
+engine's attachment path re-derives anyway.
+
+### The left cluster's anchor is already correct
+
+Bone names, dumped live: `6 = Bip01_L_Hand`, then `7-21` are nothing but finger
+joints (`kBone_L_Thumb/Index/Middle/Ring/Pinky`, three each). Bone 6 IS the palm,
+so `kBoneLWrist` is the right anchor and there is no better bone to move it to.
+The right cluster's anchor at 43 is a different kind of thing - the point a WEAPON
+hangs from - and the asymmetry between the two is not a defect. Ruled out
+2026-08-27 as a cause of the plasmid animation walk; the cause was the late write
+above.
+
+### Plasmids need their OWN numbers - one shared set cannot work
+
+Upgrade tiers are separate engine classes, so the ability class name has to be
+folded before it can key anything: `ElectricBoltAbility`, `ElectricBoltTwoAbility`,
+`ElectricBoltThreeAbility`, `ElectricBoltZeroAbility` are one plasmid, as are
+`TelekinesisAbility` / `TelekinesisTwoAbility`. Strip the trailing `Ability` and
+then a trailing `Zero`/`Two`/`Three` and eleven plasmids remain, which is what the
+game ships.
+
+**They are not interchangeable.** BRVR's shipped config, with `PerPlasmidTuning=1`,
+carries rotations that differ by tens of degrees between them:
+
+```
+PlasmidGrip0=45.50,-14.90,-12.30   PlasmidRot0=-111.00,-64.00,22.00
+PlasmidGrip1=49.50,-12.90,-12.30   PlasmidRot1=-35.00,-20.00,22.00
+PlasmidGrip2=45.50,-10.90,-6.30    PlasmidRot2=-111.00,-16.00,22.00
+```
+
+The authored poses genuinely differ, so **no single grip/rotation serves two
+plasmids** and no reference-capture instant can be found that makes one set work
+for both. Nine attempts in session 68 searched for that instant; the search was
+unsound, not merely unlucky. Per-plasmid values absorb the difference, which is
+why BRVR never had the defect.
+
+Per-plasmid values also require a **per-plasmid reference capture**: the identity
+must be the pair `(CurrentHoldable, CurrentAbility)`, or the offsets sit on
+whichever pose was captured last.
+
+Identity resolves through the ordinary UObject path - `object_class_name()` on the
+`CurrentAbility` INSTANCE - so no pawn scan and no new offsets are needed. (BRVR
+does scan the pawn for `AvailableAbilities` and match `ActiveAbility` into it for
+an index; that is its route, not a requirement.)
+
+### Hands.CurrentAbility is where plasmids live - `+0x454`
+
+`Hands.uc` declares them in separate slots:
+
+```
+var private travel ShockPawn PawnOwner;       // +0x450  kHandsBaseOffset
+var private transient Ability CurrentAbility; // +0x454  kHandsCurrentAbilityOffset
+var private transient Ability OldAbility;     // +0x458
+var private Holdable CurrentHoldable;         // +0x45C  kHandsCurrentHoldableOffset
+```
+
+**`CurrentHoldable` is NULL while a plasmid is equipped** - the plasmid is in
+`CurrentAbility`. Confirmed in the log: every plasmid switch prints bones'
+`wscale rigid: released (holdable gone)`, whose test is literally `!hold`.
+
+Consequences for anything keying off "what is in your hands":
+
+- A plasmid looks like EMPTY HANDS to `CurrentHoldable` alone. That is what left
+  the last weapon's whole profile applied - trims, placement, and the animation
+  gate - while a plasmid was up.
+- Every plasmid looks like EVERY OTHER plasmid, because they are all null there.
+  Switching plasmid A for plasmid B is invisible, so B inherits A's captured
+  reference pose and renders at A's position with no setting able to touch it.
+- **Identity is the PAIR** `(CurrentHoldable, CurrentAbility)`. Watch both.
+
+The offset was already derived and documented here (bracketed by `kHandsBaseOffset`
+and `kHandsCurrentHoldableOffset`, four consecutive pointer fields with ours at
+each end) and used only by `hands::armed()` for a cosmetic crosshair gate. The
+viewmodel drive had never read it.
+
+### Falsified this session, with the measurement that killed each
+
+| Theory | Killed by |
+|---|---|
+| Aim-vs-grip pose choice for the model | headset A/B: no change. The aim pose is also a deliberate s11 fix so barrel, laser and bullet are one ray |
+| Bone 43's rotation applied twice | writing position-only stops the gun rotating ENTIRELY. BRVR gets away with it only because its ACTOR carries the rotation |
+| A rigid lever arm | three-axis offset tuning across two sessions never nulled it, and the required value changed between sessions |
+| The game erasing our roll | BRVR measured 5-102 deg on its ACTOR rotator (its S59) and fixed it from Present (S60); this tree's BONE write holds to 0.13 deg drift, measured by `ROLLCHECK` |
+| The foreground lens match not reaching the renderer | `FOVPROBE`: field holds 117.46 and the engine does not restamp it. The first write is 83.6 only because the backbuffer dims are not known yet - a real, minor, self-correcting bug |
+
+`[hud] fov watch` reporting `1 lens(es)` / `FG tanH=0.000000` every run is a
+BLIND INSTRUMENT, not evidence that the foreground pass is missing. It cost a
+hypothesis; do not read it as a finding.
 
 ## Session 22 - scripted-camera scenes: the descent's real mechanism (measured flat)
 
@@ -3518,3 +4046,2294 @@ fg path (route B - unnecessary, the cluster lever passed first) and the fovA
 consumer hunt (route A - stays parked with its in-headset world-coupling
 negative). `kActorDrawScaleOffset`/dirty-protocol constants remain declared,
 still unreferenced.
+
+## The Flash movie stack - WHICH interface screen is up, by name
+
+**Ported from BRVR, 2026-08-21.** Consumed by `src/game/bioshock1r/screens.cpp`
+and published into the cinematic verdict via `bvr::vr::publish_ui_pause`.
+
+### Why a render-side signal cannot answer this
+
+The pause menu and the machine flows draw OVER a live world, which defeats every
+signal the verdict had. CalcView keeps firing, so it is not stale. The view actor
+is still the player pawn, so it is still strict. The game renders and claims the
+same fov. The frame is not pure gameswf, so `screen_only()` is false. The main
+menu and loading screens moved to the anchored cinema quad while the pause menu
+stayed on the head-locked HUD panel.
+
+### The chain
+
+The whole interface is a stack of named Flash movies. The engine exposes
+`GetTopPlayingMovie`, which BRVR decoded by eye rather than calling (it is an
+exec native taking an FFrame). Both getters are pure field walks:
+
+```
+GetFlashGUIController, ecx = LevelInfo:
+    mov eax,[ecx+0xFC]      ; XLevel
+    mov eax,[eax+0x5C]
+    mov eax,[eax+0x4C]
+    cmp [eax+0x48],0        ; TArray ArrayNum - the getter bails when zero
+    mov eax,[eax+0x44]      ; TArray Data
+    mov eax,[eax]           ; data[0]
+    mov eax,[eax+0x7C]      ; the controller
+
+GetTopPlayingMovie, ecx = FlashGUIController:
+    mov edx,[ecx+0x15C]     ; count
+    mov eax,[ecx+0x158]     ; array data
+    mov ecx,[eax+edx*4-4]   ; data[count-1] == the TOP
+```
+
+The movie's filename is a **string** at `+0x40` on the movie object, so it needs
+no name table. `+0x4C` also carries it but degrades to `"NoFileSpecified"` on
+some entries; `+0x40` held on every sample.
+
+**`AActor::Level` is derived at runtime, not assumed.** The controller and the
+pawn must agree on the offset, both must point at the same object, and that
+object's own copy must point at **itself**. Nothing but LevelInfo passes all
+three. Measured `+0xF8` on this build, but the code never trusts that literal.
+
+### Measured, first run of the probe, 2026-08-21
+
+| Top movie | Meaning |
+|---|---|
+| `HUDRadial.swf` | ordinary gameplay |
+| `PausePC.swf` | the pause menu |
+| `craftingstation.swf` | a vending machine |
+| `Fadeout.swf` | a loading transition |
+
+Pause, vending and hacking screens were all confirmed anchoring in a headset the
+same day.
+
+### Fail-closed behaviour
+
+- The LevelInfo self-reference is re-proved every frame, so a level change
+  re-finds rather than depending on a reset hook nobody remembers to call.
+- Array data is checked as a **buffer**, not an object. This is not pedantry: the
+  object test demands a vtable whose first entry is executable, and a TArray
+  buffer's first word is element 0, whose own first word is a vtable POINTER
+  living in read-only data. Running the object test there rejects a correct
+  pointer every time, and it cost BRVR a session. Fail closed is right; failing
+  closed on the wrong predicate is not.
+- The walk reports **which step** it stopped at. A six-deep chain decoded from
+  instructions has six ways to be wrong and "did not resolve" distinguishes none
+  of them. That cost BRVR a session too.
+- An unreadable name leaves the previous verdict standing rather than dropping
+  the panel out from under a screen the player is reading.
+- If the chain never resolves, placement behaves exactly as it did before.
+
+### FALSIFIED: LevelInfo::Pauser
+
+The first attempt used `Level+0x668`, which BRVR recorded as the pause field and
+its source called "the one reliable signal". **It read null through three real
+pauses on this build** and is not used.
+
+That offset was never a measured result in BRVR either. Its detector shared one
+dependency with two other features (`FindLevel`, which needs the pawn) and all
+three were silent for a whole 16-minute session with their switches on. The
+comment claiming reliability outlived the evidence for it.
+
+
+**RE-TESTED PROPERLY 2026-08-24, and now falsified on evidence rather than on a
+borrowed number.** The original test above used BRVR's `0x668` - a copied
+offset, which the hard rules forbid for exactly this reason - so it could only
+ever have shown that ONE slot was wrong. BRVR did not guess that number either;
+it hunted it (`GameState.cpp HuntPauser`), and `0x668` is what its hunt returned
+on its build.
+
+The same hunt now exists here (`screens.cpp`, always-on, rides the panel edges)
+and was run against a real pause in ordinary gameplay:
+
+| Sweep | Filter | Result |
+|---|---|---|
+| `Level+0x0..0x1000` | slots going `null -> object` (the Pauser shape) | **nothing** |
+| `Level+0x0..0x2000` | ANY slot that changes | 32 slots, **none of them a flag** |
+
+Every one of those 32 is a `TArray` growing by one element - they arrive in
+triples, `{Data, ArrayNum, ArrayMax}`, with the two counts stepping together:
+
+```
+Level+0x1560 changed (8ADC5F30 -> 8B34B0D0)
+Level+0x1564 changed (00000015 -> 00000016)     ArrayNum
+Level+0x1568 changed (00000015 -> 00000016)     ArrayMax
+```
+
+That is menu allocation churn, not a pause flag. **The pause state is not on
+LevelInfo on this build at any shape, within 8 KB.** Do not try `Pauser` again
+without first widening the sweep or pointing the hunt at a different object -
+the PlayerController is the obvious next candidate and has not been swept.
+
+**What is used instead: the composed pad.** The mod composes the gamepad, so it
+knows when the PLAYER pressed menu; the game's own `PausePC` during a ride or a
+scripted scene arrives with no press at all. `camera.cpp` latches on the press
+and holds it until the panel closes, and that is what lets a real pause taken
+mid-scene keep the anchored quad while the scene's own panel does not. It fails
+towards today's behaviour: a pause opened by keyboard Escape misses the window
+and behaves exactly as before rather than flattening a ride.
+
+**Also falsified in BRVR, as sway fixes:** `AdditiveHandBobAnim` and
+`WeaponBobDamping`, both observed inert. Do not revive either.
+
+### Rejected alternative, on the record
+
+BRVR first tried a **draw-signature heuristic**: in-game menus issue 20-31
+non-indexed draws per frame against gameplay's 120+, because menus hide the HUD.
+The gap looked clean at 4x with no overlap across seven captures. In practice it
+**flipped twelve times in one spot during ordinary gameplay**.
+
+## Session 63 (2026-08-22) - the rigid-holdable DrawScale lane, and what it inherits
+
+**Status: HEADSET-CONFIRMED 2026-08-22 - the wrench visibly changed size.**
+That settles a question open since session 16; see "the split", below.
+
+### The gap
+
+`bones.cpp`'s weapon-scale lane (`wskel_*`, session 61) drives the equipped
+holdable's own `SkeletonInstance`. The **wrench has none** - actor `+0x3FC` is
+null, it is a rigid melee mesh (flat-proven 2026-08-14) - so the lane logged
+`holdable ... has no resolvable SkeletonInstance (+0x3FC) ... lane stays
+unbound` and the wrench rendered at authored size no matter what `wScale` said.
+BRVR never had the problem: it scales the weapon **actor** (`GunScale` ->
+`DrawScale`), which needs no bones.
+
+### The lane
+
+Only where the skeleton lane cannot bind. A holdable WITH a skeleton keeps the
+existing path; carrying both would compound.
+
+- Field: `kActorDrawScaleOffset` +0x2AC, with the **dirty protocol** -
+  `[actor+0xD0] |= 0x10`, `[actor+0x3F4]++`, `[actor+0x3E4] = 0`. All four
+  constants were derived here in session 12 (AActor::SetDrawScale 0x375830
+  disassembled, field poked live); nothing was carried across from BRVR.
+  A raw poke without the revision bump is invisible - see the session-12 entry.
+- `wScale` is a MULTIPLIER on the captured authored value, matching the sibling
+  lane. BRVR writes its `GunScale` absolutely; for BS1 weapons the authored
+  value is 1.0, so the two agree, and the captured value is logged so a weapon
+  where it is not shows up rather than hides.
+- **A field reading 0.0 is expected**, not garbage: session 12 recorded "the
+  AHands actor read 0.0 there", which is Unreal's unset-means-one. It binds as
+  a 1.0 multiplier while the raw 0.0 is kept for the restore.
+- Re-asserts per frame (read-then-write, so zero writes when nothing moved it),
+  because the engine restamps `DrawScale` on equip and a one-shot poke was
+  BS2-proven not to render reliably.
+- **Restores only when the actor is provably live** - on `wScale` returning to
+  1.0, and on explicit release. A holdable CHANGE and a world change both
+  forget it WITHOUT writing. That is BRVR's `ArmHide_Reset` rule and it exists
+  for the same reason: by the time the change is noticed the old actor may be
+  destroyed and its address reused, and an SEH guard does not save you from a
+  VALID write into somebody else's object.
+
+### The split: the RIG actor's DrawScale is inert, the WEAPON actor's is not
+
+Session 16 measured `DrawScale` on the **RIG** actor and found the geometry
+inert through the foreground path - **gun width 240 -> 234 px at s=0.5**, 2%
+where 50% was asked - concluding that the fg rig path consumes actor DrawScale
+for bone translations but NOT for skin/attached-mesh size. It named the
+**WEAPON** actor as the case it could not isolate: "it could at best scale the
+gun, never the hand."
+
+**That guess was right, and the split is real.** The wrench visibly resized in a
+headset on 2026-08-22. So: rig-actor DrawScale does not size geometry; weapon-
+actor DrawScale does. The attach-matrix disassembly session 16 queued as the
+fallback (`AActor::AttachToBone` 0x379EF0 / the fg bake at 0x3DBF7C) is **not
+needed for weapon size** and can stay parked.
+
+### Two things the first headset run corrected
+
+**1. The wrench is authored at DrawScale 0.800, not 1.0.** Logged as
+`wscale rigid: bound 7B912A20, authored DrawScale 0.800`. The lane's first cut
+treated `wScale` as a MULTIPLIER on the authored value on the explicit
+assumption that BS1 weapons are authored at 1.0 - so `wScale 0.80` rendered the
+wrench at **0.64** and it read too small. It is now **absolute**, which is what
+BRVR does (`*p = g_cfg.gunScale`) and which makes `GunScale=0.8` mean the same
+size in both mods. The consequence to know: `wScale` is "fraction of authored"
+on the skeleton lane and "the DrawScale itself" here. That asymmetry is BRVR's
+too, and BRVR is the size that was accepted in a headset.
+
+**2. A weapon SWITCH reached the restore path.** Logged as
+`released 7B912A20 (holdable has a skeleton after all) - DrawScale restored to
+0.800`: the wrench went out of hand, a skeletal weapon bound, and the lane
+restored through the OUTGOING actor - exactly the stale-pointer case `ds_drop`'s
+`restore` flag exists to refuse. That branch now checks the bound actor is still
+`hands::current_holdable` before writing.
+
+### How to verify a change here
+
+The wrench must be EQUIPPED. `boot.ps1 -Attach` lands on the newest save, and
+that save is the bathysphere intro ("Pick up the RADIO") with no weapon, so the
+simulator cannot reach it without a later save or scripted navigation - which is
+why this went to a headset. Once equipped, the log lines above are the evidence:
+`bound <ptr>, authored DrawScale <x>` then `DrawScale <x> -> <ws>`, and a
+hand-back line on unequip.
+
+### Ini keys added the same session
+
+`HandsScale`, `GunScale` (0.05-5.0) and `CameraHeightOffset` (cm, + up) in
+`BioshockVR.ini`'s `[VR]` section, read in `Bioshock1RAdapter::init`. BRVR's key
+names, units and defaults (0.8 / 0.8 / 9), so a config carries between the two
+mods. **A saved `vrpreset.ini` loads later and overrides all three** - the
+startup echo says so, because in a headset that is indistinguishable from the
+ini being ignored.
+
+## The d-pad must be HELD, not pulsed - and that is what gates the MAP
+
+**Ported from BRVR 2026-08-22, after the modifier "did not work" in a headset.**
+
+BRVR shipped a 120 ms pulse first and had to undo it. Its own note
+(`BioshockVR/Input/InputHook.cpp`, its session 38):
+
+> HELD, not pulsed. The first version emitted a 120ms pulse to avoid
+> weapon-switch spam -- but weapons are on the RADIAL in this game, and the
+> d-pad drives HUD functions. One of those is the hint button, and
+> `ShockPlayerController` gates the MAP SCREEN behind `HintButtonHeld` with
+> `HintHoldTime=0.5s`. A pulse made the map unreachable by construction.
+
+This mod was in exactly that state until now: `kFlickPulseMs = 150`, so **the
+map screen could not be opened at all** through the modifier, no matter how the
+gesture was performed. Fixed by holding the bit for as long as the direction is
+held (`PadMap::flickHold`).
+
+**But holding is only safe on the direction that needs it, and the first cut of
+this got that wrong.** It made hold-vs-pulse a per-GAME switch on the theory
+that BS1's directions SELECT a slot. The pad audit above says otherwise with
+better evidence - UP/DOWN **cycle** (`00 Buck -> Electric Buck -> Exploding
+Buck`) - and a held cycle spins rather than settling. So the switch is
+per-DIRECTION (`PadMap::flickHoldBits`): RIGHT (hints) is held, everything else
+is pulsed, and Infinite holds nothing.
+
+**THERE ARE TWO ROUTES TO THE MAP, and the one BRVR actually ships is the MENU
+button, not the d-pad.** BRVR `InputHook.cpp`:
+`if (s.menu) btn |= (mod ? XI_BACK : XI_START);` - the MODIFIER changes what the
+menu button MEANS. Menu alone is START (pause); modifier + menu is BACK, which
+is `ShowContextHelp` ("WHAT IS THIS?"), and holding it past `HintHoldTime` opens
+the map. The same applies to the X+Y chord that stands in for the menu button on
+setups where the runtime eats it.
+
+This mod had BACK on the menu button's LONG PRESS instead, with no modifier
+involved - which put context help behind the one input most likely not to reach
+the game at all, and left the X+Y chord able to produce only START. Now
+modifier-gated, with the long press kept as a fallback for `dpadModifier = 0`.
+
+**The d-pad route, which is real but secondary: `flickRight` was 0.** BS1's map emitted only UP/DOWN/LEFT, on the belief that
+three directions covered its three ammo types. But `DPAD_RIGHT = hints` - so
+holding right emitted **nothing at all**, and no amount of hold could reach the
+map. Both halves are needed: the bit has to be sent, and it has to be held.
+
+Two smaller corrections landed with it, both BRVR's numbers: the select
+threshold is **0.5** (was 0.65), and the direction is **dominant-axis only**
+(`ay >= 0.5 && ay >= ax` -> up/down, else `ax >= 0.5 && ax > ay` -> left/right).
+The previous first-match chain could resolve a deliberate "up" as "left"
+whenever the cross axis also happened to be over threshold.
+
+### What the modifier failure actually was
+
+Worth recording because the config was never wrong. The log echoed
+`d-pad modifier = rightrest` at startup and `RIGHT thumbrest touch reported by
+the runtime` 100 s later, so both ends worked. What went wrong was **the
+controllers repeatedly unbinding mid-session** - see STATUS. Before suspecting
+the modifier again, check the census timestamps.
+
+## Session 64 (2026-08-22) - scripted EVENTS: three offsets ported from BRVR, and what re-derives them
+
+**Source: the BRVR mod** (`docs/brvr-reference/BioshockVR/Game/GameState.cpp`,
+its M7-S1/S4/S5/S6 banners). Everything below is BRVR's measurement, cited so it
+is not re-derived from scratch, plus the checks this tree adds because a
+carried-over offset is a guess until this build agrees with it.
+
+**These are not cutscene signals.** The cutscene detector here is `wantCine` in
+`src/core/vr/openxr_runtime.cpp` and it is already the stronger of the two mods'
+- BRVR's own `docs/CONSOLIDATION.md` records that BRVR shipped exactly one
+cutscene signal (the letterbox bar draw, `DrawHook_CutsceneBarsActive()`) and
+**never wired a caller to it**, while that same draw is `bar_draw_active()` here,
+consumed, and combined with four signals BRVR has none of. Nothing in the
+cutscene path was touched. What was missing here is the *scripted sequence*
+question: the world renders, the HUD may be up, and the game is moving the player
+through an authored moment.
+
+### hands+0x594 bit 2 - CurrentlyExecutingScriptedHandAnimationSequence
+
+`Hands.uc` lines 80-82 are three consecutive bools, and UE2 packs consecutive
+bools into one DWORD:
+
+| bit | field |
+|---|---|
+| 0 | `bFinishedStateAnimations` |
+| 1 | `AbilityHasBeenReleased` |
+| 2 | `CurrentlyExecutingScriptedHandAnimationSequence` |
+
+BRVR computed the DWORD's address by walking the field list from its proven
+`+0x494`/`+0x498` anchor. **The walk is the weak link, not the bit.**
+
+**MEASURED, BRVR M7-S1, 2026-08-10:** the bit set 0.8 s after the tester marked a
+scripted scene starting and cleared 0.75 s before they marked it ending - both
+inside reaction time on the marker key - and fired **exactly once** in six
+minutes covering weapon fire, plasmid fire, four gene-machine opens, a Little
+Sister rescue and walking. Zero false positives.
+
+**WHAT IT DOES NOT COVER, measured in the same run:** the Little Sister **rescue**
+and the **EVE injection** both leave this bit clear. They are Hands *states*
+(`ExorcisingGatherer`, `InjectingEve`), a different mechanism. **A build in which
+a rescue fires this signal has a wrong offset - it has not improved on BRVR.**
+That is the sharpest single test of the port.
+
+**FALSIFIED, BRVR M7-S3 - do not gate anything on bit 0.** It is
+`bFinishedStateAnimations` and it looked perfect, but gating the arms on it
+produced *opposite* failures in two scenes: arms hidden for the whole Little
+Sister crawl, arms stuck visible and frozen on the plasmid balcony. `state
+PlayingScriptedHandAnimation` has an **empty body** and never touches the flag,
+so during the crawl it kept the `true` left over from the last weapon state.
+
+### pawn+0x464 bit 1 - Pawn.bCannotFall (the bathysphere)
+
+`Pawn.uc` line 46. Pawn's own fields start at the `AActor` base `0x450`; lines
+13..44 are exactly 32 bools - one full DWORD at `+0x460` - so the next three
+start a fresh one:
+
+| offset | contents |
+|---|---|
+| `+0x460` | lines 13..44, thirty-two bools, one DWORD exactly |
+| `+0x464` bit 0 | `ShouldNotTakeDamageOnNextLanding` |
+| `+0x464` bit 1 | `bCannotFall` |
+| `+0x464` bit 2 | `bUseHavokRigidBodyCapsuleCollisions` |
+
+**THE ORACLE.** `ShockPlayer` defaults bit 2 **true**, and
+`ActionEnableBathysphereModeForPlayer` clears it in the same call that sets bit
+1. So entering a ride must flip **bit 1 up and bit 2 down in the same write** -
+two bits moving in opposite directions at once is not something a wrong offset
+produces by chance. Every edge logs both bits and says whether the oracle held,
+so the offset can be confirmed or refuted straight out of the log.
+
+It exists so the rotation comfort settings can **leave a ride alone**: a
+bathysphere is not a scripted animation, so without this signal a rotation freeze
+applies there too and the camera stops following the sphere. BRVR shipped that
+exact bug for as long as the signal was missing, and could not fix it by level
+name because the mod does not know what map it is on.
+
+### controller+0x9E0 - ShockPlayerController.bIsForcingPlayerMove
+
+`ShockPlayerController` pushes `NullInput` and then calls `StartForcePlayerMove`,
+which **interpolates** the player into position and heading *before* the scripted
+animation begins. Through that whole window the hands flag is still false.
+
+**It could not be computed.** Six interface-typed fields (`ICanBeUsed`,
+`ICanBeFocused`, `ICanBeHacked`) plus a `TArray` sit between the class base and
+the flag, and interface size in this fork is unknown - an unknown that compounds
+six times. BRVR found it by **differential probe** (M7-S5) and correlated it
+across three events whose durations differ by 24x - 1.0 s ("went straight in"),
+0.24 s (instant), 5.75 s ("the slewing") - each matching an independent tester
+report. The flag drops 0.09 s after the scripted animation begins.
+
+**Shape check, every read.** A lone bool is exactly 0 or 1. Anything else means a
+stale pointer or a wrong offset, which is not hypothetical: BRVR caught its own
+bathysphere read doing precisely that.
+
+### The held window - ONE SCENE, ONE WINDOW
+
+A scene raises the two signals **in sequence**: the forced move walks you into
+place, then the scripted animation plays. They normally overlap, so nothing
+downstream sees a gap.
+
+**The order is not guaranteed.** BRVR measured the Little Sister crawl, 2026-08-11:
+
+```
+22:46:10.556  FORCEDMOVE: --- forced move done ---
+22:46:10.557  SCRIPTED: aim released back to the player   <- the collapse
+22:46:10.561  SCRIPTED: *** SCRIPTED ANIMATION BEGAN ***  <- 5 ms later
+```
+
+One frame at 231 CalcView/s. Its camera hook released the aim in it, re-armed its
+base from an aim field that happened to read exactly (0,0), and the field sat
+**18.6 deg off the pawn for the whole 58-second scene**. So the pair is held:
+rises instantly, falls only after the hold with neither signal set. Held in the
+producer, not the consumer, because consumers layer different policies on top.
+
+### What re-derives all three here, rather than trusting them
+
+The rule is that an offset carried between builds is a guess until this build
+agrees with it. This tree has something BRVR did not - **`fname_text()`, FName
+index resolved to text via `GNames`** - so the anchor check is stronger here than
+the one BRVR had to settle for ("does this field *shape* like a name"):
+
+1. **Object identity.** The hands actor's own `UObject` name (`+0x28` ->
+   `fname_text`) must read `PlayerHands`. patterns.h already records that
+   cross-check.
+2. **The walk.** All four FName slots the same field walk produces - `+0x498`
+   `HandsOffscreenAnimationName`, `+0x4B8` `InjectingEveAnimationName`, `+0x4D8`
+   `ExorcisingGathererAnimationName`, `+0x558` `CurrentScriptedAnimationName` -
+   must resolve to non-null text. Four points along the walk's length.
+3. **The pawn.** `Hands.Base` at `hands+0x450` must pass
+   `body::is_gameplay_view()`, i.e. carry `kShockPlayerVtableRva`.
+4. **The bool.** `ctl+0x9E0` must read exactly 0 or 1.
+
+Any failure logs loudly and holds **every** signal false. Nothing is gated on a
+value the check cannot stand behind.
+
+**MEASURED AND NOT KEPT, BRVR M7-S2:** `+0x558` read `None` (index 0) for an
+entire run *including* throughout a scripted sequence. Animation-level naming
+does not come from that field, and the index-comparison idea it was going to
+enable is unproven. It is an anchor slot here and nothing more.
+
+### The three invariants that came with the port
+
+All three were bought expensively in BRVR (`docs/brvr-reference/docs/INVARIANTS.md`
+- *Locomotion and the aim field*) and none of them should be relearned:
+
+1. **Never write `Controller.Rotation` while a sequence is moving the player.**
+   Three balcony falls entered far right, straight on and far left and all landed
+   on the same spot with no write. With a heading substituted in, both
+   straight-on runs landed badly wrong. **The write itself is the damage.**
+2. **Never let the window break mid-scene.** A per-frame "are you still in
+   control" predicate over the HUD threw one landing 3.7 m. That is what the hold
+   exists for.
+3. **Follow the camera alone, never the camera and the aim field.** They are not
+   independent - the balcony's opening snap moves both by 41.03 deg/s, so
+   following both applied it twice and the view finished a whole snap past the
+   authored heading. The measurement that originally justified following both was
+   a deg/s average over 67 seconds, **and a rate cannot see a one-frame spike.**
+
+### Where the game's rotation actually reaches the player here - measured against this tree
+
+Worth writing down because it is not what the BRVR port would suggest, and it
+changed what the comfort work had to be.
+
+During **ordinary VR gameplay** `camera.cpp` overwrites `rot->pitch` and
+`rot->roll` **absolutely** from the head, and writes yaw as `gameYaw +
+headResidual`. So the game's screen shake, weapon kick and auto-pan **already
+never reach the player in pitch or roll** - that fell out of the head drive years
+of sessions ago and nobody wrote it down. Only yaw passes through.
+
+The authored rotation reaches the player in exactly one case: **when the head
+drive does not run at all**, and CalcView's rotator passes through untouched.
+That is a scripted or cinematic camera taking the view (and, incidentally, a
+menu - which is why the comfort policy also requires a scene to be active).
+
+**Consequence:** BRVR's `FreezeGameplayRotation`, which exists to kill shake and
+kick during play, would be **largely redundant here** - the axes it targets are
+already gone. What is left of it is a yaw latch, which is the risky axis (it
+feeds `body::on_calcview` and the pawn's facing) for a much smaller prize. It was
+deliberately not ported. `ScriptedRotationFollow`'s job, by contrast, lands
+cleanly and is what shipped.
+
+## Session 64 part 2 (2026-08-22) - the offsets confirmed, and PausePC.swf
+
+### All three offsets CONFIRMED in a headset run
+
+The part-1 build was diagnostic and the run settled every question it asked.
+
+**The anchor resolved four real, semantically correct names**, which is a
+stronger result than "four slots resolved":
+
+```
+scripted: anchor ok - PlayerHands confirmed, 4/4 name slots resolve
+          (+0x498 'HandsDown', +0x4B8 'Eve_ArmJab',
+           +0x4D8 'GathererSave_Heal', +0x558 'None')
+```
+
+`HandsOffscreenAnimationName` reads `HandsDown`, `InjectingEveAnimationName`
+reads `Eve_ArmJab`, `ExorcisingGathererAnimationName` reads `GathererSave_Heal`.
+Those are the right *meanings*, not just well-formed names, so the field walk
+behind `hands+0x594` is standing exactly where the derivation says.
+
+**The bathysphere two-bit oracle held on BOTH edges:**
+
+```
+23:07:19.626  bathysphere ON   (pawn+0x464 = 00000002, bCannotFall=1 havokCapsule=0 - oracle HOLDS)
+23:08:14.929  bathysphere off  (pawn+0x464 = 00000004, bCannotFall=0 havokCapsule=1 - oracle HOLDS)
+```
+
+Bits 1 and 2 moving in opposite directions in the same write, both times. That is
+not something a wrong offset produces by chance.
+
+**The held window earned itself on the first run:**
+
+```
+23:11:25.323  forced move BEGAN
+23:11:26.415  --- forced move done ---
+23:11:26.424  *** SCRIPTED ANIMATION BEGAN ***
+23:11:26.424  window bridged a 16 ms gap between the two signals
+```
+
+Nine milliseconds of daylight between the two signals - the exact defect BRVR
+measured on the Little Sister crawl, reproduced here immediately. Without the
+hold, anything reading the pair would have seen the scene end and restart.
+
+`forced move` also bracketed the bathysphere boarding at 1.22 s (23:07:18.393 to
+23:07:19.617), consistent with BRVR's 1.0 s "went straight in" measurement.
+
+### PausePC.swf is on the movie stack during rides and scripted scenes
+
+**The finding that fixed two reported defects at once.** `PausePC.swf` is not
+only the pause menu: the game keeps it on the playing-movie stack for the whole
+of a bathysphere ride and every scripted scene, at `(2 playing)` rather than the
+`(1 playing)` seen at a real pause.
+
+`screens::panel_screen_up()` matched it, that fed `publish_ui_pause(true)`, and
+`uiPaused` is an unconditional term in core's `wantCine`:
+
+```
+23:07:56.892  screens: top = "..\FlashMovies\PausePC.swf" (2 playing) -> PANEL
+23:07:56.928  xr: cinematic quad ON (strict=1 stale=0 fovMismatch=1 screenOnly=0 uiPaused=1)
+23:08:14.929  screens: top = "..\FlashMovies\HUDRadial.swf" -> gameplay
+23:08:14.929  scripted: bathysphere off              <- the same millisecond
+```
+
+Two user-visible consequences, reported independently and diagnosed as one cause:
+
+1. **The ride rendered on a head-locked quad** - "a square that is headlocked
+   with black behind it" - instead of in stereo.
+2. **The head was dead during scripted scenes.** `cinematic_active()` also gates
+   the head drive in `CalcViewDetour`, so `driveHead` was false and looking
+   around did nothing: "you stay looking wherever the game wants you to look,
+   which feels very bad".
+
+**Two candidates ruled out rather than assumed.** `g_cineStereo` already defaults
+**true**, so the `fovMm && !stereoCine` term contributes nothing even though the
+scripted camera genuinely renders 80 deg against a claimed 100. And `screen-only`
+engaged 5 s *after* the quad (23:08:02 vs 23:07:56), so it is downstream of the
+quad rather than a trigger. **`uiPaused` was the sole cause.**
+
+The fix is one gate in the adapter: a panel screen is only a UI pause when no
+scripted window is open and no bathysphere ride is running. At a real pause menu
+neither signal is set, so that path is untouched; hack/loading/FMV screens arrive
+through `screen_only()` and are untouched too.
+
+### Writing the aim field during a forced move throws the landing
+
+**Measured from a headset 2026-08-23, as a clean pair.** In a scripted event,
+looking around with the head and right stick landed the player "way off" the
+intended spot; holding head and stick completely still landed "in the exact right
+spot". Same scene, same build, one variable.
+
+`ctl+0x1E4` (`kActorViewDirOffset`, `Controller.Rotation`) is what a forced move
+steers by, and it is the same field `body.cpp`'s transfer writes every frame to
+keep the pawn's yaw under the player's head. So looking around re-aims the
+interpolation the game is running.
+
+**This is BRVR graveyard entry 16 reproduced**: *"A forced move steers by nothing
+of ours - three balcony falls entered far right, straight on and far left all
+landed on the same spot. The write itself is the damage."*
+
+**Why it only appeared in s64.** Part 2's `PausePC.swf` fix made the head drive
+live during scripted scenes, deliberately, so the player could look around
+instead of being pinned. That made `vrDriving` true inside a scene for the first
+time - which switched the body transfer on inside them too. One fix, two
+consequences, and only the intended one was considered.
+
+**The gate uses the HELD window, not the raw signal.** Entry 16's second half:
+*"never let the window break mid-scene - a per-frame 'are you still in control'
+predicate over the HUD did exactly that and threw one landing 3.7 m."*
+`scripted_window()` bridged a real 16 ms gap on its first run here. The
+bathysphere is included for the same reason with a different mover.
+
+**No turn-axis kill goes with it.** Graveyard entry 12: zeroing `sThumbRX` freezes
+`Controller.Rotation`, which forced-move sequences steer by, and the opening
+bathysphere walked into the back wall. This repo has never zeroed it and must not
+start.
+
+#### What the probe proved on the way, and it matters architecturally
+
+BRVR's `WalkDriftProbe`, ported as `vrbody walkprobe`, logged `pub -0.0` and
+`camYaw == pawnYaw` on **all 25 samples** of a normal walking run. The
+head-relative *stick rotation* lane is therefore inert in ordinary play: the body
+transfer keeps the pawn glued to the camera, so the angle it would rotate by is
+always zero.
+
+**The two mods take opposite routes to the same feature.** BRVR redirects walking
+by rotating the movement *stick* and never writes the aim field - `walk =
+aimFieldYaw + stickAngle + R` - which leaves aim, the weapon trace and
+forced-move sequences untouched by construction. This mod writes the field and
+treats the stick rotation as a correction that measurement shows never fires.
+**That difference is precisely why BS1 had a scripted-landing bug BRVR does not.**
+Gating the write fixes the symptom; the architectural difference is worth
+remembering before the next feature is built on the field write.
+
+A consequence worth writing down so it is not re-derived: **`moveYawSign` is not
+the walking-direction lever it looks like.** It scales a value that is almost
+always zero. It was flipped in a headset and changed nothing, which is the
+expected result, not evidence about the sign.
+
+### The arms during a scene: MOTION answers what the flag cannot
+
+**s64 round 7/8, 2026-08-23.** The arm hide's first predicate was
+`scripted_window() && !scripted_anim()` - hide while the game is walking you into
+position, show the moment an authored animation starts. It never fired once, and
+the log shows it was **right not to**:
+
+```
+02:37:24.155  scripted: *** SCRIPTED ANIMATION BEGAN ***  (hands+0x594 = 00000006)
+02:37:24.163  scripted: forced move BEGAN                 (ctl+0x9E0 = 1)
+```
+
+The animation flag was already true on the FIRST frame of the window, so
+`!scripted_anim()` was false throughout and the arms stayed up. **The mechanism
+was never the problem; the question was.** `hands+0x594` bit 2 answers *"is a
+scripted sequence running"*, and a scene holds a pose for seconds in the middle
+of one with the bit high the whole time. *"Do the hands have anything to do right
+now"* is a different question and no flag on this actor answers it - BRVR reached
+the same place from the other side and records `bFinishedStateAnimations` as
+falsified for precisely this (see the M7-S3 note above).
+
+**So measure the rig instead.** `bones::hand_motion()` differences one wrist's
+component-space `hkQsTransform` against the previous CalcView:
+
+```
+raw = |dp| + (1 - |dot(q, qPrev)|) * 50
+smoothed = max(raw, smoothed * 0.90)      // peak-hold with decay
+```
+
+- **Component space is what makes it honest.** The whole rig actor tracks the
+  camera every frame, so a world-space measurement reads "moving" constantly.
+  Only animation registers in the bone array's own frame.
+- **The `* 50` is arbitrary by construction** and must not be read as a
+  measurement. It only makes a small rotation comparable to a small translation.
+  The threshold is meaningful *only* against it, which is why the raw and
+  smoothed values are logged at 2 Hz inside a window rather than a constant being
+  shipped and trusted.
+- **The quaternion term is not optional.** A wrist can rotate in place without
+  its position moving at all, so `|dp|` alone misses a whole class of animation.
+
+**WHICH BONE, AND WHY IT CANNOT BE A CONSTANT.** A wrist *we* are writing reports
+our own rigid transform - bit-for-bit identical every frame while the controller
+is still, so the delta is not merely small, it is exactly zero. So sample the
+wrist of a cluster the drive is **not** writing: bone 27 (right) when the right
+cluster is free, else bone 6 (left), else **-1 meaning "cannot answer"**.
+
+BRVR paid for this the hard way: 189 and 223 consecutive `raw 0.0000` samples in
+two runs with the arms hidden for a whole scene, because its gate sampled bone 27
+while a plasmid put the weapon in the left hand and the free-hand drive was
+writing 27-44. **A run of exact zeros is only interpretable if you know which
+bone produced it**, which is why the bone index is in our log line.
+
+**-1 ROUTES TO ARMS VISIBLE.** The failure on record is arms hidden for a whole
+scene; there is no matching record of arms shown for one frame. Fail toward the
+one nobody has complained about.
+
+**One local difference from BRVR, and it matters.** Its `HideBone` pins each
+collapsed bone at *that cluster's own wrist*, so the wrist write is a no-op and a
+hidden hand still carries the engine's pose on the one bone the gate reads. Ours
+pins every collapsed bone at the **driven target** (`bones.cpp`, the
+hide-inactive block), so a collapsed cluster is **not** honest here and counts as
+written. Same rule, different reason - `g_clWritten[]` is set for both the driven
+hand and the collapsed one.
+
+#### Two of BRVR's constraints do not apply here, and the reasons are the point
+
+1. **BRVR had to release its weapon cluster immediately before measuring**,
+   because C1 let both clusters be driven inside a scripted window and there was
+   then no engine-owned wrist. Here the scripted gate calls `bones::release()`
+   (`hands.cpp`), which stands the *whole* drive down and hands the skeleton back
+   - so on a scripted frame neither cluster is ours and bone 27 is always
+   available. The blind guard is a backstop, not a load-bearing part.
+
+2. **BRVR could not hide by bone while measuring by bone.** Its collapse cleared
+   the skeleton's dirty byte, the engine stopped re-evaluating the whole array,
+   the sampled bone froze, and a scene that started hidden stayed hidden forever
+   while one that started animating stayed visible - a bistable latch.
+
+#### FINAL, and it inverts what this section said for three rounds
+
+**`DrawScale3D` IS NOT A SAFE HIDE HERE.** Measured 2026-08-23 with a read-only
+whole-array probe, which is the only measurement in this arc that was never
+confounded by the gate it was testing:
+
+| | samples | bones moving |
+|---|---|---|
+| actor at `0.0001` | **293** | **0 of 47, every one** |
+| actor at full scale | 183 | 21-47 on 116 of them |
+
+Scaling the actor down takes it out of whatever the engine animates, so the whole
+bone array freezes - not one bone, all of them. The motion gate reads that array
+to decide when the arms come back, so hiding that way is a one-way door.
+**BRVR's `ArmHide.h` says the opposite and is correct for BRVR; it does not hold
+in this build, and three separate workarounds** (re-flagging the dirty byte every
+frame, a timed re-check, discarding readings taken across the frozen gap) **all
+failed, each in a new direction, because none addressed the freeze itself.**
+
+**What works: collapse the BONES and leave the actor at full `DrawScale3D`.** The
+actor stays in the render set, the engine keeps animating it, the array stays
+live, and the signal is honest with no re-check machinery at all. Three things
+are load-bearing and each cost a headset cycle to find:
+
+1. **Write POSITION and SCALE, not scale alone.** A zero-scale bone still renders
+   as a degenerate polygon *at its own position* - reported as "a strange looking
+   small black polygon where both the right and left arm are supposed to be".
+   Everything goes to a single point far below the actor. The session-19
+   inactive-hand hide has always written both, for exactly this reason.
+2. **Every bone, not just the clusters and sleeves.** Collapsing 44 of 47 leaves
+   the root and spine at full scale, which is another way for geometry to survive.
+3. **READING BEFORE WRITING IS NOT ENOUGH.** CalcView runs at 118-240/s against an
+   animation tick well below that, so on many calls the bone still holds *our own
+   collapse* - and differencing that produces a 5000-unit spike that reads as
+   violent motion, trips the hold and pins the arms up permanently. The sampler
+   must recognise its own write (bit-for-bit; we wrote the value) and report it as
+   **stale**: not motion, not stillness, no new information. One real sample per
+   engine tick is the correct rate anyway.
+
+The weapon-attach bone still hides by translation and never by scale - session
+16's divide-by-chain-scale is unchanged by any of this.
+
+> **The generalised rule, and it is the reusable part:** *you cannot hide a thing
+> from the renderer and keep measuring what the renderer drives.* BRVR wrote its
+> version about the dirty byte; the real constraint is the render set, and actor
+> scale is inside it while bone scale is not.
+
+**The general shape, worth more than the feature:** a predicate can be a faithful
+reading of a real engine flag and still answer the wrong question. Round 7's log
+did not show a broken mechanism; it showed the mechanism working perfectly on a
+question nobody wanted asked.
+
+#### The `DrawScale3D` offset itself, kept after the constant was deleted
+
+`kActorDrawScale3DOffset` was removed from `patterns.h` in the PR-51 review pass
+(VOID, 2026-08-23): once the hide moved to the bones it had no reader anywhere in
+`src/`, and its own comment still asserted the claim the table above falsified.
+The derivation is preserved here because deriving it again is not free, and
+because the neighbouring scalar is the trap:
+
+| field | offset | what it is |
+|---|---|---|
+| `DrawScale` (scalar) | `+0x2AC` | written by `AActor::SetDrawScale` (`0x375830`). **Geometry-inert on the rig actor** - session 63: "rig-actor DrawScale does not size geometry; weapon-actor DrawScale does" |
+| `DrawScale3D` (X/Y/Z floats) | `+0x2B0` | immediately after the scalar. The field BRVR hides arms with (`Hands/ArmHide.cpp`, `kDrawScale3DOff`) |
+
+The layout is the ordinary Unreal shape - a scalar scale followed by a per-axis
+vector - which is exactly why the two get confused; s64 wasted a build hiding the
+arms with `+0x2AC` before finding that out. Either one needs the dirty protocol
+(`kActorDirtyFlagsOffset |= 0x10`, `kActorRenderRevOffset++`,
+`kActorDirtyByteOffset = 0`); a raw field poke without it is invisible.
+
+**And if anything ever revives `+0x2B0`: NEVER WRITE EXACT ZERO.** The attach path
+inverse-decomposes chain scale (session 16), the same division that makes bone 43
+untouchable. That warning is about the write, not about the hide, and it survives
+the falsification above intact.
+
+
+### The viewmodel desync: it is the RENDER LOCK, and it was switched off
+
+**BRVR HANDOFF_11 section 4.2 settles this, and supersedes HANDOFF_9 6.4.**
+Chasing 6.4 - "write the weapon actor's own transform" - is a dead end that BRVR
+already walked. HANDOFF_11 4.3(c):
+
+> The rendered weapon follows a **skeletal attachment matrix**, not the weapon
+> actor's top-level transform. That is why per-weapon grip offsets drift and why
+> nine hand-tuned slots are needed at all. The prior-art notes state plainly that
+> direct actor positioning was insufficient for this exact reason.
+
+Measured here independently before reading it: the weapon actor's Location sits
+10-16 UU off the bone we pivot about, does not rotate with that bone, and does
+not track it under translation either. Same conclusion, arrived at the slow way.
+**This repo already implements 4.3(c)** - bones.cpp's rigid cluster write IS
+`newBonePos = targetAnchorPos + targetRot * (refBonePos - refAnchorPos)`.
+
+**What 4.2 says the answer actually is:**
+
+> Prior art does not use a formula. It computes a **render-lock correction** -
+> lateral and depth corrections for the hand anchor derived from *captured
+> renderer state*, failing soft to the uncorrected pose when that state isn't
+> fresh. That is the answer. The foreground projection's effect on a world-space
+> placement is a function of live renderer state, not of two FOV numbers. **You
+> have to read it, not derive it.**
+
+That is `render_lock_delta()` in bones.cpp, line for line: it reads the live
+world tanH from `hfov_option_ptr()`, projects the target through the live camera
+rotator to NDC, derives a lateral and a depth correction, and returns false -
+failing soft - when the capture is not fresh.
+
+**It defaults to OFF** (`g_renderLock{0}`), and a live run measured
+`render lock: off |delta|=0.00 UU gain=0.90 dgain=0.90 solves=0 skips=0`.
+
+**And its precondition only became true in session 28.** The function's own
+comment says the correction assumes the lens ratio `k` collapses to 1 - which
+was true only at 16:9. The shipped 0.75 match constant left the fg lens
+1.7778/aspect narrower than the world everywhere else, so at this square
+backbuffer `k` was really 1.78 while the code assumed 1, and the correction was
+mis-scaled by that factor. Session 28 fixed the constant to `(4/3)*(H/W)`;
+measured this session as `k=1.381818`, fg 117.5 deg, the two lenses agreeing on
+the vertical to 0.071%. So the render lock's assumption holds NOW and did not
+before - which is the likeliest reason it was left off.
+
+**The test is a config change, not a build** (BRVR rule 6, "config bisection
+beats commit bisection"): F10 -> bones -> `lock ABS (true position)`, or
+`vrbones lock 1`. `vrbones lock diff` is the head-split-cancel-only variant, and
+`vrbones lockgain <0..2>` / `lockdepthgain` tune it. Watch `solves` climb and
+`skips` stay near zero in `vrbones status`.
+
+**What this predicts.** If the render lock is the answer, the per-weapon grip
+offset and model trim added earlier this branch become unnecessary rather than
+merely untuned - which is the "weapons correct by default" outcome asked for,
+and matches HANDOFF_11's account of why nine hand-tuned slots were ever needed.
+
+
+#### TESTED 2026-08-25: all three lock modes desync identically - because the lock REFUSES ITS OWN ANSWER
+
+Headset test, ABS / DIFF / off, all three the same. That reads as "the render
+lock is not the fix" and it is not what happened. The log:
+
+```
+[bones] lock: refusing outsized delta (lat 30.0 depth -15.0)
+```
+
+`render_lock_delta` armed, projected, produced a correction, and then
+`bones.cpp`'s own sanity guard threw it away:
+
+```cpp
+if (latMag > 30.0f || dDepth < -120.0f || dDepth > 120.0f)   // refuse
+```
+
+The lateral term hit the 30 UU ceiling, so `ptc` was never nudged and all three
+modes collapsed to the uncorrected pose. **The A/B measured nothing.** (HANDOFF_7
+rule 11: check whether the test was valid before believing the result.)
+
+**The real question is now sharp: is a 30 cm lateral correction plausible?**
+
+- If **yes**, the guard is simply too tight for this configuration and the fix is
+  to widen it - but 30 cm is enormous for a viewmodel nudge, so this is the less
+  likely branch.
+- If **no**, the correction is mis-scaled and the guard is doing its job. That
+  points back at `render_lock_delta`'s inputs: it takes world `tanH` from
+  `hfov_option_ptr()` and projects through `ctx.cam*`. Session 28 fixed the
+  lens-ratio assumption (`k` really is ~1 now, measured `k=1.381818`, fg 117.5,
+  lenses agreeing to 0.071%), so the remaining suspects are the NDC projection in
+  `world_ndc` and the depth term, not the lens.
+
+**Next session starts here**, and it is a measurement, not a guess: log the raw
+`dLat` / `dDepth` alongside the NDC the correction was derived from, hold the
+controller still at a known pose, and see whether the 30 UU is a stable bias or
+noise. A stable bias of that size with the lenses matched means the projection
+model is wrong somewhere specific, and that is findable.
+
+Do NOT widen the guard first. It would apply a correction nobody has shown to be
+correct, on a path that already moves the whole cluster.
+
+#### CORRECTION 2026-08-25 (s66): "lat 30.0" was never a measurement of the correction
+
+Re-reading the s65 headset log rather than the one line quoted from it. The run
+left **three** refusals, not one:
+
+```
+[14:43:55.383] [bones] lock: refusing outsized delta (lat 64.8 depth -4.1)
+[14:44:10.335] [bones] lock: refusing outsized delta (lat 30.0 depth -16.6)
+[14:44:21.346] [bones] lock: refusing outsized delta (lat 30.0 depth -15.0)
+```
+
+**That line only prints when `latMag > 30.0f`, so the sample is censored from
+below at exactly the number we were treating as the finding.** "Is a 30 cm
+lateral correction plausible?" is the wrong question - 30.0 is the guard's own
+threshold showing through a filter that can never report anything smaller. The
+one uncensored number in the set is the **64.8**, more than twice it.
+
+The camera is stationary across all three (`loc=(-37382.0 518.1 7779.3)` in
+every one), so what separates them is orientation: `rot=(64064 65158 0)` at
+64.8 against `(1452 63974 0)` and `(1194 64160 0)` at the two 30.0 readings.
+The two near-identical poses give near-identical `lat`, so the term is
+deterministic and pose-stable - and roughly 10 deg of pitch more than doubles
+it. **Strong pose dependence under a stationary camera is the shape of the
+finding**, and neither the magnitude nor its cause can be read off a censored
+log line.
+
+Also true of that run, and worth knowing before repeating it: `[tlm] lock`
+never fired once (`vrbones telemetry on` was never issued), and no `render
+lock` command line appears at all - the lock was armed from the F10 radio,
+which does not log. There is no other lock data in the run.
+
+#### The s66 instrument: `vrbones lockprobe`, and the terms that decensor this
+
+`render_lock_delta` now computes four diagnostic terms beside the existing
+ones. All read-only; none of them feed the guard or the correction.
+
+| Term | What it is | Why |
+|---|---|---|
+| `nat=(x y)` | where the fg model says `ptc` renders TODAY, in NDC | the model's own answer, to set against the world's |
+| `dndc=(x y)` | `tgt - nat` | dimensionless, so it survives every depth and UU scale factor. Its two axes name the suspect: X -> `tanH` / the right basis, Y -> `live_inv_aspect` / `invTanVFg` |
+| `latP` | the lateral correction solved at CONSTANT depth (`wNat`, not `w*`) | `lat` is the component of the FULL delta perpendicular to the fg forward, so it also carries the sideways shadow any depth move casts on an off-axis anchor - a point at NDC n sits `n*tan(fov/2)*w` off axis, so changing w by `depth` moves it sideways for free (~9 UU at the observed depth -15 and a half-screen anchor). `latP` is the honest lateral term; `lat` is not. `-1` means unsolvable, which is not `0` |
+| `split` | camera yaw minus actor yaw, degrees | the head-split the lock exists to cancel. A correction that does not scale with this is not doing its job, whatever its magnitude |
+
+`vrbones lockprobe on|off` runs the solve **for its numbers with the lock still
+off** - the apply stays gated on the lock mode alone, so a probe can never move
+a bone. That is what makes the s65 A/B repeatable without arming a correction
+nobody has shown to be correct. It needs `vrbones telemetry on` for the lines
+(the probe command says so when telemetry is off), and `vrbones status` reads
+`+PROBE (measure only)` while it is armed.
+
+**Read `k` first.** Under the session-28 lens match `k` collapses to 1 by
+construction (`invTanHFg = 1/tanH`). If the log shows ~2.06 instead,
+`fg_fov_match_active()` was false, the legacy 60-deg constants were used, and
+every downstream number is mis-scaled for that reason alone - nothing else in
+the run means anything until that reads ~1.00.
+
+**Decision rule, written before the run:**
+
+| Observation | Verdict |
+|---|---|
+| `latP` small (<=3 UU) and `dndc` ~ 0 | model and world agree laterally; `lat` is the depth move's shadow, and the guard is gating the wrong quantity |
+| `latP` large and stable at a fixed pose | the model genuinely disagrees; mis-scaled, and `dndc`'s larger axis names the term |
+| `latP` swings frame to frame at a fixed pose | unstable input (hand sway, per-eye vs mono `ctx.cam*`), not a scale error |
+| `latP` does not scale with `split` | the lock is not cancelling what it exists to cancel - refuted regardless of magnitude |
+
+Baseline to compare against: the session-21 `simhead` sweep recorded above
+(`lat` 1.04-11.59 with the yaw transfer off, 4.50-4.96 with it on). The run
+must be at the headset's own viewport - the s65 log reads `backbuffer 2750x2850
+aspect 0.96491`, `WORLD tanH=1.191754 tanV=1.235090 (hfov 100.00 deg)` -
+because `live_inv_aspect()` feeds both `world_ndc`'s `tanV` and `invTanVFg`,
+and a 16:9 run would answer a different question.
+
+**NOT RUN YET.** The instrument is built and installed; the sweep is the next
+thing that happens.
+
+### RETRACTION: the game's yaw DOES reach the camera during gameplay
+
+Part 1 recorded that the head drive overwrites `rot->pitch` and `rot->roll`
+absolutely, concluded that shake and the auto-pan therefore never reach the
+player, and left BRVR's `FreezeGameplayRotation` deliberately unported as
+"largely redundant here".
+
+**That conclusion was wrong, and a headset run refuted it.** The measurement it
+rested on was correct but incomplete: yaw is not overwritten.
+
+```cpp
+rot->yaw = gameYawUnits + residualUnits;   // camera.cpp
+```
+
+`gameYawUnits` is the engine's own value, so everything the game puts into yaw
+arrives untouched. Reported 2026-08-22: *"I am getting screenshake with world
+events and its making me look at groups of enemies that the game normally turns
+you to."* Screenshake reads as horizontal because horizontal is the only axis
+left.
+
+**The lesson worth keeping:** "two of the three axes are discarded" is not "the
+feature is redundant". The one surviving axis was the one the complaint was
+about. A per-axis audit needs a per-axis conclusion.
+
+The freeze now ships, absorbing the game's yaw *delta* into an offset rather than
+clamping the value, so the view declines to be turned instead of snapping. It
+excludes itself while the turn stick is off centre, during a scripted window, and
+during a bathysphere ride - the last of which is only possible because part 1's
+signal exists, and is the bug BRVR shipped for as long as its own signal was
+missing.
+
+**Known trade, accepted deliberately (user's call):** the filter is camera-only.
+Aim and body still turn with the game, so the crosshair can sit off centre after
+a large shake. The offset is bounded at 60 deg and says so in the log if it ever
+reaches that, because an unbounded offset is an unbounded divergence between
+where you are looking and where the pawn is facing.
+
+### Turning yourself during a scripted scene
+
+A scripted sequence pushes `NullInput`, so the game discards stick input and a
+turn routed through the game does nothing. Ported from BRVR's `ScriptedManualYaw`
+as a mod-side accumulator applied to the **camera only**.
+
+It is never written into `Controller.Rotation`. That is BRVR's invariant 1 and it
+was expensive: three balcony falls entered far right, straight on and far left
+and all landed on the same spot with no write, while a substituted heading put
+both straight-on runs badly wrong. **The write itself is the damage.**
+
+### The both-edges rule, and a third door it came through
+
+BRVR's rule is that a reference latched inside a scripted window must be dropped
+on **both** edges, or the second scene of a session differences against a value
+left over from the end of the first ("first almost perfect, second way off").
+
+That applies here to the scripted-turn accumulator and the freeze reference, and
+both are reset on the window's rising and falling edge. But there is a third gap
+BRVR did not have: **the freeze filter only runs while the head drive runs.** A
+menu, a cutscene or a scripted camera stops calling it entirely, so the yaw it
+would difference against on the way back out is from before the scene - and
+absorbing that delta would swallow the entire turn the scene just made. The
+filter therefore re-arms whenever more than 250 ms has passed since its last
+call, with dt as the witness that it was not being called.
+
+## Session 64 part 3 (2026-08-23) - the bathysphere and Big Daddy runs, and two traps in the instrument
+
+The two scenes s64 had never been run against were both verified in a headset,
+and both passed. What is worth keeping is not the pass - it is the two ways the
+instrument lied on the way there, because the instrument is now stripped and
+cannot explain itself.
+
+### The bathysphere: what actually carries the ride
+
+The window covers the **boarding forced-move only** and then closes; the ride
+itself is carried by `bathysphere()` (`pawn+0x464` bit 1), not by
+`scripted_window()`. Measured:
+
+```
+16:15:05.517  body transfer STANDS DOWN        <- window opens (forced move)
+16:15:06.877  bathysphere ON   (pawn+0x464 = 00000002, bCannotFall=1 havokCapsule=0 - oracle HOLDS)
+16:15:07.014  last motion sample               <- window closes, 70 s of ride still to go
+16:15:42.175  panel screen up during a bathysphere ride - NOT treating it as a UI pause
+16:16:18.389  bathysphere off  (pawn+0x464 = 00000004, bCannotFall=0 havokCapsule=1 - oracle HOLDS)
+16:16:18.568  body transfer resumes
+```
+
+The oracle held on both edges a second time, on a different ride from part 2's.
+
+**This is why the consumers are `scripted_window() || bathysphere()` and not the
+window alone** (`body.cpp:492`, `camera.cpp:2091`). The panel gate firing at
+16:15:42 - 35 s after the window shut - is the whole design working. A future
+session that sees "no window samples during the ride" and reaches for graveyard
+entry 12 is reading a correct measurement and drawing the wrong conclusion.
+
+The black square ~60 s into the descent is still there and is NOT this:
+
+```
+16:16:07.422  cinematic quad ON (strict=1 stale=1 fovMismatch=1 screenOnly=1 uiPaused=0)
+```
+
+`uiPaused=0` - the part-2 gate held. It is the `stale=1` term (CalcView stops
+being called across the arrival and map transition), which is session 22's
+finding and needs a render-side answer of its own.
+
+### TRAP 1: a pause menu opened mid-scene makes the STALE watchdog cry wolf
+
+The watchdog s64 added said, in words, "the gate is frozen; the hide mechanism is
+the problem, not the threshold" - and it was written precisely so a later session
+would trust it and not tune numbers. It fired once, and it was **wrong**:
+
+```
+16:18:51.888  screens: top = "..\FlashMovies\PausePC.swf" (2 playing) -> PANEL
+16:18:53.909  [bones] motion has been STALE for 2015 ms - ...
+16:18:55.116  screens: top = "..\FlashMovies\HUDRadial.swf" (1 playing) -> gameplay
+```
+
+"STALE for 2015 ms" back-dates the freeze to 16:18:51.894 - **6 ms after the
+panel came up** - and it never recurred once the panel closed. A menu freezes the
+game's own animation, so every bone read genuinely *is* our own collapse, which
+is exactly the state the watchdog was built to detect. The two are
+indistinguishable from the bone array alone; only the screen stack separates
+them. Anything reviving this watchdog must stand it down while
+`screens::panel_screen_up()`.
+
+### TRAP 2: `0/47 bones moved while collapsed` is the HEALTHY state
+
+The array probe was added to catch the collapse suppressing evaluation the way
+`DrawScale3D` did. On the passing run, 323 of 352 collapsed probes read `0/47` -
+92%, which reads as the failure returning. It is not.
+
+The gate samples **before** writing the collapse, so two consecutive reads
+normally both see the engine's authored pose and nothing has moved between them.
+`0/47` is what a working hide looks like. The tell is the other bucket: every
+`47/47` sample carried an identical `max 5009.3979`, and that constant is the
+magnitude of our own collapse write - the probe straddling it, not the hands
+moving. A raw count of moved bones cannot answer this question; only the
+constant-vs-varying character of the maximum can.
+
+### The scene that did exercise the hide
+
+93 s, one engage, one release, no flapping and no one-way door:
+
+```
+16:17:38.046  hidden=0     <- scene opens, arms visible
+16:17:43.050  hidden=1     <- hold expires, rig collapses
+16:19:11.123  hidden=0     <- window closes, authored pose restored
+```
+
+That is the first time the bone-collapse hide has been exercised end-to-end
+without freezing, which is what `DrawScale3D` could never do.
+
+## Session 65 (2026-08-23) - the world FOV is overridden BELOW CalcView
+
+### The bathysphere renders 80 deg while CalcView reports 100
+
+The "black square" on a bathysphere was never the cinematic quad. Falsified
+directly: `vrcine off` kills `g_cineActive` outright and the box survived it.
+
+What actually happens, measured on the frame the player presses A:
+
+```
+19:48:40.950  scripted: forced move BEGAN  (ctl+0x9E0 = 1)
+19:48:40.957  fov watch: WORLD tanH=0.839100 (hfov 80.00 deg, 12/12 votes)
+19:48:40.966  rendered-fov mismatch ON (rendered 80.0 deg vs option 100.0)
+19:48:40.969  xr: claim substituted from the live WORLD lens (hfov 80.00 deg)
+```
+
+**CalcView reports `fov=100.0` for the entire ride** - every sample, boarding to
+landing. The narrowing therefore happens DOWNSTREAM of CalcView, which is why
+nothing in the camera path could see it and why the fov watch is the only
+instrument that catches it.
+
+The mod's response was correct and was itself the visible defect: it re-claims
+the OpenXR layer at the measured 80 deg, so the image fills 80 deg of a wider
+headset - a correct, full-resolution picture sitting in a box with black around
+it. Reported as "renders in a square, but the resolution is the same".
+
+### The two fields, and they were already in this file
+
+`PC+0x45C` is the world lens and `PC+0x648` its mirror. **Both were already
+derived here for another purpose**: the foreground scene-node ctor is passed
+`float PC+0x45C` (default 75.0) beside `PC+0x460`, and the note on `PC+0x65C`
+records the "75/75/60 fov floats" at `PC+0x648..0x650`. Session 65 only needed
+to WRITE them.
+
+BRVR reached the same two fields independently (`ClampWorldFov`, its
+`WorldFovOffset`/`WorldFovOffset2`) and measured the narrow side as 75.0 -> 60.0.
+**The numbers do not transfer** - this build reads 100 -> 80 - but the offsets
+agreeing with a derivation already in this tree is the corroboration that
+matters.
+
+### Why the guard is gated, and why the gate is not `bathysphere()`
+
+The window is `forced_move() || bathysphere()`. The narrowing lands **1.2 s
+before** the ride flag, on the forced-move frame, so gating on the ride alone
+misses the start - which is precisely the moment the player sees the box appear.
+
+Two things depend on the guard staying narrow:
+
+1. **It would blind the cutscene detector.** One leg of `wantCine` fires when the
+   game renders a different fov than it claims. Clamping globally deletes exactly
+   that evidence - BRVR's own `CONSOLIDATION.md` names this as integration hazard
+   number one for this port.
+2. **Weapon zoom uses the same field.** `Hands::FadeFOV` drives it downward when
+   you scope. A global floor would fight it; you cannot scope on a bathysphere,
+   so the gate removes the conflict rather than special-casing it.
+
+The restored value is SAMPLED, not hardcoded: whatever the lens read while no
+scene owned the camera. That accounts for the user's own FOV option for free.
+
+## Session 65 (2026-08-23) - the turn jitter, and the wall that looks like a pause menu
+
+### The turn jitter: measured, NOT solved, and the attempt is reverted
+
+Reported as: walking a circle is smooth while the turn stick is barely over, and
+past an exact repeatable threshold it goes jittery. Predates every turn change
+this repo has made. **Six headset runs. The anomaly is real and located; whether
+it is what the player FEELS was never established, and the fix was reverted.**
+
+What is measured and can be relied on:
+
+- **It is not our input.** The composed pad the game actually consumed reads flat
+  to three decimals (`composedRx -0.428..-0.428`) across whole windows in which
+  the engine's yaw rate swings from 5 to 349 deg/s.
+- **It is not the body transfer.** `resid` stayed at 0.00-0.02 deg throughout,
+  the 180 deg/s slew cap never engaged, and the movement stick was never rotated
+  (0 STRADDLE events in 570 samples).
+- **It never stalls.** Zero frames where the yaw failed to advance, in any run.
+- **The engine advances its own yaw unevenly**: about seven normal steps then one
+  of ~2.5x, repeating every **125 ms (8 Hz)**. Confirmed across two different
+  clocks and two frame rates - 8 counted frames at 64/s and 15 at 120/s are both
+  125 ms - so it is time-periodic, not frame-counted.
+- **Frame time amplifies it**, at a fixed stick: 1.98x at 8 ms/frame, 2.11x at 9,
+  2.57x at 10, 3.67x at 12, **5.29x at 13**. So the lag spikes and the turn
+  jitter are the same subject; fixing pacing would reduce the jitter.
+- **There is a separate, real deadzone cliff**: mean turn rate jumps ~5x from
+  3.5 to 16.7 deg/s across |rx| 0.20 -> 0.25, straddling the game's 0.225
+  per-axis deadzone, and the response is nearly flat above it (16.7 at 0.25 to
+  24.6 at 0.45). Worth fixing on its own merits.
+
+**THREE PROBE REVISIONS WERE SPENT MEASURING THE INSTRUMENT.** Recorded because
+the next person will reach for the same clock:
+
+1. `GetTickCount64` has **15.625 ms** resolution and this path runs at ~245/s, so
+   most calls read `dt == 0`. Worse, the sampler updated `prevYaw` before the
+   `dt > 0` guard, so those frames' yaw was DISCARDED. The residue produced a
+   convincing "double step every 8 frames" - which is exactly 8 x 15.625 ms.
+   **Use QueryPerformanceCounter for anything sub-frame.**
+2. A 20 Hz sampler against a ~120 Hz frame cadence aliases: `dt` alternated
+   59/68 ms with the rate alternating against it, which is indistinguishable
+   from a real oscillation. **Accumulate every call; throttle only the summary.**
+3. A summary that resets its accumulators before reading them logs nothing. One
+   whole run produced 38 windows and zero sequences.
+
+**The attempted fix, and why it was abandoned rather than turned off.** A
+view-only spike clipper: clamp the excess of a step over its local average out of
+the yaw CalcView returns (through `yaw_adjust_units()`), and bleed it back over
+the next few frames. Deliberately NOT a field write, which is what kept
+graveyard entries 12, 13 and 16 out of scope entirely rather than merely handled.
+It built and shipped behind an F10 toggle; the player still felt the jitter, and
+the session ended before establishing whether the yaw anomaly is the percept at
+all. **The turn probe could never have answered that** - it reads the engine's
+yaw FIELD, and a view-only correction only changes CalcView's out-parameter, so
+the probe is blind to it by construction.
+
+**The open question, and it is the first thing to settle before any more work:**
+is the jitter the VIEW rotating unevenly, or the DIRECTION OF TRAVEL stepping?
+Everything above measures the view. Graveyard entry 14 is the movement-side
+candidate and is untested for this symptom.
+
+### Walking into a wall drops the view to the cinematic quad
+
+**The bug**: walk into a wall and the world renders in an anchored square exactly
+like the pause menu; the hand renders but cannot be moved; the game keeps
+running. It toggles on and off as the player walks into and away from the wall,
+and it persists if they quit while it is active. Several walls in one area.
+
+**The cause is a hard-coded draw-count threshold**, `hud_capture.cpp`:
+
+```
+ID3D11Resource* scene_leader() {
+    ...
+    // A handful of DSV-bound draws is not a scene (the fg rig pass has ~14);
+    // the world pass has hundreds. 32 is comfortably between.
+    return (best && best->n >= 32) ? best->res : nullptr;
+}
+```
+
+A view filled by one near wall draws too little geometry, the winning render
+target falls under 32 DSV-bound draws, `scene_leader()` returns null, and the
+screen-only verdict trips:
+
+```
+screenOnly = scene_leader() == nullptr && g_swfDrawsThisInterval >= 20
+```
+
+`screenOnly` is an unconditional term in core's `wantCine`, so the projection
+layer drops to the M2 quad - the same path menus use, which is why it looks like
+the pause menu and why the anchored placement is identical.
+
+**Measured 2026-08-23, 19 transitions in one run:**
+
+```
+22:19:19.661 screen-only interval off (swf draws 145, world pass present)
+22:19:19.710 screen-only interval ON  (swf draws 145, world pass absent)
+22:19:19.723 xr: cinematic quad ON (strict=1 stale=0 fovMismatch=0 screenOnly=1 uiPaused=0)
+```
+
+**THE SWF HALF OF THE PREDICATE IS DEAD.** `swf draws 145` is identical on both
+sides of every transition - ordinary gameplay is always far above the 20-draw
+floor, so the guard that was meant to stop single stray draws tripping the
+verdict contributes nothing. In practice `screenOnly == (scene_leader() == null)`.
+
+**`strict=1` throughout**, which is the useful discriminator: the strict gameplay
+verdict held the whole time the quad was up. A momentary world-pass loss while
+the gameplay verdict is TRUE is not a loading screen, and gating on that looks
+more promising than tuning 32 - a threshold has no correct value here, because
+"how much geometry is on screen" is a property of the level, not of the mode.
+
+The 3-interval hysteresis already present (`g_screenOnlyStreak >= 3`) is not
+enough: a wall is not momentary, it lasts as long as the player faces it.
+
+### NOT A BUG: the interact prompt aims with the HEAD, not the controller
+
+Reported 2026-08-23 as a soft lock - the flying turret wedged in the first
+Medical Pavilion door offered no hack prompt while vending machines, lootables
+and money on the ground all did. It was aim, not a defect: the player was not
+looking down far enough at it.
+
+Worth writing down because the false alarm is a good one. The use/interact trace
+is the ENGINE's, so it aims along the engine's view pitch - and in VR that value
+is driven only indirectly, by the session-30 pitch servo steering it toward the
+head through the game's own input path. **Pointing a controller at something
+does nothing for the prompt; you have to physically look at it.** Objects with
+generous use volumes (money, loot, a vending machine you walk into) hide this;
+a small device low in a doorway does not.
+
+If a prompt ever genuinely will not appear, the F10 input section's "Kill
+right-stick pitch under VR" is the A/B: unchecked, the right stick's Y goes back
+to the game as an ordinary look axis and can pitch the engine's view directly.
+If the prompt appears that way and not otherwise, the servo has stalled - it
+fails open to the plain kill, and a frozen engine pitch is invisible until
+something the engine owns aims with it.
+
+## Session 71 (2026-08-30) - THE OFF-HAND SWIVEL: the rig actor's DrawScale multiplies bone translations
+
+**SOLVED, headset-confirmed.** The reported bug: *"Rotating the right hand causes
+the left one to move as well. Turning the pistol left causes the left hand to
+swivel towards the right hand... it doesnt apply rotation to the left hand, but
+it just moves it positionally in a swivel depending on right hand rotation
+horizontally."*
+
+### The mechanism
+
+`AHands` (the rig actor) ships with **DrawScale = 0.8000**, and the foreground
+rig path **multiplies every bone TRANSLATION we write by it**. So a component-
+space position `p` that we write renders at `k*p`, with `k = 0.8`.
+
+The free hand's target is built to cancel the actor exactly:
+
+```
+ptc   = inv(A) * (want - actorLoc)          <- what we write
+world = actorLoc + A * (k * ptc)            <- what the engine renders
+      = k*want + (1-k)*actorLoc
+```
+
+With `k != 1` a share `(1-k)` of **actorLoc** leaks into the free hand's world
+position - and `actorLoc` is the HELD hand's position plus its placement offsets
+rotated into the held hand's own basis. Rotate that wrist and `actorLoc` swings
+through an arc; 20% of that arc lands on the off hand. Measured this session: the
+actor's location swung **103 UU in x and 96 UU in y** across a 344 deg sweep, so
+the leak is ~20 UU - a plainly visible swivel.
+
+Every part of the symptom falls out of that one term:
+
+| Observation | Why |
+|---|---|
+| position moves, orientation clean | a scalar on translations cannot touch a quaternion |
+| tracks the HELD hand's rotation | `actorLoc` carries the held hand's rotated offsets |
+| magnitude grows with distance from the actor | the leak is `(1-k) * actorLoc`, and the cancellation error scales with `\|want - actorLoc\|` |
+| **only the OFF hand, never the held one** | the held hand's anchor sits essentially ON the actor, so `\|want - actorLoc\| ~ 0` and the leak lands on the same point. The free hand is an arm's length away. **This asymmetry is the tell** - nothing else in the subsystem predicts "only the other hand moves" |
+
+### The fix
+
+`drive_free_hand()` divides its component-space target by the rig actor's
+DrawScale before writing (`bones.cpp`, grep `FREESCALE`):
+
+```cpp
+float k = 1.0f;
+if (ds_read(handsActor, &k) && k > 0.01f && fabsf(k - 1.0f) > 0.001f) {
+    ptc[0] /= k; ptc[1] /= k; ptc[2] /= k;
+}
+```
+
+Read live rather than hardcoded: 0.8 is what the shipped rig authors, not a
+constant of the engine, and a rig that ever authored something else would
+silently reintroduce the bug.
+
+**BRVR had this from the start** and we had the measurement and did not use it.
+`FreeHandModelPos()` in `Camera/CameraHook.cpp` divides by `handsScale` with the
+reason in one line: *"DrawScale scales the whole mesh, skeleton included, so a
+bone moved by N model units renders as N * scale centimetres."*
+
+### Why it took a whole session, and the lesson
+
+**Session 16 measured this exact behaviour and recorded it** (see "Rig-actor
+DrawScale + drive positions pre-divided by s" above): *"bone positions round-trip
+through the scale - written p renders at s\*p"*, and *"the fg rig path consumes
+actor DrawScale for bone translations but NOT for skin/attached-mesh size."*
+
+The headline that survived into the code was **"the rig actor's DrawScale does
+not size geometry"** - true about mesh SIZE, and it buried the half that mattered.
+The finding was never wrong; the summary of it was lossy, and the lossy version
+is what every later session read. **When a measurement has two halves, the
+summary must carry both, because the summary is what gets reused.**
+
+### The probes that read clean, and why they all could
+
+FREEPROBE, FREETARGET, FREEHOLD and ACTORWATCH all read clean or constant while
+the bug was live, because **every one of them measures the input or component
+space**. The multiply happens AFTER, in the engine's bone->world step, which
+nothing had ever measured. A probe that cannot see the stage where the defect
+lives will always report health.
+
+Four instruments read zero in this session for four different reasons - zero by
+algebra (measuring through the transform it had just cancelled), zero by timing
+(a window that closes before the engine acts), zero by an unchecked read (a
+failed read seeded from the value it was compared against), and zero by masking
+(`reapply()` restoring the value before the comparison). **Before believing a
+silent probe, ask what it would print if the defect were present** - and check
+that the stage it samples is the stage the defect lives in.
+
+### Corrections this session leaves behind
+
+- **ACTORWATCH is not a defect meter.** With the head and both controllers held
+  still it reads a CONSTANT (84 of 88 samples bit-identical at
+  `pitch +42.0 yaw +24.7 roll +2.1`). It is the standing difference between the
+  rotation we write (the controller's) and the one the engine writes (the view's),
+  so it can never be zero while the mod deliberately writes a different rotation.
+  Do not chase it to zero.
+- **There is no actor race.** The actor holds our value at CalcView (0.1 deg) and
+  through scenedraw (FREEPROBE, 115 samples, bit-identical). Cancelling the
+  engine's actor instead of ours is a measured no-op.
+- **The rig actor's DrawScale is NOT inert.** It does not size geometry; it does
+  scale bone translations. Both halves are true and both matter.
+
+### The off hand needed the SAME two-knob split as the weapon (2026-08-30)
+
+Reported immediately after the DrawScale fix landed: *"they are decoupled, but now
+the offhand is having the pivot problem the weapons had when I adjust the
+position/rotation with the numpad."*
+
+`g_offHandPosCm` is applied along the TARGET's own axes - `ptc += qtc * o`, i.e.
+INSIDE the hand's own rotation - so in world the anchor sits at `want + T*o`. As
+the free hand's own rotation `T` changes, the anchor orbits `want` at radius
+`|o|`. **The knob is a pivot**, and tuning it to move the hand displaces the point
+the hand turns about. That is the weapon's grip-offset defect exactly, inherited
+by a hand that was written later:
+
+> *"The grip offset IS the pivot - and that is why tuning it could never work...
+> Using it to correct the gun's HEIGHT displaces the pivot by the same amount,
+> which becomes an orbit the moment the wrist rotates."* (15 cm bought an 8 inch
+> orbit.)
+
+The weapon's answer was **two knobs, two jobs: grip = where it pivots, view =
+where it sits**, with placement applied in the VIEW frame after the model
+transform where it cannot create a lever. The off hand now has the same pair:
+
+| knob | frame | job |
+|---|---|---|
+| `off_hand_cm` (`offHand*Cm*`) | the hand's own axes, inside the rotation | where it **pivots** |
+| `off_hand_view_cm` (`offHandView*Cm*`) | the camera basis, on the WORLD target before the push into component space | where it **sits** |
+
+The numpad's free-hand position mode drives the VIEW knob (help text: `FREE-HAND
+PLACE`), because "move the hand" is what a tester means when they reach for it;
+the pivot knob stays reachable through `hands.ini`. Roll is dropped from the
+camera basis for the same reason the weapon drops it - the camera's own roll must
+not tip placement.
+
+**The general rule, now paid for twice:** an offset applied inside a rotation is a
+pivot, not a placement. Any new knob that nudges a driven mesh has to say which of
+the two it is, or it will be tuned as one and behave as the other.
+
+## Session 72 (2026-08-30) - THE OFF HAND'S ARM: eight couplings, and the shape they share
+
+**SOLVED, headset-confirmed: the off-hand arm is fully decoupled from the held
+hand.** This is the long half of the off-hand work and it is worth reading before
+touching either arm, because the same mistake recurs in eight different places
+and one of them will be made again otherwise.
+
+### The shape every one of them shares
+
+> **A quantity that is not fully determined by the solve takes the frame it is
+> written into, and that frame is the ACTOR - which is the held hand.**
+
+The free hand's bones live in component space, which is relative to the `AHands`
+actor, and this mod writes that actor from the HELD controller every frame. So
+component space *spins and translates with the held hand*. Anything that is not
+pinned to a world-anchored reference is therefore pinned to the other hand.
+
+s70i had already written this down for the shoulder - *"the entire space the arm
+lives in spins with your wrist... there is no bone write that can fix that"* -
+and the lesson did not get carried to the other seven cases.
+
+### The eight, in the order they were found
+
+| # | symptom | cause |
+|---|---|---|
+| 1 | off-hand IK worked in some runs, not others | `g_armRefValid` was set ONLY in `drive()`'s settle window, indexed by the HELD hand. The free hand had an arm reference only if that hand had previously been the driven one - **equip-history dependent, not build dependent** |
+| 2 | "the right hand drives the left arm's rotation" | when it did fire, it solved the free arm from `g_armRef`/`g_armW0` captured in the HELD role, and read `g_ref` (the held bank) for scale |
+| 3 | hiding the driven arm silently killed the off arm's IK | `g_collapse` was one global doing two jobs for two hands: hiding the driven sleeve AND gating `solve_arm()` for both |
+| 4 | bicep and elbow roll with the held hand | `quat_from_to` returns the MINIMAL rotation - **zero component about the axis** - so the arm's roll was never set by the solve. A free DOF takes the actor |
+| 5 | forearm still rolls after 4 | the twist HELPERS (22/23) were built from the bare swing, so their axial DOF was free and the hand twist rode on top of it |
+| 6 | elbow orbits the arm axis | the pole is a blend, and its `poleRig` half is `aSEn` - a capture-frame COMPONENT-space direction. At the shipped `ElbowFollowWrist=0.4` that was 40% of the pole spinning with the actor |
+| 7 | shoulder shifts forward/back as the weapon pitches | the rig DrawScale (0.8) multiplies bone translations; the wrist target was divided by it and **the arm was not**, so the shoulder rendered at `0.8*sWorld + 0.2*actorLoc` - a fifth of the actor, on a 44 cm lever (`posFwdCmR`). Then, with S and W divided but the bone LENGTHS not, the triangle was closed with sides 1.25x short of its own hypotenuse and the elbow slid |
+| 8 | "the two forearms are perfectly synced" | **`g_elbowPrev` held last frame's elbow in COMPONENT space.** Smoothing this frame's elbow against it while the actor had travelled in between dragged the elbow after the actor. The wrist is not smoothed, which is why it was immune - and a fixed wrist with a dragging elbow pivots the forearm |
+
+### What each DOF is pinned to now (free arm)
+
+| bone | roll pinned to |
+|---|---|
+| clavicle | authored; shoulder is head-relative (s70i) |
+| upper arm | the pole |
+| elbow / forearm | the pole |
+| twist helper 22 | pole + 0.5 x hand twist |
+| twist helper 23 | pole + 1.0 x hand twist |
+
+The twist angle is measured about the forearm axis against the hand's
+**actor-cancelled** orientation (`qtc`), which is what makes it independent of the
+held hand rather than a correction applied afterwards.
+
+### Fallout 4's FRIK named the fix
+
+`rollingrock/Fallout-4-VR-Body`, `src/skeleton/Skeleton.cpp` (`setArms` /
+`solveArmToHandWorldTarget`, algorithm credited to SkyrimVR's VRIK):
+
+> *"For non-power armor, `forearm2` and `forearm3` receive opposing rotations
+> based on computed wrist twist."* - the arm's roll is driven EXPLICITLY from the
+> hand, never left free.
+>
+> *"Hand rotation is decoupled from arm solving."*
+>
+> *"Each arm solves independently via the `isLeft` parameter, with no cross-arm
+> coupling in the solver logic."*
+
+BS1 has the same bones: `patterns.h` records the sleeve as *"3 clavicle,
+4 upperarm, 5 elbow, **22/23 forearm twist helpers**"*. This tree was writing
+22/23 with the forearm's own swing and no wrist twist at all.
+
+**Not yet ported, and worth having:** FRIK's shoulder reach offset
+(`norm(shoulderToHand) * adjust * armLength * 0.08` - ours anchors the shoulder
+rigidly) and its elbow constraints (law of cosines with hand-behind-body,
+chest-crossing and arm-lift limits).
+
+### MEASURED NEGATIVE: there is no script-level IK surface
+
+`HavokSkeletalSystem.uc` is a **4-line stub** and the only IK class in the
+decompiled tree is `AnimNotify_FootIK`. There is no skeletal controller to hook
+from UnrealScript. **The bone array is the only lever** - do not go looking again.
+
+### The two probes that did the work, and what skipping them cost
+
+- **ARMHOLD** - reads the free arm's five bones back after the write. All five
+  held to **0.0 UU / 0.1 deg across 41 samples** while the held hand was twisted
+  every way, which killed the entire "something re-evaluates the arm" class in one
+  run and sent the search back into the solve's own inputs, where the faults were.
+- **FOREARM** - lifts the free elbow and wrist into WORLD. With the off hand held
+  still: **wrist steady to 0.4 UU, elbow swinging 25 UU.** Every geometric input
+  to the elbow was fixed, so the culprit had to be the only STATEFUL term - the
+  smoothing. Found #8 in one run.
+
+**Three whole-arm corrections were tried before the first probe was written and
+all three made the coupling worse:** `inv(A_now) * A_capture`, its inverse, and
+rebuilding the orientation in world. Three DIFFERENT shapes failing the same way
+is not three wrong signs - it means the correction is aimed at the wrong thing.
+Stop at the second and measure.
+
+### Standing rules for this subsystem
+
+1. **Anything derived per frame must be anchored in world or in the head frame,
+   never left in component space.** That includes smoothed and remembered values -
+   #8 was pure state, not geometry.
+2. **Every rotational DOF must be explicitly pinned.** `quat_from_to` leaves the
+   axial one free; a free DOF is a coupling waiting to be reported.
+3. **The DrawScale divide applies to EVERYTHING written as a bone translation**,
+   and to any length compared against one.
+4. **Per-hand state must be per hand, and per-role state must be per role.** #1
+   and #2 were one bank serving two roles.
+5. **Measure before the third attempt.** Both probes above answered in a single
+   run what several code changes could not.
+
+## Session 73 (2026-08-30) - MAKING THE FREE ARM ROTATE: frames, gradients, and the hinge
+
+Continues session 72, which decoupled the free arm's POSITION. This is the half
+that made it rotate correctly, and it is signed off in the headset: *"it looks and
+feels amazing"*.
+
+### THE ONE-LINE SUMMARY
+
+> **The held arm is CARRIED by the actor. The free arm is not, so everything the
+> actor was doing for it implicitly has to be reconstructed explicitly - and each
+> thing that was not reconstructed showed up as a coupling, a lock, or a pinch.**
+
+Every fault below is one more thing the actor had been doing for free.
+
+### THREE FRAMES, AND USING THE WRONG ONE COST THREE REGRESSIONS
+
+This is the single most expensive lesson of the two sessions. "Not the actor" was
+never the answer; there are THREE candidate frames and most of this subsystem
+wants the third.
+
+| frame | moves with the HELD hand | moves with the PLAYER | use it for |
+|---|---|---|---|
+| component (actor) | **yes** | yes | nothing that must stay put |
+| world | no | **no** | nothing that must follow the player |
+| **body** (`base[XYZ]` + body yaw) | no | yes | almost everything |
+
+Measured failures, one per wrong choice:
+
+- **elbow smoothing in COMPONENT space** -> the elbow dragged after the held hand;
+  the forearm pivoted about a fixed wrist and the two forearms read as "perfectly
+  synced" (s72u).
+- **elbow smoothing in WORLD** -> running forward left the elbow behind while the
+  shoulder and wrist travelled with the body, and the arm STRETCHED (s72w).
+- **rig pole fixed in WORLD while its blend partner was body-relative** -> the
+  elbow oscillated in lockstep with the right stick: *"it feels like right stick
+  controls the placement"* (s72x).
+
+s70i had already chosen the body frame for the shoulder and written down why. The
+rule generalises: **anything derived per frame, including remembered and smoothed
+values, belongs in the body frame unless there is a reason it does not.**
+
+### A QUANTITY CANNOT BE MEASURED AGAINST SOMETHING THAT MOVES WITH IT
+
+Two separate faults, same shape:
+
+- `ElbowFollowWrist`'s follow half was the AUTHORED bend - a fixed direction - so
+  it never followed a wrist at all. Rotating the off hand moved the hand and left
+  the elbow, pinching the mesh between them. It now takes the free hand's own
+  orientation (`qtc`), which is actor-cancelled (s73b).
+- ...but the SAME vector was also the reference the segments' roll is pinned to,
+  and the twist is the residual between that pinned forearm and the hand. Once
+  the pole followed the wrist the residual collapsed and the forearm stopped
+  rolling: *"the elbow pivots out, but it doesn't seem to rotate at all"*. The
+  roll pin keeps a body-relative pole; the elbow position keeps the blended one.
+  **Two jobs, two poles** (s73d).
+
+### THE ELBOW IS A HINGE, SO IT CANNOT HOLD A TWIST STEP
+
+The first twist gradient was 0.25 bicep / 0.50 forearm - a 0.25 STEP across the
+elbow, up to 45 degrees of twist discontinuity at a joint with no twist axis. The
+skin spanning it absorbs the whole step, which is the hourglass. Raising the
+bicep alone would only have moved the pinch.
+
+**Segments either side of a hinge must carry the same roll**, and the gradient
+belongs inside the forearm, where the twist helpers exist because that is where a
+real forearm pronates - radius over ulna, between elbow and wrist.
+
+### UNWRAP BEFORE YOU SCALE
+
+`atan2` returns `(-pi, pi]`, so the twist jumps 2pi at one point in the wrist's
+travel. A full turn is INVISIBLE on a bone given the whole angle - which is why
+the wrist end never flickered - but the gradient multiplies it by a FRACTION, and
+a fraction of 2pi is not a full turn: the forearm snapped 180 degrees and the
+bicep 90. ARMIK logged it flipping `+179.9 / -179.9`, which is how it was found.
+
+**Any angle that will be scaled, blended or interpolated must be made continuous
+first.** Carry it across frames by the shortest step and accumulate. That is
+continuity, NOT smoothing - there is no lag - and the comment says so, because
+the two look alike in a diff.
+
+### EASE DERIVED JOINTS. NEVER EASE A JOINT THAT MUST MEET SOMETHING UNSMOOTHED
+
+The twist was eased on the elbow's lane, copying FRIK. Wrong here: the twist
+exists to make the forearm MEET THE HAND, and the hand tracks the controller
+live. Easing one side of a junction guarantees a visible mismatch for the length
+of every wrist movement - exactly when a wrist is looked at.
+
+FRIK eases because its twist is an `asin` of a dot product, noisy near the poles.
+Ours is an `atan2` of an already-stable orientation, so there is nothing to
+denoise. The ELBOW keeps its easing: it is a derived joint with no counterpart to
+match, which is the case easing is for.
+
+### TWO BONES DO NOT SHARE AN AXIS CONVENTION
+
+The twist was the raw angle between the forearm's local up and the hand's, and a
+hand's local axes are not its forearm's. That difference baked in as a constant,
+so the wrist never quite met the hand - small, identical on both hands, present
+with NO trim dialled.
+
+The helpers want the CHANGE in twist since the authored pose, so the same angle
+is measured between the AUTHORED forearm and AUTHORED wrist and subtracted. It is
+derived from capture data, so it is automatically right per weapon and per
+plasmid with no constant to tune.
+
+**And a trim must never be used to hide it.** A mirrored right-hand rotation
+trim was seeded on the theory that the plasmid off hand needed the left's -206
+roll; the tester reported the rotation already matched their controller untuned,
+which meant the fault was downstream and the trim was masking it. Reverted. A
+trim that compensates for a real fault is how the next session is lost - the same
+way `ElbowFollowWrist` sat as a slider over a frame bug for three sessions.
+
+### THE SCALE ARITHMETIC, WRITTEN OUT ONCE
+
+A component-space vector `v` renders at `k*v`, where `k` is the rig actor's
+DrawScale (0.8 on the shipped rig).
+
+- A POINT that must land at a given world position is written `p/k`.
+- A LENGTH compared against a distance between two such points is written
+  **unchanged** - the authored segment renders at `k*|a|`, which in the divided
+  space is `k*|a|/k = |a|`.
+
+Dividing the lengths as well stretched every segment by 1/0.8, the forearm
+overshot the hand, and the skin between the last helper and the wrist stretched
+to cover it: *"like you have a super long wrist"*.
+
+### THE SHARE IS 1.0 BECAUSE THAT IS WHAT THE HELD ARM DOES
+
+The held arm gets no explicit twist at all - the twist block and `pinRoll` are
+both `freeBank`-gated, and the held call site passes `handQ = nullptr`. Its whole
+roll comes from the actor, which rotates fully with the held controller. So every
+held-arm segment rotates 1:1 with that wrist: share = 1.0, no gradient.
+
+`g_armTwistShare` therefore ships at 1.0 - a deliberate match, not a guess - with
+`vrbones armtwist <0..1>` live for anyone who wants the bicep to roll less than
+the wrist, which is what a real humerus does.
+
+### STANDING RULES (extending session 72's five)
+
+6. **Pick the frame deliberately: component, world, or body.** Body is usually
+   right. Three regressions came from moving something out of a wrong frame into
+   another wrong one.
+7. **Never measure a quantity against a reference that moves with it.** If a pole
+   both places a joint and defines the zero of an angle, it needs to be two poles.
+8. **Segments either side of a hinge carry the same roll.** Gradients belong
+   inside a segment, not across a joint that cannot twist.
+9. **Unwrap any angle before scaling, blending or interpolating it.** A 2pi jump
+   is invisible at weight 1.0 and a disaster at every other weight.
+10. **Ease derived joints only.** Anything that must meet an unsmoothed thing must
+    itself be unsmoothed.
+
+### STILL OPEN: the two arms should be ONE implementation
+
+`solve_arm()` is already shared - both hands call it - but its behaviour forks
+internally on `freeBank` in six places: the twist gradient, the roll pins, the
+smoothing frame, the reference bank, the shoulder mirror, and the DrawScale
+divide. So the arms are one function and two behaviours, and every fix this
+session had to be written for one of them.
+
+That fork exists for a reason - the held arm is carried by the actor and the free
+arm is not - but it is no longer a NECESSARY reason. Now that the free path
+solves an arm explicitly and correctly from nothing but that hand's own
+controller, it should reproduce the held arm too: the actor would still carry the
+rig, but the bones get overwritten either way, so the result should be identical
+while the code becomes one path.
+
+**Do it as its own change with its own headset pass.** The held arm is the
+signed-off, headset-accepted baseline, and unifying is exactly the kind of change
+that trades a known-good half for elegance. The gate is: with `freeBank` forced
+true for both hands, the held arm must be indistinguishable from today.
+
+## Sessions 75-76 (2026-08-31 / 09-01) - THE FOREARM'S TWIST: a rest pose, and a second joint
+
+Recorded 2026-10-07 from the code and the commit trail; the sessions themselves
+ended without a handoff. Everything here is `solve_arm()`, free arm only - the
+held arm's twist is carried by the actor and never derived (`handQ` is null).
+
+### The accumulator must carry the TRUE angle (s75b)
+
+s75 (`d03ac49`) bounded the unwrapped twist at +-85 deg and stored the CLAMPED
+value back as the unwrap's previous angle. Measured at a collapse point, arm
+completely still and every other quantity healthy (swingDot -0.51, fp 1.0000,
+poleTilt 2 deg): raw read +250 deg frame after frame, clamped to +85 - a 165 deg
+error held rock steady.
+
+Why: the unwrap takes the shortest step FROM THE LAST TRUE ANGLE. Pin that at the
+limit and, with a true measurement near -110, the shortest step from +85 wraps to
++165, lands on +250, clamps back to +85, and re-derives the same wrong branch
+next frame. A stable fixed point in the wrong place, at a different pose per
+direction because the branch depends on the side it was approached from.
+
+**Rule: clamp what drives the bones, never the state an unwrap steps from.**
+
+### Joint limits are about the joint's REST pose, not zero (s75c)
+
+The measured twist is between the forearm's local up and the hand's, and those
+two bones do not share an axis convention; s72z subtracts an authored constant
+for that and under-corrects. Measured: the free arm's twist at rest has a median
+of -59 deg (92% of samples negative, 163 past -85 against 5 past +85; -59.9 at
+the captured neutral). A limit centred on zero therefore gave ~26 deg of travel
+one way and ~144 the other - the reported "collapses one way, works the other".
+
+So the rest angle is captured as the first measurement after a reference drop
+(the settle gate - the arm is at rest there by definition), dropped wherever the
+reference is (`free_ref_drop`, `on_world_change`), and both the limit and the
+applied rotation are about it. Splitting the ABSOLUTE angle while clamping the
+travel left a permanent ~60 deg twist at rest; the applied twist is travel.
+
+### The excess belongs to the humerus (s76)
+
+Every single-joint bound failed, each in its own way:
+
+| form | measured failure |
+|---|---|
+| unbounded accumulation | a 360 deg roll took the angle -11 -> +349 and pinned it |
+| store the clamped value | latched 165 deg off (above) |
+| clamp the wrapped angle | snaps ~170 deg at the far side |
+
+The controller is held by a real arm, so every orientation that arrives was made
+by a valid pose; the roll past the forearm's range is a real rotation of a joint
+the solve was not driving. A hand reaches nearly 360 deg of roll from ~175 deg of
+forearm because the humerus rotates at the shoulder for the rest (internal
+rotation with pronation, external with supination).
+
+So the travel is split: the forearm takes up to `armTwistLimitDeg` (85), the
+humerus the remainder up to `humerusTwistLimitDeg` (90), and `fore + hum ==
+travel` by construction up to the combined limit. The humeral part rides both
+segments either side of the elbow (a hinge holds no step - session 73 rule 8);
+only the forearm carries the 0 -> 1 gradient to the wrist. The accumulator is
+bounded at the combined limit instead of an arbitrary 170.
+
+Clamping BEFORE the split made it meaningless: theta capped at neutral+85, the
+humerus only ever saw the leftover 37.7 and the sum stalled at 122.7 while the
+true angle ran on to 300. There is no output clamp ahead of the split now.
+
+`humerusTwistLimitDeg` is in `hands.ini`, the F10 bones panel and has a getter;
+0 turns the split off (the s75 forearm-only clamp) and A/Bs it.
+
+### ARMDIAG - always on, 2 Hz per arm and role
+
+One line per arm: twist raw/clamped/neutral/travel, the fore/hum split, swingDot
+(approaching -1 = `quat_from_to` is near its arbitrary-axis branch, the 180 flip),
+poleTilt (how far `elbowFollowWrist` swung the pole), and the pre-normalisation
+lengths of both twist references (`fp` under 0.2 = the forearm's +Z is along its
+own axis and the angle is noise). Deliberately NOT behind `probes_on()`: the run
+before it came back with 504 ungated SHOULDER lines and nothing else, because the
+rest needed a checkbox nobody ticked.
+
+**Status: built and iterated against headset logs; the final split has not been
+signed off in the headset.**
+
+## Session 77 (2026-09-01) - THE HELD ARM WAS SOLVED THROUGH THE WRONG ACTOR
+
+Recorded 2026-10-07 from the code and the 2026-09-07 log. Reported in the headset:
+rolling the main hand's wrist far enough swivels the shoulder out of position.
+
+### Two actors in one frame
+
+`drive()` pushes the held cluster into component space through the actor as READ
+at its top. The held arm then re-derived its actor from
+`hands::last_actor_write()` - which `hands.cpp` stores only AFTER both arm solves
+have run, so it returned the PREVIOUS frame's write. Hand and arm divided out two
+different transforms, and the shoulder sits 40-70 UU from the actor origin, so
+the residual showed up there as an orbit. The actor's rotation is the main hand's
+wrist - exactly the reported trigger. s71b had found and fixed this identical
+defect for the FREE hand; the held path was never brought along.
+
+### The live read is the WORSE choice - measured with SHOULDERLAND
+
+The first fix made the arm use the same live read as the cluster. SHOULDERLAND
+(below) then measured it, held arm, player still, rolling the main wrist, 84
+samples: the requested shoulder was bit-identical on every sample - the body-frame
+anchor is perfect and never was the defect - while where it LANDED matched on 76
+frames and was 8.75 / 20.0 / 21.0 / 24.6 / 27.5 / 31.4 / 32.3 UU away on the
+other 8.
+
+ACTORWATCH gave the cause: the engine changes the rotation we wrote by a
+SUSTAINED pitch -23.9 yaw +31.6 roll -41.1 deg (four consecutive samples within
+0.5 deg), and `late_write()` puts ours back for the draw. A live read returns the
+engine's actor, not ours; converting through one and rendering through the other
+puts that angle on the shoulder's lever. The control was in the same run - the
+free arm, already handed the intended transform:
+
+| | worst SHOULDERLAND gap |
+|---|---|
+| held arm, live read | 32.27 UU |
+| free arm, intended write | 3.26 UU |
+
+So `drive()` now takes `actorWriteLoc`, the location `hands.cpp` is ABOUT to
+write, paired with `gp.rot` (which is the rotation it writes in mode 3). Null in
+mode 2, where the actor stays engine-placed and the live read is the only
+truthful source. **Never solve against a read of an actor the mod also writes.**
+
+### SHOULDERLAND - the probe, and what it has said since
+
+Carries last frame's pair (the world point asked for, the component point
+written) and re-lifts the component point through THIS frame's actor; the gap is
+the displacement the actor put on the shoulder between conversion and draw.
+Always on, 2 Hz per arm and role, flagged above 5 UU. The comment in `solve_arm()`
+writes down what each hypothesis would print before any run.
+
+**OPEN.** The only log since the fix (2026-09-07, 26 s, not a deliberate wrist-roll
+test) reads, per arm: held median 3.75 / p90 4.87 / max 20.55 UU, free median 3.59
+/ p90 4.87 / max 20.57 UU. The held arm's worst case fell from 32.3 to 20.6 and the
+two arms now agree, but neither is at the ~0 the fix predicts. The next run should
+be the probe's own protocol: both hands still, roll the main wrist slowly.
+
+## 2026-10-10 - the scene depth and the cameras, for DLSS and the alternate frame warp
+
+Design and offline measurements: `bioshock1/TEMPORAL.md`. The engine facts it rests on,
+with their status:
+
+| Fact | Source | Status |
+|---|---|---|
+| Scene depth = `D24_UNORM_S8_UINT` at the backbuffer size, typeless resource (an R24X8 SRV view exists) | "D3D11 frame map" above (T1 / T34) | dump-proven, 1920x1080 |
+| The world renders through `DrawIndexed` only; the scene DSV stays bound through the tonemap and the HUD | "D3D11 frame map", session 19 | dump-proven |
+| Standard D3D projection: near 10 uu, far 65536 uu in gameplay (1024 in another branch), conventional depth (0 near) | the BioShock VR DLSS/DLAA community fork (MIT), `temporal_guides.cpp` comments, IDA on `BioShockHD.exe`'s finite projection builder | **measured in game 2026-10-10 09:15** (Quest 3, 2750x2850 eyes, 460 frames): the vector audit's depth-scale sweep `0.25:0.0202 0.5:0.0142 1:0.0071 2:0.0115 4:0.0127` - scale 1 lowest; vectors 0.0071 vs rotation only 0.0136 vs no motion 0.0171 |
+| CalcView calls per frame | the 2026-10-10 log: `calcview in=130 out=398/s` with 130 builds/s; BRVR measured 4.2 per frame (one per call site: the render view plus movement/AI/audio consumers carrying different rotators) | measured. Exactly ONE call per frame runs inside the gameplay scene build (caller `kSceneBuildGameplayRetRva`): that one is the render view. Per-frame state must key on it, never on calls |
+| The foreground pass (arms, weapon) renders through the WORLD lens | session 15/16 (`vrfgfov` match, default on) | dump-proven |
+| Whether the foreground pass CLEARS depth before drawing | the 2026-10-10 19:28 run (clears logged as `\|`): `381W 8w 8w 4w 261w 10w 75w 32w 42w 3w \|` and `91W 55w 17w 11w 3w \|` - no clear until after every pass | **answered: NO.** The foreground (hands, weapon) draws into the world's own depth, first in the main pass (session 21), so there is no separate hands pass and no hands mask (`with a hands pass 0`); the later segments are more of the world after other surfaces were bound |
+| The foreground draws' projection vs the world's | two frame dumps (2026-10-09 20:55, `framedump_20554*`), each draw's local-to-clip matrix in cb0 floats 40..55: the z row is A x the w row (+ B in the translation), near = -B/A | **identical**: 37 foreground draws (bake stacks 0x3DBF7C / 0x3EDCBF, the hands draw 26178 indices) and ~570 world draws all give near = 10 uu (+-1%, the local scale), the tangents match (s90). The MATRICES are consistent - but see the next row: the viewport is not |
+| The viewport depth range of the foreground draws | the draw tap's census (RSGetViewports on sampled DrawIndexed calls), headset run 2026-10-10 20:48 | **measured: the viewmodel draws into viewport depth [0, 0.010]**, the world [0, 1] (and the sky [0.990, 1.000]). So the stored depth of the hands and weapon is 1% of their true device depth: decoded plainly it reads at the near plane (~4x too near for a hand at 45 uu). Any pixel with raw depth below 0.010 is viewmodel - world geometry only lands there within near / 0.99 = 10.1 uu of the eye. `temporal.cpp` re-expands that range automatically (`dlss squeeze off` to compare) |
+| The frame-delta function (BRVR's DeltaClamp target): `__thiscall`, `ret 8` = (stack arg1, stack float deltaSeconds), virtual (zero static E8/E9 callers), called on two objects per frame before the scene build | lead: BRVR module+0x53D850 and its 47-byte signature (bytes 6..9 an SEH scope-table address, wildcarded). Re-derived 2026-10-10 on this exe with `disasm-rva.py`: `search` finds the signature tail (bytes 10..46) exactly once, at 0x53D85A; `dis 0x53D850` shows the prologue `55 8B EC 6A FF` and `ret 8` at 0x53E844 | static-proven; patterns `kFrameDeltaRva` + prologue + tail, byte-checked at install. Live behaviour (holding it freezes the world for one frame and the bank pays out) is BRVR's measurement, not yet this mod's |
+| CalcView's final `loc`/`rot` is the camera the frame renders with | the stereo work (SR/AER eye offsets are applied there and render as expected) | assumed exact; any later camera shake or bob would show as a vector-audit residual while still |
+
+## Session 81 (2026-10-08) - the arm on the Dishonored solver, and what the rig weights say
+
+Offline, from the Havok reference skeleton and skin weights that `tools\bsmesh-export.ps1`
+reads out of `0-Lighthouse` (docs/bioshock1/HAVOK_AND_PACKAGES.md). No game was launched.
+
+- **The arm chain is Biped:** `Clavicle -> UpperArm (43.3 UU) -> Forearm (30.0 UU) -> Hand`.
+  Every limb bone has +X along the limb. `ForeTwist` hangs off `UpperArm` at the elbow;
+  `ForeTwist1` is its child, halfway down the forearm (15.0 UU). The runtime sleeve
+  indices `{3,4,5,22,23}` / `{24,25,26,45,46}` are these bones in the same order: the
+  engine's bone array is the Havok skeleton's order (47 bones, `R_grip` 43,
+  `IKbindLhandDummy` 44, as measured live).
+- **What carries skin** (summed weight per arm): `ForeTwist1` 371, `Hand` 306, `Forearm`
+  238, `UpperArm` 188, **`Clavicle` 0, `ForeTwist` 0**. Whatever is written to the clavicle
+  or the elbow helper is invisible. The forearm's shape is the blend of `Forearm` and
+  `ForeTwist1`: that pair is where a twist gap pinches.
+- **The Havok reference pose has the arms reaching forward** along -Z, with the spine
+  along +X and the right arm on +Y (forward -Z, right +Y, up +X: Unreal's handedness).
+- **New capture:** the settle bank now also keeps the reference wrist's ROTATION
+  (`g_freeArmW0Q`), which the v2 solver measures the forearm roll against.
+
+The solver, its integration and its validation are in `docs/bioshock1/ARM_IK.md`.
+
+## Session 82 (2026-10-08) - BS1's skeleton evaluator, for a post-evaluation hand drive
+
+Offline, `tools\ida\hd1_skelinst_update.py` against the staged `BioshockHD.exe` (md5
+`b4db411a...`). The BS1 twin of BS2's `wfix` target (BS2 session 74). Not consumed by code
+yet. The design that will consume it is `docs/bioshock1/HANDS_DISHONORED.md`.
+
+- **The evaluator is `SkeletonInstance` vtable slot `+0x9C`** (vtable RVA `0xE19ACC`),
+  target **RVA `+0x597CF0`**, 808 bytes, thiscall with no stack arguments. Hex-Rays reads
+  it as `(int *a1@<ecx>, int a2@<ebp>)`. The `@<ebp>` is probably its SEH frame, so copy
+  BS2's convention-agnostic naked ret-stub rather than trusting a C++ detour.
+- **The gate around it** (decompiled at `+0x598020`, slot `+0xA0`, and inlined at each
+  caller): `if (freeze[+0x20] && lastEvalTime[+0x80] > 0) { dirty[+0x88] = 0; skip }`
+  `else if (dirty) { evaluate(); dirty = 0; }`. So freezing suppresses evaluation
+  entirely, and the dirty byte `+0x88` is the only other switch. That is why the mode-3
+  drive, which clears the dirty byte every frame, sees an evaluation only ~1 frame in 19
+  (ARCHITECTURE s68d).
+- **Four dirty-guarded call sites:**
+
+  | Site | In function | Note |
+  |---|---|---|
+  | `+0x319F55` | `+0x319F00` | Gets the actor's SkeletonInstance (`+0x3FC`), evaluates it, then calls the mesh instance's virtuals `+0x12C` and `+0x128` with a 64-byte matrix: the per-draw skin path, BS2's pass-1 update shape |
+  | `+0x434B28` | `+0x434A70` | |
+  | `+0x598050` | the `+0xA0` gate | |
+  | `+0x6429AE` | `+0x6423F0` | |
+
+  Hooking the slot function catches all four.
+
+### Session 82b - the evaluator measured live (simulator, one run)
+
+`vrbones evalprobe on` in `vrhands mode gun`, so the drive writes nothing, and the probe
+sets the dirty byte every CalcView. BS1, Welcome to Rapture, stereo on, 138 s, no crash.
+
+| Measured | Value |
+|---|---|
+| Evaluations | 64-71 a second against ~140-150 CalcViews: **once per game tick** (one per stereo pair) |
+| Where | **all in the game tick**, caller `0x598056` (the `+0xA0` gate); **0 in render pass 1, 0 in pass 2** |
+| Thread | 0 on another thread, 0 nested |
+| The hooked copy against the live array at the next CalcView | **0 mismatches in ~19,000 checks** |
+| Freeze / last-eval | freeze 0; last-eval time advancing 1.0 s per second |
+
+So with the dirty byte set and no freeze, the engine rebuilds the hands once per tick, in
+the tick. Nothing re-evaluates between the passes, so a pose composed in the hook is the
+pose both eyes draw.
+
+Not measured: animation content. The save had nothing equipped (`HandsOffscreen`) and the
+bones did not move between evaluations, which is expected for an off-screen rig.
+
+## Session 87 (2026-10-08/09) - BS1 skins on the CPU: the skin palette, and the weapon's draw transform
+
+Static (headless IDA, `tools\ida\rs1`-`rs13`, staged exe md5 `b4db411a...`) and live in the
+simulator (`dumpframe full`, the new `vbtap`, the palette hook's own probes). The consumer is
+`src/game/bioshock1r/palette.cpp`; constants in `patterns.h` "THE SKIN PALETTE".
+
+- **The hands are one CPU-skinned draw.** `NEWPlayerHands` LOD 0 (8,726 triangles) is ONE
+  `DrawIndexed` of 26,178 indices from a 2 MB dynamic vertex ring at stride 56, bake stack
+  `+0x3EDCBF`. Its VS b0 is the 576-byte tier and no other VS constant buffer is bound: no
+  bone palette reaches the GPU. Rigid pieces (the `+0x3DBF7C` stack) draw from static
+  48-byte buffers with their transform in b0.
+- **The skinner.** `FFinalSkinVertexStream` (vtable `0xDF32A0`) slot 9 (`+0x3ED7E0`) calls
+  the **gather** `+0x3ED660` (thiscall: palette cache in ecx; mesh instance, lod, out, a5 on
+  the stack; `retn 10h`; called from that one site with `[stream+0x14]` as the instance). The
+  gather copies `instance[+0x170]` (`FMatrix*`, count `+0x174`, one per skeleton bone) into a
+  per-LOD cache through the LOD's u16 bone map (mesh `+0x44`; LODs `+0xC4`, 288 bytes; LOD
+  `+0x0C`/`+0x10` the map), then calls the dispatch `+0x5EC080` (ecx/edx = rigid vertices and
+  count, stack = skinned vertices, count, palette, scratch, dst; caller cleans), which runs
+  `VertexSkinTask` (`+0x5EBAB0`) inline or on a worker. Rigid vertices are 60 bytes with one
+  bone byte at +36; skinned 64 bytes with four bone bytes at +36 and four weights at +40 (/255);
+  output 56 bytes (position, a 3x3 basis, uv).
+- **The palette's form and space.** 4x4 floats, ROW-VECTOR: rows 0-2 the images of the
+  bind-space axes, row 3 the translation. It is in the SAME component space as the evaluated
+  pose (the space probe: `inverse(pose) * palette` at each wrist is constant while the hand
+  animates, drift 0.000 UU / 0.00 deg, scale 1.000, and mirror-symmetric between the wrists:
+  L (-71.38, -28.47, -5.74), R (-71.38, -28.47, +5.74)).
+- **Which instance.** The gather never sees `actor + 0x128` (that pointer is another object).
+  The instance it skins for the hands holds the hands actor at **`+0x48`** (pointer scan of
+  the 47-bone instance the gather was skinning). Its vtable is `USkeletalMeshInstance`'s.
+- **What else the gather skins** (Medical Pavilion): PlayerHands (47 bones), splicer bodies
+  and `DeadBodyContainer`s (73), the medical doors (3). **No holdable**: the wrench is not
+  skinned.
+- **The held weapon's draw.** A `UStaticMesh` (vtable `0xDF20B4`) drawn through slot 5,
+  `+0x3DBCF0` (thiscall: mesh; record, renderer, a4; `retn 0Ch`), which passes the per-draw
+  record's LocalToWorld (+160) and WorldToLocal (+224), row-vector 4x4, WORLD space (the
+  translation equals the owner actor's location to 0.1 UU), to the renderer's set-transform
+  virtual (+168). The record holds its owner actor at **+0**.
+- **The rest of the vertex ring** (vbtap): its NO_OVERWRITE uploads at a 12-byte stride come
+  from `+0x765C60` (position-only geometry, `+0x5CFF64` in the scene render); the DISCARD maps
+  are the frame-end ring reset (`+0x7B4350`).
+
+## Session 88 (2026-10-09) - the hands' LOD and vertex layout, the Hands state in mode 4
+
+- **The hands' skinned vertices, as the gather sees them** (tools\ida\rs10/rs11 read again for
+  the rigid wrist; `patterns.h` holds the constants): mesh = instance[+0x44]; LODs = mesh[+0xC4]
+  (count +0xC8, stride 288); in a LOD the u16 bone map +0x0C (count +0x10) and the skinned
+  vertices +0x40 (count +0x44). A skinned vertex is 64 bytes with the four bone SLOTS (indices
+  into the LOD bone map, not the skeleton) at +56 and four weights /255 at +60. NEWPlayerHands
+  LOD 0: 3,469 skinned vertices; 142 of them have at least half their weight on one hand and
+  some on that side's arm bones (the cuff ring).
+- **Swapping the LOD's vertex pointer for one gather call is honoured**: the gather pushes
+  [LOD+0x40] to the dispatch at call time, and a worker-queued skinning task keeps that pointer -
+  so the copy must outlive the call (palette.cpp keeps eight).
+- **`hands_state` was never located on mode 4.** Only mode 3's path called `locate()`. The
+  hand-back calls it itself; it locates on the first frame. The states seen in the sim:
+  WeaponIdling, WeaponFiring (~0.7 s for a wrench swing, 1.4 s for a two-press combo),
+  WeaponUnEquipping, AbilityFastEquipping, AbilityIdling, AbilityFiring,
+  FinishAbilityFiringWithEve (PostFiring).
+- **The wrench's Firing is entered ~5-15 ms after the RT press**, and the physical swing's RT
+  pulse (core swing module) is open at that moment: the VR-220 80 ms window separates the two
+  sources cleanly in every run.
+
+
+## Session 90 (2026-10-09) - every draw's cb0 carries its eye; the fg pull is zero on the palette route
+
+- **cb0 floats 56..58 = the eye the draw is rendered from, in that draw's LOCAL space** (float 59
+  is 0). Derivation: for every draw in two sim dumps, the null point of the clip rows x, y, w
+  (floats 40..43, 44..47, 52..55, `M = diag(1/tanH, 1/tanV, 1, 1) * s[R | -R*E]`) equals floats
+  56..58 to within 0.05 local units - world draws and foreground draws alike. Dynamic draws that
+  bake their own transform into the vertices carry zeros there (s in the hundreds; skip them).
+  The row-w norm `s` is the draw's local-to-world scale (0.80 for the hands = their DrawScale).
+- **The hands draw on the palette route**: 26178 indices, the 832-byte tier, a CPU-skinned
+  56-byte VB, stacks `0x3EDCBF` (main) and `0x3EDC1B` (a second pass); its local space is the
+  hands actor's component space. Its eye read (-1.38, +-4.00, 11.16) component units with the
+  camera at (-1.374, 0, 11.166) (`PIVOTPROBE CAM`, same frame): **the fg eye is the per-eye camera
+  exactly, no pull** - +-4.00 x 0.80 = +-3.2 UU, half the 64 mm IPD. Tangents 1.19174 / 1.23502 and
+  rotation rows equal the world view's; the sim's submitted layer FOV (+-50 / +-51.004 deg) is the
+  same frustum. Session 16's +11.5 UU was measured on the bone drive's rigid-section path and does
+  not apply here.
+- How to repeat: `vrhands pivotprobe on`, then `dumpframe full 2` (two present windows = both
+  eyes); decode the hands draw's floats 40..59 against the CAM line.
+
+## Session 91 (2026-10-10) - what the engine attaches to the hands, and the two levers that move it
+
+Measured in the simulator with `vrhands attach` (census, `attach_census.cpp`) on the 11:01 save.
+
+- **The Hands mesh instance (`actor+0x128`) holds a SOCKET TABLE** (`+0x3FA1E0`, tools\ida\rs14):
+  `+0xE8/+0xEC` socket FNames (8 bytes each), `+0xF4` the bone each aliases (8 bytes), `+0x100` a
+  48-byte offset per socket in that bone's frame (the first 12 bytes the origin, world units).
+  19 entries on PlayerHands: every weapon socket (Wrench, Pistol, TommyGun, Launcher, Crossbow,
+  Chem, IrritantBall, PlayerGathererGun) aliases `R_Grip` = bone 43 with no offset; the plasmid
+  sockets (FirePlasmid, IceShards, ParasiteSocket, PustuleBirth) alias `Bip01_L_Hand` = bone 6 with
+  small offsets; **`FireballSocket` aliases the HEAD bone (`bip01_head`, 2) at (10, -65, -3)** - the
+  Electro Bolt cast particle sits there. Bone 44 is `IKbindLhandDummy`, the off-hand grip of
+  two-handed guns (not a muzzle).
+- **Skin weights** (the palette gather's LOD): bones 43 and 44 carry none; bone 6 carries 436
+  vertices (the left hand), 27 carries 436 (the right).
+- **The weapon's children are engine-attached to the weapon**: the Tommy Gun (`MachineGun`) carries
+  `VisibleAmmoModel` (the drum magazine, `AmmoDummySocket`), `TG_upgradeA/B`, three
+  `MachineGun_*MuzzleFX` with `DynamicLight_MuzzleMG`, and `MG_ShellEject`, linked at +0xAC/+0xB0.
+  Electro Bolt puts `ElectroBoltHandLight` and `ElectricBoltSmoke` on `Bip01_L_Hand` and
+  `ElectricBoltParticle` on `FireballSocket`.
+- **Lever 1, the bone write (weapons):** writing bone 43/44 in the engine's array after each
+  evaluation carries the weapon AND everything attached to it (the drum mag sat on the drawn gun
+  in the sim; with the render-side weapon correction alone it floated beside it).
+- **Writing a SKINNED bone is not usable:** bone 6 written the same way bent the left hand back at
+  the wrist during a cast, though the palette's own bone-6 entry did not change (the palette probe
+  read the same inverse bind with and without) and a restore before each evaluation did not help.
+- **Lever 2, the socket offset (effects):** the engine honours the table's offsets - poking
+  FireballSocket's y from -65 to 0 moved the cast particle ~65 UU. Rewriting each hand socket's
+  origin per frame (`bone^-1 x S x bone x offset0`) moved the particle 30 UU onto the drawn hand with
+  the hand intact.
+- Not attached, not yet found: the Electro Bolt BEAMS (white lines that start away from the hand).
+  `vrhands attach find <class text>` lists actors by class for the next run.
+- **The socket offset's convention (sim, pokes of FireballSocket's record):** the record is an
+  FCoords - origin, then X/Y/Z axes (identity for FireballSocket, a rotation for IceShards and the
+  weapon sockets). The origin is in the bone's frame in COMPONENT units: 100 along each axis moved
+  the attached particle exactly 80 UU (DrawScale 0.8) on three orthogonal right-handed axes that
+  match bone array A's orientation. The POSITION, though, sits a constant (15, -30, 30) component
+  units in the head bone's frame away from `A[bone] x offset`, at three head/hand poses: the attach
+  routine builds its origin from the SkeletonInstance's slot +0x10 (actor Location plus the instance's
+  +0x14 vector) and the mesh instance's +0x80/+0x8C (tools\ida\rs16; slot +0xB8 returns A itself).
+  The hands actor's PrePivot (+0x2BC) is zero. Whether the gap is one vector for every bone is open:
+  `vrhands attach` prints it for effects attached straight to a hand bone.
+- **THE PER-FRAME RELATIVE (sim, s91): an attached actor holds its relative at +0x230** (FVector,
+  component units, the bone's frame). The engine places the actor at bone x relative EVERY frame
+  and copies the socket record into it only AT ATTACH. Evidence: ElectricBoltSmoke on
+  `Bip01_L_Hand` holds (0, 2, -2) there and sits exactly that far off bone 6; poking the hand
+  light's +0x230 x to 20 moved it 16.0 UU on the next frame with no re-attach. Pointing an effect's
+  attach name at FireballSocket moved it to that socket's BONE (the head) with its old zero relative,
+  which is how this was found. A hand-bone attachment sits exactly on bone array A (gap 0.00); the
+  (15, -30, 30) gap is the head bone's only.
+## 2026-10-11 - the live resolution change: the engine resizes itself on WM_SIZE
+
+`SETRES` through the viewport Exec seam faults (session 27, above), and the fault site is now
+read: `+0x4C2340` is an Exec dispatcher that dereferences `this+4` first (`sub_10DC2340`: the
+engine pointer of the object it was called on) - the seam handed it the wrong `this`, not a
+bug in SETRES itself. It no longer matters, because the engine has a cheaper door.
+
+Static (headless IDA, `tools\ida\vp1_viewport_resize.py`, `vp2_viewport_resize_path.py`,
+`vp3_setres_device.py`, 2026-10-11, md5 `b4db411a...` == deployed):
+
+| Fact | Where | RVA |
+|---|---|---|
+| `UWindowsViewport::Exec` SETRES branch parses `WxH[xBits][w\|f]` and calls the render device's **SetRes**: `device->vtable[+0xF4](device, viewport, W, H, fullscreen, colorBytes, 0, 1)`; on failure it calls the EndFullscreen helper `+0x857340`. Exec's `this` is the viewport's FExec subobject at viewport+0x44 | `vp2` lines 155-237 | Exec `+0x8525C0`, call at `+0x852B29` |
+| The render device pointer | viewport **+0xA4** (`*(this+96)` from the FExec `this`) | - |
+| The viewport's current size as GETCURRENTRES prints it | viewport **+0xC8 / +0xCC** | - |
+| The fullscreen flag word | viewport **+0x20C**, bit 0 = fullscreen; bits 0x90 = a device is live | - |
+| **The window procedure handles WM_SIZE (case 5)**: windowed (bit 0 of +0x20C clear), a device bound, `wParam != SIZE_MINIMIZED`, and `+0x857C90(viewport, w, h)` true - which is "not fullscreen AND (w, h) differs from the client's stored viewport size at client+0x88/+0x8C" - then it calls the SAME `device->SetRes(viewport, w, h, fullscreen, 0, 0, 1)` | `vp2` window procedure lines 1094-1200, `vp3` | WndProc `+0x858620`; check `+0x857C90`; SetRes call at `+0x8553FF`+ |
+| TEMPSETRES, ENDFULLSCREEN, TOGGLEFULLSCREEN words exist beside SETRES | `vp2` | `+0x857340`, `+0x857470` |
+
+So in windowed mode a change of the game window's CLIENT size is a resolution change the
+engine performs itself (its SetRes, then the swapchain's `ResizeBuffers`, which core already
+answers with an XR swapchain rebuild). `bioshock1r/resize.cpp` does exactly that:
+`SetWindowPos` on the game thread (the window's thread; WM_SIZE is delivered synchronously
+inside the call), then it waits for the HUD capture's backbuffer size to become the asked one
+and reports CONFIRMED / NOT TAKEN. No engine address is called. Caveat read in the WndProc,
+not yet measured: a window larger than the desktop may be clamped by Windows (the engine then
+follows the clamped size; the mod logs both). The Dishonored mod reaches the same result by
+calling its engine's viewport Resize directly (ABI-checked); BS1 did not need that.
+
+**Not run in the game yet.** The proof is the log line `[resize] CONFIRMED: the backbuffer is
+WxH`, followed by core's `xr: real ResizeBuffers` and the eye swapchain rebuild.
+
+**Measured 2026-10-11 (the eighth run): the window route does NOT work on this machine.** The
+client area was already 2750x1415 under a 2750x2850 render (Windows had clamped the window's
+height to the desktop at creation), SetWindowPos to 3072x3072 gave a 3072x1415 client, and the
+engine did nothing: no SetRes, no ResizeBuffers (the WM_SIZE branch's conditions were not met,
+or the message never reached it). `resize.cpp` now calls the render device's SetRes directly
+(viewport +0xA4 -> device, vtable slot 61 (+0xF4), args (viewport, w, h, fullscreen as the
+viewport has it, 0, 0, 1), the viewport's +0x208 reentry counter held, SEH), logging the
+device's vtable and SetRes RVAs and the function's first bytes on every call so the next run
+can pin them. Unverified in the game.
+
+### 2026-10-11 - the foreground scene node under the alternate-eye methods
+
+The original entry inferred that this ctor consumed a one-build-stale camera and
+that enabling sync would fix the arms. Run ten disproved that account. CalcView
+runs first, and the ctor is the submitted player scene. Reading `current_sign()`
+while it returned the already-advanced next eye introduced a whole-scene crossed-eye
+regression. See the corrected call-order derivation below. A hand-disparity ratio
+of 0.55-0.65 alone does not establish this camera hypothesis or a depth gain.
+
+### 2026-10-11 - Pin the SetRes door (polish item 2)
+
+Run 9's banner is v0.8.3-239-g720c9f7. Every confirmed call reports render-device
+vtable RVA 0xE38E7C, slot 61 entry RVA 0x75F940, first bytes 55 8B EC 6A.
+The slot and argument/viewport layout came from `tools/ida/vp2_viewport_resize_path.py`
+and `vp3_setres_device.py`, as above. `patterns.h` now owns both RVAs, the byte signature,
+and the viewport fields previously local to resize.cpp. Live requests refuse before
+changing the reentry counter unless the newly resolved device matches all three.
+`BioshockVR.ini` [Bioshock1R] `RenderDeviceVtableRva` and `RenderDeviceSetResRva` accept
+decimal or 0x-prefixed overrides for a separately derived build; invalid values refuse,
+and overrides still require the same prologue. Mismatches log both actual/expected RVAs.
+
+SaveConfig already persists the active mode: the final ninth-run CONFIRMED at 11:34:21.973
+is 1834x1900, and the post-run [WinDrv.WindowsClient] WindowedViewportX/Y are 1834/1900,
+with StartupFullscreen=False. The inactive fullscreen pair remains 2750/2850. No redundant
+`game_ini::write_viewport` is added; the engine's active-mode save is the persistence path.
+
+
+### 2026-10-11 - Tenth-run correction: committed player-scene eye vs next eye
+
+**Observed:** installed banner v0.8.3-248-g419b304, run 13:02:39-13:03:51. The tester
+reported massive whole-scene back-and-forth flicker. During stable gameplay the log
+still had continuous DLAA/AFW, no missing depth/cameras or fallbacks, and successful
+sync substitutions. Those counters proved execution, not correct eye identity.
+
+**Static derivation:** `build/fg1_camera_order.py` and `fg2_camera_calls.py`, using
+`tools/ida/template.py` / `ida-run.ps1`, on staged/deployed BS1 executable MD5
+`b4db411ab3e5994b6cd39f8dd91fd990`; ProcessEvent anchor verified. Xrefs and disassembly
+show the only direct PlayerCalcView call in scene build at **0x4CCF5D**, before the
+camera ctor call at **0x4CDC31** and frame submit at **0x4CDCD2**. RTTI identifies the
+constructed node as FCameraSceneNode then FPlayerSceneNode, stored at viewport+0x1B0.
+The later **0x4CDD85 -> 0x585AC0** call was wrongly treated as CalcView in old notes.
+No engine RVA or byte signature changes are needed; patterns.h's derivation comments
+now state the correct order and scope. Research output remains untracked.
+
+`CalcViewDetour` stores this build's eye camera, records its temporal tag and invokes
+`commit_render_view`, which advances `g_nextSign`. The subsequent ctor used that NEXT
+sign to select the other eye's old camera while depth/reconstruction metadata still
+named the committed eye. This alters the entire scene, explaining the world flicker.
+The fix separates `g_renderSign` from `g_nextSign`: commit latches the former before
+advancing the latter, and the ctor reads the latch. Root build entry clears it; a
+scripted/menu build that never commits a view preserves the original ctor arguments.
+
+**Offline reproduction:** correcting the pretend game's order BEFORE changing the
+production code yielded 59 passes / 3 failures: ctor-camera error 7.89934 uu, rebuilt
+world error 0.04077 vs rotation-only 0.04145, rebuilt hand error 0.1505. The fixture now
+uses the ctor camera for the whole scene and maintains both per-eye stashes. This is
+a regression test against the old behavior, not an assertion of the old assumed order.
+The repaired run and headset outcome are recorded in TEMPORAL.md.
+
+
+### 2026-10-11 - Run eleven: alternating render-eye origin moved the IK shoulders
+
+Banner v0.8.3-251-g66a102f, 13:29:05 boot. The tester accepts the whole-scene
+stability fix and reports flickering arms with stable hands, plus white pistol edges.
+The two six-present captures are afw-20261011-133304 and afw-20261011-133320.
+Steady log intervals have continuous DLSS/AFW and zero depth/camera/sync misses.
+
+Code tracing finds a separate body-placement error: CalcView applies the AFW/AER
+eye translation before publishing FrameContext.camXYZ. The merged arm IK uses that
+field as the head/shoulder origin; the tracked wrist uses the controller mapping
+based on baseXYZ and the anchor. Thus stationary wrists were attached to shoulders
+that moved by one IPD on alternate frames. SequentialReentry applies its eye shift
+after this publication and did not have that error. No engine field/address changes.
+
+The camera now remembers the actual translation applied by apply_eye_offset and
+subtracts only that translation from the published body origin. Render metadata and
+the scene camera remain at their intended eye. Later common camera edits remain.
+The production helper test covers 600 position/yaw/pitch/roll combinations, including
+large world coordinates: 3600 checks, body disagreement 0.000001 uu, wrist disagreement
+zero; the negative control moves the old shoulders by at least 6.397 uu.
+
+Capture disparity fits also oppose a single foreground gain: the world and far hand
+features favor unity, while nearer sleeve bands prefer different ratios (roughly
+0.45 at 10-15 uu, 0.55 at 15-20 uu, unity at 45-80 uu in the first capture). These
+are moving/deforming surfaces, not an independent lens/depth calibration. Diagnostic
+wording now says so; unity remains the default. Headset confirmation of the arm fix
+is pending. The user's new target is native stereo quality, so this is a checkpoint,
+not completion of the remaining AFW work.
+
+
+### 2026-10-11 - Run twelve: foreground history needs the tracking-frame transform
+
+The 14:12:03 banner confirms v0.8.3-255-g81def2d. The tester accepts the large
+arm-stability improvement and reports gaps in motion plus background-dependent
+edge colour. In the nearly stationary first pair, foreground disparity is 1.000
+and world 1.001, supporting the body-origin correction. The walking capture
+shows broad fallback strips along the palm where the fresh eye cannot see its
+far side. Old foreground had been reprojected as stationary world geometry,
+although locomotion translated both the player and their tracked hands.
+
+A capture-only translation experiment removes the broad strip; it is not a safe
+general solution because render-camera motion also contains physical head motion.
+The implemented solution records the existing room-to-game affine transform from
+FrameContext beside each render camera in the build ring. The origin is the
+existing xr_pose_to_game mapping of XR zero, the yaw is game yaw minus recenter
+yaw, and the scale is the current world scale. Transporting the held camera
+through old and current tracking frames carries only masked foreground through
+locomotion. World samples still use the original source camera. Missing tracking
+frames or a scale change refuse transport. This adds no engine memory writes or
+addresses and retains no engine-object identity.
+
+A transported foreground hint is required as well as the mesh seed: old-world
+triangles can otherwise cover the moved foreground's silhouette seed during a
+turn. The hint uses the transported foreground camera, then the same depth solve
+and current-eye visibility validation. Current foreground keeps priority; the
+old image is still rejected when the controller moves the object away. Capture
+metadata now records the optional transported camera and the replay honours it.
+Old captures lack the tracking transform and therefore keep their original semantics.
+
+Host checks cover 725 transform cases, including physical head motion and invalid
+frames: worst agreement with the existing controller map is 0.003974 uu at large
+world coordinates, versus 17.937 uu for the world-fixed control. The curved GPU
+fixture leaves 2 holes during walking/turning versus 353/360 without transport,
+with zero ghosts after independent object motion and byte-identical world-only
+output. These are reconstruction improvements, not a native second-eye draw.
+
+## 2026-10-14 - The weapon's muzzle: a socket, and the engine call that places it
+
+**Every player weapon starts its muzzle flash and tracer at a socket named `muzzle`** (the
+UnrealScript corpus: each weapon class's OnFiredEffects AttachmentBone and the Tommy Gun's
+TracerStartBone). It is a SOCKET, not a bone - the shotgun's own skeleton has three bones and no
+muzzle (session 20 above) - so it lives in the weapon mesh instance's socket table (`+0xE8` names,
+`+0xEC` count, `+0xF4` aliased bone, `+0x100` 48-byte offset; the same table rs14 found on the
+Hands). Bone 44 is NOT a muzzle (`IKbindLhandDummy`, the census above), so the session-20 "muzzle
+ray" direction is a barrel-ish axis at best.
+
+**`AActor::GetBoneCoords` is `+0x544FA0`** (tools\ida\rs17_bone_coords.py,
+rs18_socket_coords.py), the C++ behind `execGetBoneCoords` (+0x545090):
+`FCoords* __thiscall (FCoords* out, FName name /* by value */, UBOOL bGetSocketCoords)`, `retn 10h`,
+prologue `55 8B EC 83 E4 F8 83 EC 30 56 8B F1`. Its name lookup (`+0x3F4BD0`) first swaps a socket
+name for the bone it aliases, then the SharedSkeletonData map (`+0x5F6500`) gives the index; with
+the flag clear it returns that BONE's coords (no socket offset), with it set `+0x3F9D80` applies
+the socket's own offset record together with the actor's location, draw scale and the
+SkeletonInstance (`actor+0x3FC`, required non-null). The script signature is
+`GetBoneCoords(name BoneName, optional bool bGetSocketCoords)` and the corpus passes `true` for
+every socket. Early returns (no mesh instance at `+0x128`, a failed check through the mesh's
+vtable `+0x120`) leave `out` UNWRITTEN - callers pre-fill it.
+
+**Used by the barrel origin** (`muzzle.cpp`, `aim.cpp`): the held weapon (Hands.CurrentHoldable)
+is asked for `muzzle` with the flag set on the game thread in CalcView. Because the held weapon
+rides the hand bone (the socket write above), this is the drawn barrel. aim runs before hands in
+CalcView, so the gun it reads was placed by the PREVIOUS frame's hand target; the socket is
+expressed in that frame's ray (zero-roll frame, cm) and applied to this frame's fire-ray origin
+(the laser draws that ray, below). **Not yet run in the game:**
+whether the LOD check lets the call through every frame, and the offsets each weapon reports,
+are the first run's questions (`vraim barrel` prints both).
+
+**The barrel's direction (same day).** The same call returns the socket's X/Y/Z axes. Which one
+runs along the barrel is not assumed: per weapon, the signed axis nearest the calibrated aim ray
+is chosen (axes are 90 deg apart, the calibration within a few tens of degrees) and refused below
+cos 60 deg. It is kept in the untrimmed aim pose's own frame (roll included), so it turns with
+the wrist exactly; the fire ray takes it (and so the laser, below). The per-weapon tilt/turn trims
+are bypassed while it holds. **Open for the first run:** which axis each weapon reports, and
+whether the returned axes are the socket's world axes or their transpose (`vraim barrel` logs the
+choice and its dot with the aim ray; a transposed set would show as a poor or wandering match).
+
+**The laser on the fire ray (same day, after the first headset look: the muzzle flash lined up,
+the beam did not).** The laser no longer rebuilds its ray from the controller pose on the render
+thread: BS1 hands core the fire ray's own two points - its origin (the muzzle) and its point at
+the reticle distance - converted to XR the way the camera draws them, i.e. `game_point_to_xr`
+of the point MINUS the head anchor (the camera is the pose map's head plus the head-offset
+sliders, camera.cpp). The reticle now takes the same conversion; before, it skipped the anchor
+(a few cm, invisible at reticle distance but not at the muzzle).
+
+**The barrel's direction comes from the gun body, not the socket (second headset look).** With
+the laser on the fire ray, the beam started at the flash but its line was off the drawn barrel by
+a different amount per weapon, while the run's log showed the socket axis chosen at 0.94-0.98 with
+the calibrated aim ray on all three guns. A socket's rotation is authored for its effect, so the
+direction now comes from `GetBoneCoords("muzzle", false)` - the same lookup without the socket
+flag returns the BONE the socket hangs on, i.e. the gun body's own frame (+X along the barrel on
+the shotgun's identity-ish skeleton, session 20). `vraim barrel src socket` switches back; the
+first measurement per weapon logs both axes and the angle between them.
+
+**The laser drawn into the eye images (third headset look: "still the same").** The run's log
+had the body and socket axes 0.0 deg apart on every weapon - the direction source was never the
+difference - so the remaining gap is between the room-space quads and the gun as rendered. The
+laser and reticle are now drawn INTO each eye image (`laser_draw.cpp`): the fire ray's dots
+projected through the camera that image was rendered with (the build's CalcView camera for a
+native eye, the held eye's `p.target` for an AFW rebuild), after the AFW source copy so the beam
+never becomes rebuild scenery. The gun is drawn through that same camera, so the two cannot part.
+The XR quad laser (`fixedRay`) and dot stand down while it draws and return within 250 ms if it
+stops (no DLSS/AFW image processing, a refused render target). F10 Aim > Aim laser, Advanced:
+"Draw the laser in the game image" (default on). Offline: `gpu-test laser-draw` 7/7.
+
+**The real cause (fourth look: the in-image laser sat exactly where the quads had).** The barrel
+origin ADDED the per-weapon F10 origin sliders on top of the muzzle, as trims - and the tester's
+weapons.ini holds old calibrations that moved the controller ray up to the drawn gun: Pistol
+up +18.7 / right -2.1 cm, MachineGun +13.1 / -3.5, Shotgun +7.5 / -2.8. Every shot and the laser
+therefore started that far above the barrel and ran parallel to it - a different amount per
+weapon, the flash itself (at the socket) lined up. At the barrel the sliders are now bypassed, as
+tilt/turn already were. The capture now records `fresh.ray` and `fresh.muzzle` per present for
+checking a run against the drawn gun offline.

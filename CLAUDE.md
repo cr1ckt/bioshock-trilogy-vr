@@ -11,9 +11,16 @@ The two remasters are Vengeance (UE2.5). **BioShock Infinite is Unreal Engine 3 
 different engine, so no number transfers, and even shapes are suspect.
 
 **`main` is THE branch: all three mods live there, all three work, all three shipped in v0.8.0
-(2026-08-13, session 59).** Branch every new session off `main` and merge back to it - the old
-per-game branches (`bioshock-2`, `bioshock-infinite`) are historical and fully contained in
-`main`; do not start work on them.
+(2026-08-13, session 59)** - but day-to-day work no longer merges straight into it. Branch every
+new session off `staging` and open a **pull request back to `staging`**; `main` moves only through
+a `staging` -> `main` PR at release time. See "Branches, PRs and staging" below. The old per-game
+branches (`bioshock-2`, `bioshock-infinite`) are historical and fully contained in `main`; do not
+start work on them.
+
+**Read `CONTRIBUTING.md` before your first commit.** More than one person works here now:
+`main` is never committed to directly, every change reaches it through a reviewed PR, and
+one commit is one logical change. `docs/ORG-PRACTICES.md` covers the repo and org settings
+that back those rules up.
 
 ## Hard rules
 
@@ -53,16 +60,55 @@ per-game branches (`bioshock-2`, `bioshock-infinite`) are historical and fully c
   no BS1 path changes behaviour. Consolidation and de-duplication are deferred to a dedicated
   "healing" session in the polish milestone.
 
+## Branches, PRs and staging
+
+Direction from VOID (2026-08-23), and it applies to everyone working here.
+
+```
+feature branch --PR--> staging --PR (at release time)--> main --> tagged release
+```
+
+- **Open a PR to merge a branch anywhere.** Never merge branch-to-branch by hand. The PR is
+  what tells you whether there are merge conflicts; when there are, fix them on the branch
+  and **re-test** before merging, rather than discovering them inside someone's unrelated
+  work later.
+- **`staging` is the day-to-day target**, not `main`. It holds work that is tested but not
+  yet ready for a release. Both contributors PR into it, which is what keeps the conflicts
+  small and early.
+- **PR at every good stopping point** - a feature that works and has been tested - not once
+  at the end. Small and frequent beats one large PR: it is what lets the other contributor
+  join a subject while it is still in flight. A large roll-up is for the end of a cycle.
+- **A PR does not have to be merged, and can be a draft.** An open or draft PR leaves
+  `staging`, `main` and the release completely untouched, while still surfacing conflicts
+  and still signalling that the subject is taken. Open it early as a draft by default.
+- **`main` changes only through a `staging` -> `main` PR**, and the release is cut from
+  `main` after that merge.
+- **Always PR a feature branch into `staging`, never into another feature branch.**
+  VOID, 2026-08-23: stacked feature-to-feature PRs "can get quite dirty real quick".
+  If your work depends on another branch that has not merged yet, wait for it to land
+  in `staging` and rebase onto it, rather than opening a PR that targets it.
+
+**NEVER MERGE without the user confirming it first.** Agents may commit and open pull
+requests on their own judgement - that is the point of the flow above, and an open or
+draft PR changes nothing until someone merges it. The merge is the irreversible step and
+the one that needs a human saying yes (VOID, 2026-08-23). Show what is about to land and
+wait; finishing a feature is not permission to merge it.
+
 ## Session protocol
 
 - **START**: read `docs/STATUS.md`, then the current milestone in `docs/ROADMAP.md`, then
-  `git log --oneline -10`. **ALWAYS BRANCH FROM `main`** - every game ships from it since
-  v0.8.0; there is no per-game branch to hunt for. **Working on Infinite?** Same `main`, but
+  `git log --oneline -10`. **ALWAYS BRANCH FROM `staging`** - every game ships from the same
+  trunk; there is no per-game branch to hunt for. **Working on Infinite?** Same `staging`, but
   the ladder is `docs/bioshockinfinite/ROADMAP.md` (milestones I0-I11 after the 2026-08-05
   BS2-shaped restructure), which is separate from M0-M10.
 - Touching engine internals? Read the game's `docs/<game>/ENGINE_NOTES.md` first
   (`docs/bioshock1/`, `docs/bioshock2/` or `docs/bioshockinfinite/`). New findings go there, in
   the same commit as the code that uses them.
+- **Before deriving an address, an offset or a behaviour, check `docs/TOOLS.md`** and use the
+  tool that applies: headless IDA, the UnrealScript corpus, UModel + Blender, FFDec, host
+  tests, the simulator. Static before runtime, runtime before headset. Run
+  `.\tools\tool-paths.ps1` (with `-Init` if it reports the file MISSING) so the session
+  knows which tools this machine has.
 - **Validate in the SIMULATOR before handing a build to the user.** `tools\xrsim-launch.ps1`
   runs the game against `bvr_xrsim32.dll`, a simulated 32-bit OpenXR runtime that presents as a
   Quest 3, so head/hand poses, every controller button, deterministic frame stepping and per-eye
@@ -90,9 +136,29 @@ per-game branches (`bioshock-2`, `bioshock-infinite`) are historical and fully c
 .\tools\xrsim-launch.ps1 -Game bs1           # launch against the simulator (no headset needed)
 .\tools\xrsim-cmd.ps1 "head rot 30 0 0"      # drive the simulated head/hands/controls
 .\tools\xrsim-shot.ps1 -Out shot             # per-eye compositor capture + JSON to assert on
+
+.\tools\tool-paths.ps1 [-Init]               # where IDA, Blender, UModel, ... are on this machine (local file)
+.\tools\ida-run.ps1 -Game bs1 -Stage         # headless IDA (docs/IDA_WORKFLOW.md); then: ida-run.ps1 -Game bs1 <script.py>
+.\tools\model-export.ps1 -Game bs1 -List <pkg>   # UModel; blender-run.ps1 for headless Blender (docs/MODEL_WORKFLOW.md)
+.\tools\bsmesh-export.ps1 -Game bs1 -Package <map> -Mesh <name> [-Check]   # a BS1 rig + Havok clips -> .glb for Blender
+.\tools\uscript-export.ps1 -Game bs1         # the local UnrealScript corpus (tools\uscript\bs1\)
+.\tools\host-test.ps1                        # pure-logic suites in tools\tests\, no game
+.\tools\lint.ps1                             # static checks before a commit
 ```
 
-- BioShock 1: `K:\SteamLibrary\steamapps\common\BioShock Remastered\Build\Final\BioshockHD.exe`
+**The tools are catalogued in `docs/TOOLS.md`.** The scripts are ours and committed; their
+OUTPUT (decompiles, databases, extracted meshes, UI movies, script corpora) is game-derived
+and never is. Paid and third-party programs are referenced by path through the local tool
+file, never copied into the tree.
+
+**THE EXE PATHS BELOW ARE ONE MACHINE'S LAYOUT, NOT THE TRUTH.** Since 65f02fa the
+scripts resolve each game per-machine from the Steam library folders, so `-Game bs1`
+finds it wherever it is. Do not hardcode these, and do not trust them when a script
+disagrees - on the machine this was last verified on, BS1 lives under
+`C:\Program Files (x86)\Steam\`, not `K:`. The **appids** and the **data dirs** are
+the parts that are actually fixed.
+
+- BioShock 1: `<steam library>\steamapps\common\BioShock Remastered\Build\Final\BioshockHD.exe`
   (32-bit, D3D11, no DRM; Steam appid 409710). Launch through Steam; add `-allowconsole` to
   launch options for the Tab console. Data dir: `%LOCALAPPDATA%\BioshockVR\`.
 - BioShock 2: `D:\SteamLibrary\steamapps\common\BioShock 2 Remastered\Build\Final\Bioshock2HD.exe`
@@ -115,19 +181,30 @@ per-game branches (`bioshock-2`, `bioshock-infinite`) are historical and fully c
   adapters (`bioshock1r/`, `bioshock2r/`, `bioshockinf/` from I1) + `shared/` (engine math,
   no addresses)
 - `third_party/` - pinned submodules: minhook, imgui, OpenXR-SDK
-- `tools/` - build/install/uninstall/log scripts, `lib/` shared helpers,
-  `uscript/` decompile workspace (gitignored)
+- `tools/` - build/install/uninstall/log scripts, `lib/` shared helpers, `ida/` IDAPython
+  scripts, `blender/` Blender scripts, `tests/` host test suites, `uscript-export/` the UELib
+  batch decompiler's source, `uscript/` decompile workspace (gitignored)
 - `docs/` - the project's brain; see index below
 
 ## Docs index
 
 | File | Purpose |
 |---|---|
+| `CONTRIBUTING.md` | **Branch, commit and PR rules.** Read before your first commit of a session |
+| `docs/ORG-PRACTICES.md` | Repo and `VR-Stereo-Hub` settings that enforce the above (admin) |
 | `docs/STATUS.md` | **Session handoff**: current state, next steps, blockers, session log |
+| `docs/KNOWN-ISSUES.md` | **Known issues + review findings** per game: what is open, what was fixed and in which session, cleanup deferred to the healing session |
 | `docs/ROADMAP.md` | BS1/BS2 milestones M0–M10 with acceptance criteria and checkboxes |
 | `docs/ARCHITECTURE.md` | Module design, core/adapter contract, stereo strategy, decision log |
 | `docs/RESEARCH.md` | All research findings with sources (engine, prior art, VR runtimes, legal) |
+| `docs/PORT-CANDIDATES.md` | **BS1 behaviours BS2/Infinite have never been tested with**, and the exact one-line opt-in for each. Add a row in the same commit as any core default only one game opts into |
+| `docs/CONTROLS.md` | **Controller config**: `BioshockVR.ini` reference, which keys are live vs planned, hardware notes that decide the d-pad modifier |
 | `docs/VERIFICATION.md` | **Verification catalog**: intent -> tool -> command -> how to read the result. The simulated OpenXR runtime, the command seam, screenshots, img-diff, frame dumps, record/replay - and what still needs a human in the headset |
+| `docs/TOOLS.md` | **The tool catalog, by question**: the local tool file, static RE, game content, host tests, running-process diagnostics, debug programs. Check it before deriving anything |
+| `docs/IDA_WORKFLOW.md` | **Headless IDA**: staging each game's exe, the md5 provenance check, the one-question script shape (RVAs, per-game anchors), where IDA sits in the order of work, traps |
+| `docs/MODEL_WORKFLOW.md` | **UModel + headless Blender, our BS1 rig/Havok converter, FFDec, the UnrealScript corpus**: what extracts per game, commands, workspace, traps |
+| `docs/MODDING_SDKS.md` | **The Unofficial BioShock SDK and CodeRed** (third-party, cloned to the gitignored `external\`): compiling new classes toward Remastered, CodeRed for Infinite, the open questions |
+| `docs/bioshock1/HAVOK_AND_PACKAGES.md` | BS1's package, skeletal-mesh and Havok packfile formats, and how each was derived |
 | `docs/bioshock1/ENGINE_NOTES.md` | BS1 reverse-engineering knowledge base: signatures, offsets, class layouts, hook points; also holds the full derivation recipes |
 | `docs/bioshock1/TESTING.md` | How to install, launch, verify each milestone; VR setup; crash triage |
 | `docs/bioshock2/ENGINE_NOTES.md` | BS2 knowledge base: verified RVAs, the ProcessEvent CalcView seam, BS1 deltas |

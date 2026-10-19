@@ -233,7 +233,11 @@ Written to `%LOCALAPPDATA%\BioshockVR\xrsim\state.json`, atomically replaced, at
 | `framesDiscarded`, `endsOutOfOrder` | Protocol violations, counted rather than fatal |
 | `sessionState`, `sessionRunning`, `actionsAttached` | Session status |
 | `paceMode`, `refreshHz`, `stepsPending`, `idleBlockMs` | Pacing |
-| `layersLastFrame`, `projectionViews` | The live layer census, updated every frame |
+| `layersLastFrame`, `projectionViews`, `quadLayers` | The live layer census, updated every frame |
+| `eyeAgeL/R`, `eyeAgeMaxL/R`, `eyeReleasedOnFrameL/R` | Per-eye freshness of the last projection submit, in frames, **every frame** (not only when `hash` is armed): 0/0 is a healthy pair, 1+ is an eye showing a held image. Max since `reset`. Complements `eyeHash` (WHAT each eye showed) with how OLD it was |
+| `eyeSameSwapchain`, `projSubmits`, `projMonoSubmits`, `projStaleSubmits` | Both views on one swapchain (the mono path), and the cumulative classification of every projection submit |
+| `endPhaseMs` | xrEndFrame time minus its displayTime (negative = closed before its slot) |
+| `capNonBlackL/R`, `quadAlphaPct` | The last CAPTURE's per-eye non-black percent, and the first quad layer's alpha coverage - assertable (`@assert capNonBlackL ge 50`) |
 | `head`, `handL`, `handR`, `controls` | The committed rig |
 | `cmdSeq`, `lastCmd`, `lastCmdError`, `errors` | The ack channel |
 | `captureSeq`, `lastCapture` | Capture bookkeeping |
@@ -260,6 +264,24 @@ The JSON is the point. Beyond the poses and controls it carries:
   28's yaw warp was a 1.84x claim/RENDER mismatch - that class shows up here as
   a measured value that disagrees with the law-derived expectation.
 - `stats.meanLumaL/R`, `stats.nonBlackPctL/R` - is anything actually rendered.
+- `stats.bboxL/R`, `stats.bboxPctL/R` - the non-black bounding box of each eye;
+  equal boxes in both eyes is the mono gate.
+- `layers[].src` - each layer's SOURCE image (the swapchain image the app last
+  released) read back on the capture frame: size, image index, the frame it was
+  released on, non-black and alpha percent, bbox. A black eye is then named in
+  `xrsim.log` as a **COMPOSITOR fault** (the source had content: a NaN pose or a
+  crossed fov - `xrEndFrame` also logs those as `BAD POSE` / `BAD FOV`) or an
+  **APP fault** (the source was black too).
+
+**Quad placement was fixed 2026-10-07** (`xrsim_math.h` `mat4_view_from_pose`,
+plus `D3DCOMPILE_PACK_MATRIX_ROW_MAJOR`): the view matrix used the inverse
+rotation's axes and HLSL read the matrix transposed, so a head-locked quad swung
+by twice the head yaw in captures. Measured and fixed first in the Dishonored VR
+mod's copy of this simulator; here the view math is pinned by a host test
+(`.\tools\host-test.ps1 xrsim-math`: a point ahead of the eye lands on -Z within
+1e-6 m over 275 poses, and the pre-fix basis fails the same test by metres). The
+shader-packing half is not host-testable. Quad screen positions in captures taken
+before that date are not comparable with later ones.
 
 ### 2.7 Scripted sequences
 
@@ -267,8 +289,13 @@ The JSON is the point. Beyond the poses and controls it carries:
 
 | Directive | Effect |
 |---|---|
+| `<cmd>; <cmd>` | sim commands grouped with `;` go as ONE batch, applied on the same frame - a head and a hand that must move together |
 | `@wait <ms>` | sleep |
 | `@frames <n>` | wait for the sim's frame counter to advance n |
+| `@key <name> [n] [ms]` | press a key in the game window (`game-key.ps1`) |
+| `@mark` | forget the mod log written so far; `@log`/`@nolog` look only after the mark |
+| `@log <regex> [<n>s]` | wait up to n s (default 5) for a MOD log line since the mark to match; the match moves the mark, so consecutive `@log` lines assert an ORDER |
+| `@nolog <regex>` | fail if a mod log line since the mark matches (something that must NOT happen) |
 | `@shot <name>` | capture; the result object is collected and returned |
 | `@mod <seam command>` | route to the MOD's `command.txt` via `game-cmd.ps1` |
 | `@assert <k> <op> <v>` | assert on `state.json` (`eq ne gt ge lt le`) |
@@ -276,6 +303,13 @@ The JSON is the point. Beyond the poses and controls it carries:
 
 Shipped: `smoke`, `stereo`, `headlook`, `laser`, `unfocused-pacing`,
 `world-6dof`, `coupling-viewmodel`, `coupling-hand`.
+
+**Interpolated motion (`head to`, `hand <h> to`) runs on the frame's DISPLAY time**
+since 2026-10-07, not `GetTickCount64`: the tick clock steps in ~15.6 ms, so a mod that
+differences successive hand poses (the wrench swing) saw a hand hold still for a frame
+and then jump, and the wall clock drifts against `predictedDisplayTime` after a hitch
+(the Dishonored mod measured a slow reach reading 3.1 m/s). A pose and the display time
+it is stamped with now describe the same instant.
 
 **`@mod` waits a poll period on purpose.** The mod reads its own `command.txt` at 1 Hz on mtime
 change, so two `@mod` lines in a row overwrite each other and the first is silently lost. Group them
@@ -357,6 +391,23 @@ lasers-OFF station diff (localized drill-region cells moving), never from mean-a
 melee drill never traverses the fire seam on air swings - use a gun (F9 GiveAll, digit-key
 switch) for any seam-counter oracle.
 
+### 2.8b The BS1 hands on the palette (s87/s88)
+
+All four expect gameplay on the sim with the wrench out; `tools\sim-load-save.ps1 -Row 10` loads
+the Aug 03 11:01 save through the menu (NEVER Continue - it lands on a hands-less save).
+
+| Question | Command | Read |
+|---|---|---|
+| Does the hand stay on the controller at every orientation? | `.\tools\pivot-sweep.ps1 [-Hand l -Point "-0.10 1.45 -0.45"]` | worst palm-vs-grip < 1 cm; the captures hold the fist at one screen point |
+| Does an attack hand the hand to the clip and back? | `.\tools\handback-test.ps1 [-Swing] [-Force both]` | the verdict line, the weight ends, the TRACE (drawn palm vs controller vs the game's palm) |
+| Do the IK arms reach and bend right? | `.\tools\arm-sweep.ps1` | reach % per side, slide; the seven captures |
+| Is it stable? | `.\tools\hands-soak.ps1 -Seconds 150` | SOAK PASS: alive, 0 faults, composes climbing |
+
+`game-cmd` REPLACES `command.txt` and the game reads it from CalcView: send several commands in
+ONE call, and never fire presses into the intro (sim-load-save waits for each press's echo).
+The sim TELEPORTS a controller between poses; the physical-swing detector reads that as a swing,
+so sweeps fire SWING attacks (classified correctly, kept tracked) - harmless, but expected.
+
 ### 2.9 Measured baselines (BS1, 2026-08-01, in gameplay)
 
 > **SESSION-38 SCALE BREAK for pixel statistics.** The sim's capture composite
@@ -406,7 +457,28 @@ compare against rather than a guess:
   lone-left pair breaks (a pass-2 skip after the left tag - see `skip`
   silent/stall/foreign for WHY); `reb>0` marks the mid-session resolution
   change the reporter performed. `mirror` prints the vrmirror pin state so a
-  `vrmirror off` A/B is legible in the same log line.
+  `vrmirror off` A/B is legible in the same log line. s74 correction: a
+  lone-left break parks the RIGHT eye, not the left - read `stale` BOTH ways.
+  s74 adds `deep=` (tag-ring pops that found a full pair queued - a sustained
+  nonzero is the phase-offset tell no other counter sees).
+- **`vrbones diag31 on` -> `[pairEdge]` / `[hudgate]` event-edge lines** (BS2,
+  s74): timestamped one-shots at each pairing break (lone-left,
+  untagged-close, untag-capture, acquire/wait-fail, hold-expired,
+  unheld-right) and at each per-eye HUD-burn interval (`burn eye=... `,
+  `leaderMiss eye=...`). A tester's "I saw it at 12:03" is answered by
+  grepping the minute around 12:03 for these. Known good signal: every BS2
+  pause open/close fires 3 leaderMiss + 6 burn + 1 unheld-right (the menu
+  flicker mechanism, 5/5 in sim).
+- **xrsim `hash every <n>` + `tools\eye-seq-diff.ps1`** (s74): the temporal
+  per-eye oracle. One TSV row per Nth submitted frame with an FNV hash of
+  each eye's SOURCE projection texture, per-eye release age and luma
+  (`capture\eyehash.tsv`, latest row mirrored in state.json `eyeHash`). The
+  differ flags left-stale / right-stale / eye-swap / age-spike / one-eye
+  luma-pop; exit 0 clean, 2 anomalies. Trap it exists to close: eye-check
+  legs 1-5 pass with identical eye images, and the PNG capture path cannot
+  see a repeated frame. Sim baseline at the save: 1651 projection rows, zero
+  anomalies - while the pose-snap flicker was VISIBLY firing, which is the
+  proof that artifact lives in frame content, not frame identity.
 - **BS2 pause menu**: seam commands and the pad are BOTH dead while paused (the
   PE-tail service lane starves - ENGINE_NOTES s42 #4); an unfocused-paused game
   writes nothing and false-positives log-age wedge checks. `game-key Space` wakes
@@ -561,6 +633,24 @@ $a.NonBlackPctL      -gt 50     # something was rendered
     JSON sitting in the worktree - never committable (hard rule). Pass an
     absolute `-Out` outside the repo, or delete the copies before `git add`.
     (Session 41 - they showed up in `git status` next to a real commit.)
+22. **The Flash menus IGNORE synthetic mouse clicks. Use the keyboard or the
+    pad.** `game-click.ps1` reports `clicked window(x,y)` and the menu does not
+    move - the click is delivered and swallowed, so it looks like a bad
+    coordinate and is not. This is the same gameswf behaviour that
+    `game-key.ps1` was written for (session 24: "synthetic clicks and Enter
+    presses were largely IGNORED"). **Arrow keys via `game-key.ps1`, or
+    `vrinput test press DU|DD|A` via `game-cmd.ps1`, both work** - the latter is
+    what `boot.ps1` already uses to walk the title screen. Reach for one of
+    those first and never spend a screenshot confirming a click landed.
+23. **`boot.ps1` presses Continue - it loads the NEWEST save, not the one you
+    want.** It is a "reach gameplay" tool, not a "reach a scenario" tool, and
+    the save it lands on may have no weapon equipped at all, which silently
+    disables anything holdable-gated (`wskel`/`wscale rigid` log nothing at
+    `wscale 1.0` or with no holdable - absence of those lines is NOT evidence the
+    lane is broken; check `vrhands status` for `weapon actor=00000000` first).
+    To reach a specific save, boot with `boot.ps1 -Attach`, then Escape ->
+    arrow keys -> LOAD, per gotcha 22. (Session 65, chasing the wrench-scale
+    regression on a save that had no wrench.)
 
 ---
 
