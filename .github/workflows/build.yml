@@ -29,7 +29,8 @@ jobs:
       run:
         # Each step's output is also kept in ci-step.log, so a failure can be read back
         # from the run's annotations (the "Report failure" step) without the raw logs.
-        shell: pwsh -NoProfile -Command "$log = Join-Path $env:RUNNER_TEMP 'ci-step.log'; try { & '{0}' *>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE) { exit $LASTEXITCODE } } catch { ($_ | Out-String) | Out-File -Append $log; throw }"
+        # Braces are doubled because GitHub formats this string ({0} is the script path).
+        shell: pwsh -NoProfile -Command "$log = Join-Path $env:RUNNER_TEMP 'ci-step.log'; try {{ & '{0}' *>&1 | Tee-Object -FilePath $log; if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} }} catch {{ ($_ | Out-String) | Out-File -Append $log; throw }}"
     steps:
       - uses: actions/checkout@v4
         with:
